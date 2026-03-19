@@ -1,0 +1,10 @@
+.env
+.robin_token
+*.pickle
+monitor.log
+news.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+.claude/
