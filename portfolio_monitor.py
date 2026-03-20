@@ -136,14 +136,29 @@ def robinhood_login():
     On first run, Robinhood will trigger an MFA/device-approval flow via SMS or
     the app. Follow the prompts in the terminal. The approved session is saved to
     ROBIN_TOKEN_PATH (.robin_token) so subsequent runs are silent.
+
+    r.login() can return without error even when a cached token has expired.
+    We validate the session immediately and, if it's dead, delete the stale token
+    and perform a fresh credential login. Since the device is already approved,
+    this does not trigger MFA.
     """
-    login_data = r.login(
-        username=os.getenv("ROBINHOOD_USERNAME"),
-        password=os.getenv("ROBINHOOD_PASSWORD"),
-        store_session=True,
-        pickle_name=ROBIN_TOKEN_PATH,
-    )
-    return login_data
+    def _login():
+        r.login(
+            username=os.getenv("ROBINHOOD_USERNAME"),
+            password=os.getenv("ROBINHOOD_PASSWORD"),
+            store_session=True,
+            pickle_name=ROBIN_TOKEN_PATH,
+        )
+
+    _login()
+
+    try:
+        r.load_portfolio_profile()
+    except Exception:
+        log.warning("Session invalid after login — stale token, retrying with fresh credentials")
+        if os.path.exists(ROBIN_TOKEN_PATH):
+            os.remove(ROBIN_TOKEN_PATH)
+        _login()
 
 
 # ── Positions ─────────────────────────────────────────────────────────────────
