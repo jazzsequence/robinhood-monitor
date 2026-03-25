@@ -8,11 +8,12 @@ Usage:
 import json
 import os
 import re
+import socket
 import sys
 import logging
 import smtplib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -43,12 +44,12 @@ CLAUDE_SYSTEM_PROMPT = (
     "no pump-and-dump, no unsavory trades, Robinhood platform only. "
     "Robinhood supports fractional share purchases, so small dollar amounts (even $5-20) "
     "can be deployed to open or add to a position. "
-    "A RECENT TRADES section is included showing buys and sells from the last 14 days. "
-    "Use this to: (a) avoid recommending re-entry into positions recently sold unless "
-    "there is a compelling new reason, (b) recognise positions recently opened and avoid "
-    "urging immediate additions unless conditions have materially changed, "
-    "(c) factor recent buy prices into your assessment of current return and risk. "
-    "Analyze the portfolio and provide a concise assessment covering: "
+    "Structure your response in two parts:\n"
+    "PART 1 — TL;DR: Write 2-3 sentences framed as 'if you do nothing else today, consider this.' "
+    "This is a high-level, humanistic read on the most important trend, risk, or opportunity "
+    "facing the portfolio right now — not a trade recommendation, but the broader context that "
+    "should inform every decision today. End this section with exactly the line: ---\n"
+    "PART 2 — Full analysis covering: "
     "(1) any positions to EXIT with clear reasoning, "
     "(2) any positions to ADD TO or new positions to ENTER using available cash — "
     "including small fractional purchases to gradually diversify beyond the current holdings, "
@@ -222,71 +223,6 @@ def get_cash() -> float:
     except Exception as e:
         log.warning(f"Could not fetch cash balance: {e}")
         return 0.0
-
-
-# ── Recent trades ─────────────────────────────────────────────────────────────
-def get_recent_trades(days: int = 14) -> list[dict]:
-    """
-    Return filled stock orders from the last `days` days, newest first.
-    Each entry: {symbol, side, quantity, price, date}.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    try:
-        orders = r.get_all_stock_orders() or []
-    except Exception as e:
-        log.warning(f"Could not fetch order history: {e}")
-        return []
-
-    recent = []
-    instrument_cache: dict[str, str] = {}
-
-    for order in orders:
-        if order.get("state") != "filled":
-            continue
-
-        last_tx = order.get("last_transaction_at", "")
-        if not last_tx:
-            continue
-        try:
-            tx_dt = datetime.fromisoformat(last_tx.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-
-        # Orders are returned newest-first; stop once we're past the window
-        if tx_dt < cutoff:
-            break
-
-        instrument_url = order.get("instrument", "")
-        if not instrument_url:
-            continue
-
-        if instrument_url not in instrument_cache:
-            try:
-                instrument = r.get_instrument_by_url(instrument_url)
-                instrument_cache[instrument_url] = instrument.get("symbol", "")
-            except Exception:
-                instrument_cache[instrument_url] = ""
-
-        symbol = instrument_cache[instrument_url]
-        if not symbol:
-            continue
-
-        try:
-            qty = round(float(order.get("quantity") or 0), 4)
-            raw_price = order.get("average_price") or order.get("price")
-            price = round(float(raw_price), 4) if raw_price else None
-        except (TypeError, ValueError):
-            continue
-
-        recent.append({
-            "symbol": symbol,
-            "side": order.get("side", ""),
-            "quantity": qty,
-            "price": price,
-            "date": tx_dt.date().isoformat(),
-        })
-
-    return recent
 
 
 # ── Watchlists ────────────────────────────────────────────────────────────────
@@ -518,16 +454,6 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
             for c in candidates
         )
 
-    recent_trades = summary.get("recent_trades", [])
-    if recent_trades:
-        recent_trades_lines = "\n".join(
-            f"  {t['date']}: {t['side'].upper():<4} {t['quantity']} {t['symbol']}"
-            + (f" @ ${t['price']:.4f}" if t["price"] else "")
-            for t in recent_trades
-        )
-    else:
-        recent_trades_lines = "  (none in last 14 days)"
-
     prompt = (
         f"Current screener watchlist ({len(screener_tickers)} tickers, max {MAX_SCREENER_TICKERS}):\n"
         f"{', '.join(screener_tickers)}\n\n"
@@ -545,9 +471,6 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
         f"{sherwood_lines}\n\n"
         f"Recent news for held positions (Yahoo Finance):\n"
         f"{ticker_news_lines}\n\n"
-        f"Investor's recent trades (last 14 days) — avoid recommending tickers just sold; "
-        f"note positions recently opened:\n"
-        f"{recent_trades_lines}\n\n"
         f"Recommend incremental changes to the watchlist. Use news and momentum data as primary "
         f"signals. Addition priority order: (1) user's own watchlist tickers with good signals, "
         f"(2) Robinhood watchlist tickers with strong signals, (3) any other tickers with "
@@ -714,17 +637,6 @@ def build_prompt(summary: dict) -> str:
             f"Volume ratio: {_fmt(ind.get('volume_ratio'), '.2f')}x",
         ]
 
-    recent_trades = summary.get("recent_trades", [])
-    lines += ["", "=== RECENT TRADES (last 14 days) ==="]
-    if recent_trades:
-        for t in recent_trades:
-            price_str = f"@ ${t['price']:.4f}" if t["price"] else ""
-            lines.append(
-                f"{t['date']}: {t['side'].upper():<4} {t['quantity']} {t['symbol']} {price_str}".rstrip()
-            )
-    else:
-        lines.append("(none in last 14 days)")
-
     lines += ["", "=== TOP MOMENTUM MOVERS (not in portfolio) ==="]
     for m in summary["momentum"]:
         lines.append(
@@ -752,7 +664,8 @@ def build_prompt(summary: dict) -> str:
     return "\n".join(lines)
 
 
-def get_claude_analysis(summary: dict) -> str:
+def get_claude_analysis(summary: dict) -> tuple[str, str]:
+    """Return (tldr, analysis) parsed from Claude's structured response."""
     client = Anthropic()
     prompt = build_prompt(summary)
     message = client.messages.create(
@@ -761,7 +674,14 @@ def get_claude_analysis(summary: dict) -> str:
         system=CLAUDE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
-    return message.content[0].text
+    raw = message.content[0].text
+    if "\n---\n" in raw:
+        tldr_part, analysis_part = raw.split("\n---\n", 1)
+        tldr = tldr_part.strip()
+    else:
+        tldr = ""
+        analysis_part = raw
+    return tldr, analysis_part.strip()
 
 
 # ── Email digest ──────────────────────────────────────────────────────────────
@@ -769,11 +689,24 @@ def format_digest(summary: dict, analysis: str) -> str:
     SEP = "=" * 64
     sep = "-" * 64
 
+    tldr = summary.get("tldr", "")
     lines = [
         SEP,
         f"PORTFOLIO DIGEST — {summary['date']}",
         f"Total Value: ${summary['total_value']:.2f}  |  Cash: ${summary['cash']:.2f}",
         SEP,
+    ]
+
+    if tldr:
+        lines += [
+            "",
+            "TL;DR",
+            sep,
+            tldr,
+            "",
+        ]
+
+    lines += [
         "",
         "CURRENT POSITIONS",
         sep,
@@ -813,17 +746,6 @@ def format_digest(summary: dict, analysis: str) -> str:
             f"Score {m['score']:>5}"
         )
 
-    recent_trades_plain = summary.get("recent_trades", [])
-    lines += ["", "RECENT TRADES (last 14 days)", sep]
-    if recent_trades_plain:
-        for t in recent_trades_plain:
-            price_str = f"@ ${t['price']:.4f}" if t["price"] else ""
-            lines.append(
-                f"{t['date']}  {t['side'].upper():<4}  {t['quantity']:>10}  {t['symbol']:<8}  {price_str}".rstrip()
-            )
-    else:
-        lines.append("No trades in the last 14 days.")
-
     ticker_changes = summary.get("ticker_changes", {})
     added = ticker_changes.get("added", [])
     removed = ticker_changes.get("removed", [])
@@ -849,6 +771,7 @@ def format_digest(summary: dict, analysis: str) -> str:
         analysis,
         "",
         SEP,
+        f"Sent from {summary.get('hostname', 'unknown')}",
     ]
 
     return "\n".join(lines)
@@ -1128,43 +1051,29 @@ def format_digest_html(summary: dict, analysis: str) -> str:
     else:
         ticker_news_content = '<p style="color:#6b7280;font-size:13px;margin:0;">No ticker news fetched.</p>'
 
-    # ── Recent trades ─────────────────────────────────────────────────────────
-    recent_trades_list = summary.get("recent_trades", [])
-    if recent_trades_list:
-        trades_header = "".join([
-            _th("Date", align="left"),
-            _th("Action", align="left"),
-            _th("Symbol", align="left"),
-            _th("Qty"),
-            _th("Price"),
-        ])
-        trades_rows = ""
-        for t in recent_trades_list:
-            side = t["side"].upper()
-            side_color = "#16a34a" if side == "BUY" else "#dc2626"
-            price_str = f"${t['price']:.4f}" if t["price"] else "N/A"
-            trades_rows += (
-                "<tr>"
-                + _td(_h(t["date"]), align="left", mono=True)
-                + _td(f'<span style="color:{side_color};font-weight:700;">{side}</span>', align="left")
-                + _td(_h(t["symbol"]), align="left", bold=True, color="#0f172a")
-                + _td(str(t["quantity"]), mono=True)
-                + _td(price_str, mono=True)
-                + "</tr>"
-            )
-        recent_trades_content = _table(trades_header, trades_rows)
-    else:
-        recent_trades_content = '<p style="color:#6b7280;font-size:13px;margin:0;">No trades in the last 14 days.</p>'
-
     # ── Analysis block ───────────────────────────────────────────────────────
     analysis_html = _md_to_html(analysis)
 
+    # ── TL;DR block ──────────────────────────────────────────────────────────
+    tldr_text = summary.get("tldr", "")
+    if tldr_text:
+        tldr_block = (
+            '<div style="background:#0f172a;border-left:4px solid #f59e0b;'
+            'padding:20px 24px;margin:0 0 28px;border-radius:0 6px 6px 0;">'
+            '<p style="margin:0 0 6px;font-size:10px;font-weight:700;color:#f59e0b;'
+            'text-transform:uppercase;letter-spacing:0.1em;">TL;DR</p>'
+            f'<p style="margin:0;font-size:15px;line-height:1.6;color:#f1f5f9;">{_md_to_html(tldr_text)}</p>'
+            '</div>'
+        )
+    else:
+        tldr_block = ""
+
     # ── Assemble ─────────────────────────────────────────────────────────────
     body_content = (
-        _section("Current Positions", _table(pos_header, pos_rows))
+        tldr_block
+        + _section("Current Positions", _table(pos_header, pos_rows))
         + _section("Technical Indicators", _table(ind_header, ind_rows))
         + _section("Top Momentum Movers", _table(mom_header, mom_rows))
-        + _section("Recent Trades (14 days)", recent_trades_content)
         + _section("Watchlist Updates", watchlist_content)
         + _section(
             "Claude Analysis",
@@ -1263,6 +1172,7 @@ def format_digest_html(summary: dict, analysis: str) -> str:
                text-align:center;">
       <p style="margin:0;font-size:11px;color:#94a3b8;">
         Generated by portfolio_monitor.py &middot; {_h(summary["date"])}
+        &middot; sent from {_h(summary.get("hostname", "unknown"))}
       </p>
     </td>
   </tr>
@@ -1279,6 +1189,7 @@ def main():
     load_dotenv()
     log.info("Starting portfolio monitor")
     today = date.today().isoformat()
+    hostname = socket.gethostname()
 
     # 1. Load screener tickers
     screener_tickers = load_tickers()
@@ -1293,7 +1204,7 @@ def main():
         send_error_email("Robinhood authentication", e)
         sys.exit(1)
 
-    # 3. Pull positions, cash, and recent trades
+    # 3. Pull positions and cash
     try:
         positions = get_positions()
         cash = get_cash()
@@ -1302,13 +1213,6 @@ def main():
         log.error(f"Failed to fetch positions: {e}")
         send_error_email("fetching Robinhood positions", e)
         sys.exit(1)
-
-    try:
-        recent_trades = get_recent_trades(days=14)
-        log.info(f"Fetched {len(recent_trades)} recent trades (last 14 days)")
-    except Exception as e:
-        log.warning(f"Could not fetch recent trades: {e}")
-        recent_trades = []
 
     portfolio_symbols = {p["symbol"] for p in positions}
 
@@ -1372,12 +1276,12 @@ def main():
     total_value = round(total_equity + cash, 2)
     summary = {
         "date": today,
+        "hostname": hostname,
         "total_value": total_value,
         "cash": cash,
         "positions": positions,
         "momentum": momentum,
         "watchlist_candidates": watchlist_candidates,
-        "recent_trades": recent_trades,
     }
 
     # 8. Fetch market and ticker news
@@ -1420,11 +1324,14 @@ def main():
     # 10. Claude analysis
     try:
         log.info("Requesting Claude analysis")
-        analysis = get_claude_analysis(summary)
+        tldr, analysis = get_claude_analysis(summary)
+        summary["tldr"] = tldr
     except Exception as e:
         log.error(f"Claude analysis failed: {e}")
         send_error_email("Claude API analysis", e)
+        tldr = ""
         analysis = f"[Claude analysis unavailable: {e}]"
+        summary["tldr"] = ""
 
     # 11. Format and send email digest
     try:
