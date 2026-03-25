@@ -44,7 +44,12 @@ CLAUDE_SYSTEM_PROMPT = (
     "no pump-and-dump, no unsavory trades, Robinhood platform only. "
     "Robinhood supports fractional share purchases, so small dollar amounts (even $5-20) "
     "can be deployed to open or add to a position. "
-    "Analyze the portfolio and provide a concise assessment covering: "
+    "Structure your response in two parts:\n"
+    "PART 1 — TL;DR: Write 2-3 sentences framed as 'if you do nothing else today, consider this.' "
+    "This is a high-level, humanistic read on the most important trend, risk, or opportunity "
+    "facing the portfolio right now — not a trade recommendation, but the broader context that "
+    "should inform every decision today. End this section with exactly the line: ---\n"
+    "PART 2 — Full analysis covering: "
     "(1) any positions to EXIT with clear reasoning, "
     "(2) any positions to ADD TO or new positions to ENTER using available cash — "
     "including small fractional purchases to gradually diversify beyond the current holdings, "
@@ -659,7 +664,8 @@ def build_prompt(summary: dict) -> str:
     return "\n".join(lines)
 
 
-def get_claude_analysis(summary: dict) -> str:
+def get_claude_analysis(summary: dict) -> tuple[str, str]:
+    """Return (tldr, analysis) parsed from Claude's structured response."""
     client = Anthropic()
     prompt = build_prompt(summary)
     message = client.messages.create(
@@ -668,7 +674,14 @@ def get_claude_analysis(summary: dict) -> str:
         system=CLAUDE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
-    return message.content[0].text
+    raw = message.content[0].text
+    if "\n---\n" in raw:
+        tldr_part, analysis_part = raw.split("\n---\n", 1)
+        tldr = tldr_part.strip()
+    else:
+        tldr = ""
+        analysis_part = raw
+    return tldr, analysis_part.strip()
 
 
 # ── Email digest ──────────────────────────────────────────────────────────────
@@ -676,11 +689,24 @@ def format_digest(summary: dict, analysis: str) -> str:
     SEP = "=" * 64
     sep = "-" * 64
 
+    tldr = summary.get("tldr", "")
     lines = [
         SEP,
         f"PORTFOLIO DIGEST — {summary['date']}",
         f"Total Value: ${summary['total_value']:.2f}  |  Cash: ${summary['cash']:.2f}",
         SEP,
+    ]
+
+    if tldr:
+        lines += [
+            "",
+            "TL;DR",
+            sep,
+            tldr,
+            "",
+        ]
+
+    lines += [
         "",
         "CURRENT POSITIONS",
         sep,
@@ -1028,9 +1054,24 @@ def format_digest_html(summary: dict, analysis: str) -> str:
     # ── Analysis block ───────────────────────────────────────────────────────
     analysis_html = _md_to_html(analysis)
 
+    # ── TL;DR block ──────────────────────────────────────────────────────────
+    tldr_text = summary.get("tldr", "")
+    if tldr_text:
+        tldr_block = (
+            '<div style="background:#0f172a;border-left:4px solid #f59e0b;'
+            'padding:20px 24px;margin:0 0 28px;border-radius:0 6px 6px 0;">'
+            '<p style="margin:0 0 6px;font-size:10px;font-weight:700;color:#f59e0b;'
+            'text-transform:uppercase;letter-spacing:0.1em;">TL;DR</p>'
+            f'<p style="margin:0;font-size:15px;line-height:1.6;color:#f1f5f9;">{_md_to_html(tldr_text)}</p>'
+            '</div>'
+        )
+    else:
+        tldr_block = ""
+
     # ── Assemble ─────────────────────────────────────────────────────────────
     body_content = (
-        _section("Current Positions", _table(pos_header, pos_rows))
+        tldr_block
+        + _section("Current Positions", _table(pos_header, pos_rows))
         + _section("Technical Indicators", _table(ind_header, ind_rows))
         + _section("Top Momentum Movers", _table(mom_header, mom_rows))
         + _section("Watchlist Updates", watchlist_content)
@@ -1283,11 +1324,14 @@ def main():
     # 10. Claude analysis
     try:
         log.info("Requesting Claude analysis")
-        analysis = get_claude_analysis(summary)
+        tldr, analysis = get_claude_analysis(summary)
+        summary["tldr"] = tldr
     except Exception as e:
         log.error(f"Claude analysis failed: {e}")
         send_error_email("Claude API analysis", e)
+        tldr = ""
         analysis = f"[Claude analysis unavailable: {e}]"
+        summary["tldr"] = ""
 
     # 11. Format and send email digest
     try:
