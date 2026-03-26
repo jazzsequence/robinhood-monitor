@@ -45,7 +45,7 @@ CLAUDE_SYSTEM_PROMPT = (
     "Robinhood supports fractional share purchases, so small dollar amounts (even $5-20) "
     "can be deployed to open or add to a position. "
     "Structure your response in two parts:\n"
-    "PART 1 — TL;DR: Write 2-3 sentences framed as 'if you do nothing else today, consider this.' "
+    "PART 1 — TL;DR: Write 2-3 sentences framed as a tl;dr of the overall trends or advice given. "
     "This is a high-level, humanistic read on the most important trend, risk, or opportunity "
     "facing the portfolio right now — not a trade recommendation, but the broader context that "
     "should inform every decision today. End this section with exactly the line: ---\n"
