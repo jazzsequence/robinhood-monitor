@@ -13,7 +13,7 @@ import sys
 import logging
 import smtplib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -43,7 +43,20 @@ CLAUDE_SYSTEM_PROMPT = (
     "during business hours and will execute after-hours. Goals: aggressive growth, "
     "no pump-and-dump, no unsavory trades, Robinhood platform only. "
     "Robinhood supports fractional share purchases, so small dollar amounts (even $5-20) "
-    "can be deployed to open or add to a position. "
+    "can be deployed to open or add to a position.\n\n"
+    "CAPITAL AWARENESS: This portfolio is self-funding — no new money is being added from outside. "
+    "When recommending purchases, be mindful that available capital comes from: "
+    "(a) the Available Cash already in the account, and (b) proceeds from any SELL actions "
+    "you recommend in this same analysis. Before recommending buys, note the total capital "
+    "available (cash + sell proceeds) so the investor can see whether the purchases are "
+    "feasible without adding funds. If recommending new purchases would require capital beyond "
+    "what cash and recommended sells provide, flag this clearly so the investor can decide "
+    "whether to fund it externally or adjust the plan.\n\n"
+    "RECENT POSITIONS — DO NOT SELL PREMATURELY: The prompt includes recent transaction history. "
+    "Do not recommend selling any position acquired within the last 7 days unless there is a severe, "
+    "specific fundamental reason (e.g. company halted, stop-loss clearly breached, major negative news "
+    "that materially changes the thesis). Selling a recently purchased position at a loss is one of the "
+    "worst outcomes for this portfolio — avoid it.\n\n"
     "Structure your response in two parts:\n"
     "PART 1 — TL;DR: Write 2-3 sentences framed as a tl;dr of the overall trends or advice given. "
     "This is a high-level, humanistic read on the most important trend, risk, or opportunity "
@@ -51,10 +64,10 @@ CLAUDE_SYSTEM_PROMPT = (
     "should inform every decision today. End this section with exactly the line: ---\n"
     "PART 2 — Full analysis covering: "
     "(1) any positions to EXIT with clear reasoning, "
-    "(2) any positions to ADD TO or new positions to ENTER using available cash — "
-    "including small fractional purchases to gradually diversify beyond the current holdings, "
+    "(2) your total buy capacity (cash + sell proceeds) and any positions to ADD TO or new positions "
+    "to ENTER within that limit — including small fractional purchases to gradually diversify, "
     "(3) one key thing to watch today. "
-    "If conditions do not warrant action on a position, saying so is a valid output — "
+    "If conditions do not warrant action, saying so is a valid output — "
     "do not manufacture trades just to fill the format. "
     "Use specific BUY, SELL, or HOLD language. Assume basic but not advanced knowledge "
     "of stock trading and terminology."
@@ -223,6 +236,72 @@ def get_cash() -> float:
     except Exception as e:
         log.warning(f"Could not fetch cash balance: {e}")
         return 0.0
+
+
+# ── Recent order history ──────────────────────────────────────────────────────
+def get_recent_orders(days: int = 30) -> list[dict]:
+    """
+    Return filled stock orders from the last `days` days, newest first.
+    Each entry: {symbol, side, quantity, price, date, days_ago}.
+
+    Note: Robinhood returns orders newest-first, so we break early once
+    we pass the cutoff rather than scanning the full history.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        all_orders = r.get_all_stock_orders() or []
+    except Exception as e:
+        log.warning(f"Could not fetch order history: {e}")
+        return []
+
+    instrument_cache: dict[str, str] = {}
+    recent = []
+
+    for order in all_orders:
+        if order.get("state") != "filled":
+            continue
+        ts_str = order.get("last_transaction_at", "")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        # Orders come back newest-first; stop once past the window
+        if ts < cutoff:
+            break
+
+        instrument_url = order.get("instrument", "")
+        if not instrument_url:
+            continue
+        if instrument_url not in instrument_cache:
+            try:
+                instrument = r.get_instrument_by_url(instrument_url)
+                instrument_cache[instrument_url] = instrument.get("symbol", "")
+            except Exception:
+                instrument_cache[instrument_url] = ""
+
+        symbol = instrument_cache[instrument_url]
+        if not symbol:
+            continue
+
+        try:
+            qty = round(float(order.get("quantity") or 0), 4)
+            raw_price = order.get("average_price") or order.get("price")
+            price = round(float(raw_price), 4) if raw_price else None
+        except (TypeError, ValueError):
+            continue
+
+        recent.append({
+            "symbol": symbol,
+            "side": order.get("side", ""),
+            "quantity": qty,
+            "price": price,
+            "date": ts.date().isoformat(),
+            "days_ago": (datetime.now(timezone.utc) - ts).days,
+        })
+
+    return recent
 
 
 # ── Watchlists ────────────────────────────────────────────────────────────────
@@ -636,6 +715,21 @@ def build_prompt(summary: dict) -> str:
             f"  Today: {_fmt(ind.get('pct_change_today'), '+.2f')}% | "
             f"Volume ratio: {_fmt(ind.get('volume_ratio'), '.2f')}x",
         ]
+
+    recent_orders = summary.get("recent_orders", [])
+    if recent_orders:
+        lines += ["", "=== RECENT TRANSACTIONS (last 30 days) ==="]
+        lines.append(
+            "  (Do not recommend selling positions bought within 7 days without a severe reason)"
+        )
+        for o in recent_orders:
+            flag = "  ← RECENT BUY — do not sell" if o["side"] == "buy" and o["days_ago"] < 7 else ""
+            price_str = f"${o['price']:.4f}" if o["price"] is not None else "N/A"
+            lines.append(
+                f"  {o['side'].upper():<4} {o['symbol']:<8} "
+                f"{o['quantity']:.4f} shares @ {price_str}  "
+                f"{o['date']} ({o['days_ago']}d ago){flag}"
+            )
 
     lines += ["", "=== TOP MOMENTUM MOVERS (not in portfolio) ==="]
     for m in summary["momentum"]:
@@ -1216,6 +1310,14 @@ def main():
 
     portfolio_symbols = {p["symbol"] for p in positions}
 
+    # 3b. Fetch recent order history (for capital-consistency checks in Claude prompt)
+    try:
+        recent_orders = get_recent_orders(days=30)
+        log.info(f"Fetched {len(recent_orders)} recent filled orders")
+    except Exception as e:
+        log.warning(f"Could not fetch recent orders: {e}")
+        recent_orders = []
+
     # 4. Bulk fetch market data for portfolio + screener in two calls
     try:
         portfolio_data = fetch_bulk_market_data(sorted(portfolio_symbols))
@@ -1282,6 +1384,7 @@ def main():
         "positions": positions,
         "momentum": momentum,
         "watchlist_candidates": watchlist_candidates,
+        "recent_orders": recent_orders,
     }
 
     # 8. Fetch market and ticker news
