@@ -1304,7 +1304,22 @@ def main():
         log.info(f"Fetched {len(positions)} positions, cash: ${cash}")
     except Exception as e:
         log.error(f"Failed to fetch positions: {e}")
-        send_error_email("fetching Robinhood positions", e)
+        if "logged in" in str(e).lower():
+            subject = f"Portfolio Monitor — Re-authentication Required ({hostname}) - {date.today()}"
+            body = (
+                f"The script could not run on {hostname} because the Robinhood session has expired "
+                f"or is no longer valid.\n\n"
+                f"Error: {e}\n\n"
+                f"To fix: run the script manually on {hostname} to re-authenticate:\n"
+                f"  cd ~/Claude/robinhood-monitor && .venv/bin/python portfolio_monitor.py\n\n"
+                f"Follow any MFA prompts. The new session will be cached for future runs."
+            )
+            try:
+                send_email(subject, body)
+            except Exception as mail_err:
+                log.error(f"Failed to send login error email: {mail_err}")
+        else:
+            send_error_email("fetching Robinhood positions", e)
         sys.exit(1)
 
     portfolio_symbols = {p["symbol"] for p in positions}
