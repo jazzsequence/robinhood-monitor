@@ -52,11 +52,13 @@ CLAUDE_SYSTEM_PROMPT = (
     "feasible without adding funds. If recommending new purchases would require capital beyond "
     "what cash and recommended sells provide, flag this clearly so the investor can decide "
     "whether to fund it externally or adjust the plan.\n\n"
-    "RECENT POSITIONS — DO NOT SELL PREMATURELY: The prompt includes recent transaction history. "
-    "Do not recommend selling any position acquired within the last 7 days unless there is a severe, "
-    "specific fundamental reason (e.g. company halted, stop-loss clearly breached, major negative news "
-    "that materially changes the thesis). Selling a recently purchased position at a loss is one of the "
-    "worst outcomes for this portfolio — avoid it.\n\n"
+    "PROFIT/LOSS AWARENESS: Each position includes avg_cost, which is the actual average price paid "
+    "per share (cost basis from Robinhood), and total_return_pct, which is the current gain or loss "
+    "relative to that cost. Use these to evaluate the real P&L impact of any recommended sale. "
+    "Selling at a gain to redeploy capital is always worth considering. Selling at a loss requires "
+    "clear justification: a broken thesis, significant adverse news, or a technical breakdown with "
+    "no credible recovery signal. How long a position has been held is context, not a constraint — "
+    "a well-timed short-term flip is a valid outcome but only when risk/reward supports it.\n\n"
     "Structure your response in two parts:\n"
     "PART 1 — TL;DR: Write 2-3 sentences framed as a tl;dr of the overall trends or advice given. "
     "This is a high-level, humanistic read on the most important trend, risk, or opportunity "
@@ -719,11 +721,8 @@ def build_prompt(summary: dict) -> str:
     recent_orders = summary.get("recent_orders", [])
     if recent_orders:
         lines += ["", "=== RECENT TRANSACTIONS (last 30 days) ==="]
-        lines.append(
-            "  (Do not recommend selling positions bought within 7 days without a severe reason)"
-        )
         for o in recent_orders:
-            flag = "  ← RECENT BUY — do not sell" if o["side"] == "buy" and o["days_ago"] < 7 else ""
+            flag = ""  # append contextual notes per order if needed (e.g. flags, warnings)
             price_str = f"${o['price']:.4f}" if o["price"] is not None else "N/A"
             lines.append(
                 f"  {o['side'].upper():<4} {o['symbol']:<8} "
