@@ -9,6 +9,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import logging
 import smtplib
@@ -152,6 +153,19 @@ def send_error_email(context: str, exc: Exception):
         send_email(subject, body)
     except Exception as e:
         log.error(f"Failed to send error email: {e}")
+
+
+# ── Git helpers ───────────────────────────────────────────────────────────────
+def git_pull():
+    """Pull latest changes before running. Non-fatal — logs and continues on failure."""
+    try:
+        result = subprocess.run(
+            ["git", "pull", "--ff-only"],
+            capture_output=True, text=True, check=True
+        )
+        log.info(f"git pull: {result.stdout.strip() or 'already up to date'}")
+    except subprocess.CalledProcessError as e:
+        log.warning(f"git pull failed (continuing anyway): {e.stderr.strip()}")
 
 
 # ── Robinhood auth ────────────────────────────────────────────────────────────
@@ -1281,6 +1295,7 @@ def format_digest_html(summary: dict, analysis: str) -> str:
 def main():
     load_dotenv()
     log.info("Starting portfolio monitor")
+    git_pull()
     today = date.today().isoformat()
     hostname = socket.gethostname()
 
