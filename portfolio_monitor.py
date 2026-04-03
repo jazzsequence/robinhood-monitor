@@ -168,6 +168,27 @@ def git_pull():
         log.warning(f"git pull failed (continuing anyway): {e.stderr.strip()}")
 
 
+def git_commit_tickers():
+    """Commit and push tickers.json if it has changed. Non-fatal."""
+    try:
+        diff = subprocess.run(
+            ["git", "diff", "--quiet", TICKERS_FILE],
+            capture_output=True
+        )
+        if diff.returncode == 0:
+            log.info("tickers.json unchanged — skipping git commit")
+            return
+        subprocess.run(["git", "add", TICKERS_FILE], check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "chore: update screener watchlist [skip ci]"],
+            check=True, capture_output=True
+        )
+        subprocess.run(["git", "push"], check=True, capture_output=True)
+        log.info("tickers.json committed and pushed")
+    except subprocess.CalledProcessError as e:
+        log.warning(f"git commit/push of tickers.json failed: {e.stderr.strip() if e.stderr else e}")
+
+
 # ── Robinhood auth ────────────────────────────────────────────────────────────
 def robinhood_login():
     """
@@ -1476,6 +1497,9 @@ def main():
         log.error(f"Failed to send digest email: {e}")
         send_error_email("sending email digest", e)
         sys.exit(1)
+
+    # 12. Commit and push tickers.json if Claude updated the watchlist
+    git_commit_tickers()
 
     log.info("Portfolio monitor complete")
 
