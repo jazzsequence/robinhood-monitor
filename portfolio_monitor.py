@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 # Edit tickers.json directly to make manual changes.
 TICKERS_FILE = "tickers.json"
 NEWS_FILE = "news.json"
+ANALYSIS_FILE = "last_analysis.json"
 MIN_SCREENER_TICKERS = 25
 MAX_SCREENER_TICKERS = 40
 WATCHLIST_MIN_SCORE = 15  # minimum momentum score to surface a watchlist ticker as a candidate
@@ -580,7 +581,14 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
         f"removals without paired additions are allowed."
     )
 
+    prior = summary.get("prior_analysis")
+    prior_tldr_line = (
+        f"Prior analysis TL;DR ({prior['date']}): {prior['tldr']}\n\n"
+        if prior and prior.get("tldr") else ""
+    )
+
     prompt = (
+        f"{prior_tldr_line}"
         f"Current screener watchlist ({len(screener_tickers)} tickers, max {MAX_SCREENER_TICKERS}):\n"
         f"{', '.join(screener_tickers)}\n\n"
         f"{removal_note}\n\n"
@@ -742,12 +750,39 @@ def save_news_cache(date_str: str, sherwood: list[dict], ticker_news: dict[str, 
         json.dump({"date": date_str, "sherwood": sherwood, "ticker_news": ticker_news}, f, indent=2)
 
 
+def load_last_analysis() -> dict | None:
+    """Load the prior run's analysis. Returns None if not available or malformed."""
+    try:
+        with open(ANALYSIS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_analysis(date: str, tldr: str, analysis: str):
+    """Persist today's Claude analysis so tomorrow's run has continuity."""
+    with open(ANALYSIS_FILE, "w") as f:
+        json.dump({"date": date, "tldr": tldr, "analysis": analysis}, f, indent=2)
+
+
 # ── Claude analysis ───────────────────────────────────────────────────────────
 def build_prompt(summary: dict) -> str:
     lines = [
         f"Portfolio Summary as of {summary['date']}",
         f"Total Portfolio Value: ${summary['total_value']:.2f}",
         f"Available Cash: ${summary['cash']:.2f}",
+    ]
+
+    prior = summary.get("prior_analysis")
+    if prior:
+        lines += [
+            "",
+            f"=== PRIOR RUN ANALYSIS ({prior['date']}) ===",
+            f"TL;DR: {prior['tldr']}" if prior.get("tldr") else "",
+            prior.get("analysis", ""),
+        ]
+
+    lines += [
         "",
         "=== CURRENT POSITIONS ===",
     ]
@@ -1440,6 +1475,9 @@ def main():
     # 7. Build summary
     total_equity = sum(p["equity"] for p in positions)
     total_value = round(total_equity + cash, 2)
+    prior_analysis = load_last_analysis()
+    if prior_analysis:
+        log.info(f"Loaded prior analysis from {prior_analysis['date']}")
     summary = {
         "date": today,
         "hostname": hostname,
@@ -1449,6 +1487,7 @@ def main():
         "momentum": momentum,
         "watchlist_candidates": watchlist_candidates,
         "recent_orders": recent_orders,
+        "prior_analysis": prior_analysis,
     }
 
     # 8. Fetch market and ticker news
@@ -1493,6 +1532,11 @@ def main():
         log.info("Requesting Claude analysis")
         tldr, analysis = get_claude_analysis(summary)
         summary["tldr"] = tldr
+        try:
+            save_analysis(today, tldr, analysis)
+            log.info(f"Analysis saved to {ANALYSIS_FILE}")
+        except Exception as save_err:
+            log.warning(f"Failed to save analysis: {save_err}")
     except Exception as e:
         log.error(f"Claude analysis failed: {e}")
         send_error_email("Claude API analysis", e)

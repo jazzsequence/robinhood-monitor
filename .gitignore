@@ -3,6 +3,7 @@
 *.pickle
 monitor.log
 news.json
+last_analysis.json
 session_notes.md
 __pycache__/
 *.pyc
