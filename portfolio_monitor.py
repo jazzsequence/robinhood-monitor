@@ -570,9 +570,20 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
             for c in candidates
         )
 
+    at_minimum = len(screener_tickers) <= MIN_SCREENER_TICKERS
+    removal_note = (
+        f"IMPORTANT: The list is at its minimum size ({len(screener_tickers)}/{MIN_SCREENER_TICKERS}). "
+        f"Removals are blocked unless paired with additions. If you want to remove a ticker, you MUST "
+        f"also recommend at least one addition — or skip the removal and only add."
+        if at_minimum else
+        f"The list has {len(screener_tickers) - MIN_SCREENER_TICKERS} tickers above the minimum; "
+        f"removals without paired additions are allowed."
+    )
+
     prompt = (
         f"Current screener watchlist ({len(screener_tickers)} tickers, max {MAX_SCREENER_TICKERS}):\n"
         f"{', '.join(screener_tickers)}\n\n"
+        f"{removal_note}\n\n"
         f"Portfolio positions (do not add these):\n"
         f"{', '.join(portfolio_symbols)}\n\n"
         f"Today's top momentum movers (from the screener scan):\n"
@@ -591,6 +602,9 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
         f"signals. Addition priority order: (1) user's own watchlist tickers with good signals, "
         f"(2) Robinhood watchlist tickers with strong signals, (3) any other tickers with "
         f"exceptional momentum or news coverage. Remove tickers showing persistent weakness.\n\n"
+        f"Aim for sector diversity across the watchlist — consider opportunities in energy, "
+        f"healthcare/biotech, financials, industrials, and consumer sectors when the news or "
+        f"momentum data supports them, not only the sectors already well-represented.\n\n"
         f"Respond with ONLY valid JSON — no markdown, no explanation outside the JSON:\n"
         f'{{\n'
         f'  "add": [{{"ticker": "SYM", "reason": "one sentence"}}],\n'
@@ -602,7 +616,7 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
         f"- Do not add tickers already in the portfolio\n"
         f"- Remove tickers showing persistent weakness, low relevance, or delisted/acquired status\n"
         f"- Add tickers with strong momentum signals, sector tailwinds, or high conviction setups\n"
-        f"- Return empty arrays if no changes are warranted"
+        f"- Return empty arrays only if truly nothing warrants a change"
     )
 
     client = Anthropic()
