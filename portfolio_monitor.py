@@ -1435,6 +1435,29 @@ def main():
         log.error(f"Screener market data failed: {e}")
         screener_data = {}
 
+    # Auto-remove screener tickers that returned no data (likely delisted/halted).
+    # Bypass Claude for these — there's nothing to analyse. Min-size guard still applies.
+    no_data_tickers = [
+        t for t in screener_tickers
+        if t not in portfolio_symbols and t not in screener_data
+    ]
+    if no_data_tickers:
+        auto_removed = []
+        for t in no_data_tickers:
+            if len(screener_tickers) - 1 < MIN_SCREENER_TICKERS:
+                log.warning(
+                    f"Cannot auto-remove {t} (no data / possible delisting): "
+                    f"list would drop below minimum ({MIN_SCREENER_TICKERS})"
+                )
+                continue
+            screener_tickers.remove(t)
+            auto_removed.append(t)
+            log.warning(f"Auto-removed {t} from screener: no market data returned (possible delisting)")
+        if auto_removed:
+            with open(TICKERS_FILE, "w") as _f:
+                json.dump(sorted(screener_tickers), _f, indent=2)
+            log.info(f"Wrote updated tickers.json after auto-removing: {auto_removed}")
+
     # 5. Score watchlist tickers as preferred add candidates
     watchlist_candidates = []
     try:
