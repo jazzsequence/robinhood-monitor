@@ -13,6 +13,7 @@ import subprocess
 import sys
 import logging
 import smtplib
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -25,6 +26,29 @@ import yfinance as yf
 import robin_stocks.robinhood as r
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+# robin_stocks 3.4.0 (latest) crashes when the push-approval polling endpoint
+# returns 429 (None response) instead of continuing to wait. Patch it here so
+# the fix survives venv rebuilds. Upstream bug: jmfernandes/robin_stocks#auth
+import robin_stocks.robinhood.authentication as _rh_auth
+_orig_validate = _rh_auth._validate_sherrif_id
+
+def _patched_validate(*args, **kwargs):
+    _orig_request_get = _rh_auth.request_get
+    def _safe_request_get(url, *a, **kw):
+        result = _orig_request_get(url, *a, **kw)
+        if result is None:
+            # 429 — back off hard before the next poll (existing 5s sleep still runs too)
+            time.sleep(25)
+            return {"challenge_status": "pending"}
+        return result
+    _rh_auth.request_get = _safe_request_get
+    try:
+        return _orig_validate(*args, **kwargs)
+    finally:
+        _rh_auth.request_get = _orig_request_get
+
+_rh_auth._validate_sherrif_id = _patched_validate
 
 # ── Screener watchlist ────────────────────────────────────────────────────────
 # Tickers are loaded from tickers.json at runtime and updated daily by Claude.
@@ -77,7 +101,9 @@ CLAUDE_SYSTEM_PROMPT = (
     "of stock trading and terminology."
 )
 
-ROBIN_TOKEN_PATH = ".robin_token"
+# robin_stocks stores pickles in ~/.tokens/robinhood.<name>.pickle regardless of path
+ROBIN_TOKEN_NAME = "robin_token"
+ROBIN_TOKEN_PATH = os.path.expanduser(f"~/.tokens/robinhood.{ROBIN_TOKEN_NAME}.pickle")
 LOG_FILE = "monitor.log"
 RSI_PERIOD = 14
 MOMENTUM_TOP_N = 10
@@ -197,7 +223,7 @@ def robinhood_login():
 
     On first run, Robinhood will trigger an MFA/device-approval flow via SMS or
     the app. Follow the prompts in the terminal. The approved session is saved to
-    ROBIN_TOKEN_PATH (.robin_token) so subsequent runs are silent.
+    ROBIN_TOKEN_PATH (~/.tokens/robinhood.robin_token.pickle) so subsequent runs are silent.
 
     r.login() can return without error even when a cached token has expired.
     We validate the session immediately and, if it's dead, delete the stale token
@@ -209,7 +235,7 @@ def robinhood_login():
             username=os.getenv("ROBINHOOD_USERNAME"),
             password=os.getenv("ROBINHOOD_PASSWORD"),
             store_session=True,
-            pickle_name=ROBIN_TOKEN_PATH,
+            pickle_name=ROBIN_TOKEN_NAME,
         )
 
     _login()
@@ -220,7 +246,17 @@ def robinhood_login():
         log.warning("Session invalid after login — stale token, retrying with fresh credentials")
         if os.path.exists(ROBIN_TOKEN_PATH):
             os.remove(ROBIN_TOKEN_PATH)
+        # Wait before retrying — Robinhood rate-limits push-approval polling (429)
+        # and a back-to-back attempt will fail the same way.
+        time.sleep(60)
         _login()
+        try:
+            r.load_portfolio_profile()
+        except Exception as e:
+            raise RuntimeError(
+                "Robinhood session could not be established after two attempts. "
+                "Delete .robin_token and re-run to trigger a fresh device approval."
+            ) from e
 
 
 # ── Positions ─────────────────────────────────────────────────────────────────
