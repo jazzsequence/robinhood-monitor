@@ -27,6 +27,9 @@ import robin_stocks.robinhood as r
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+# Set a recognizable User-Agent for device-approval prompts in the Robinhood app.
+r.helper.update_session("User-Agent", "Robinhood Monitor/1.0")
+
 # robin_stocks 3.4.0 (latest) crashes when the push-approval polling endpoint
 # returns 429 (None response) instead of continuing to wait. Patch it here so
 # the fix survives venv rebuilds. Upstream bug: jmfernandes/robin_stocks#auth
