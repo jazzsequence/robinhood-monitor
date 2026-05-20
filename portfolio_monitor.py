@@ -104,9 +104,9 @@ CLAUDE_SYSTEM_PROMPT = (
     "of stock trading and terminology."
 )
 
-# robin_stocks stores pickles in ~/.tokens/robinhood.<name>.pickle regardless of path
-ROBIN_TOKEN_NAME = "robin_token"
-ROBIN_TOKEN_PATH = os.path.expanduser(f"~/.tokens/robinhood.{ROBIN_TOKEN_NAME}.pickle")
+# robin_stocks stores pickles in ~/.tokens/robinhood<name>.pickle regardless of path
+ROBIN_TOKEN_NAME = ".robin_token"
+ROBIN_TOKEN_PATH = os.path.expanduser(f"~/.tokens/robinhood{ROBIN_TOKEN_NAME}.pickle")
 LOG_FILE = "monitor.log"
 RSI_PERIOD = 14
 MOMENTUM_TOP_N = 10
