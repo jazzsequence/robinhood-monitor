@@ -257,8 +257,11 @@ def robinhood_login():
             r.load_portfolio_profile()
         except Exception as e:
             raise RuntimeError(
-                "Robinhood session could not be established after two attempts. "
-                "Delete .robin_token and re-run to trigger a fresh device approval."
+                "Robinhood session could not be established after two attempts.\n\n"
+                "To fix, run reauth.py:\n"
+                "  cd ~/Claude/robinhood-monitor && .venv/bin/python reauth.py\n\n"
+                "It will prompt you to run this in the Robinhood browser console:\n"
+                "  JSON.stringify(JSON.parse(localStorage.getItem('web:auth_state')))"
             ) from e
 
 
@@ -1431,12 +1434,13 @@ def main():
         if "logged in" in str(e).lower():
             subject = f"Portfolio Monitor — Re-authentication Required ({hostname}) - {date.today()}"
             body = (
-                f"The script could not run on {hostname} because the Robinhood session has expired "
-                f"or is no longer valid.\n\n"
+                f"The script could not run on {hostname} because the Robinhood session has expired.\n\n"
                 f"Error: {e}\n\n"
-                f"To fix: run the script manually on {hostname} to re-authenticate:\n"
-                f"  cd ~/Claude/robinhood-monitor && .venv/bin/python portfolio_monitor.py\n\n"
-                f"Follow any MFA prompts. The new session will be cached for future runs."
+                f"To fix, run reauth.py on {hostname}:\n"
+                f"  cd ~/Claude/robinhood-monitor && .venv/bin/python reauth.py\n\n"
+                f"It will prompt you to run this in the Robinhood browser console:\n"
+                f"  JSON.stringify(JSON.parse(localStorage.getItem('web:auth_state')))\n\n"
+                f"Paste the output into the terminal and the session will be restored."
             )
             try:
                 send_email(subject, body)
