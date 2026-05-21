@@ -9,10 +9,18 @@ import json
 import os
 import pickle
 import secrets
+import subprocess
 import sys
 
 PICKLE_PATH = os.path.expanduser("~/.tokens/robinhood.robin_token.pickle")
-JS_COMMAND = "JSON.stringify(JSON.parse(localStorage.getItem('web:auth_state')))"
+
+# Extracts only the fields we need, keeping the clipboard payload small
+JS_COMMAND = (
+    "(function(){"
+    "var s=JSON.parse(localStorage.getItem('web:auth_state'));"
+    "copy(JSON.stringify({access_token:s.access_token,refresh_token:s.refresh_token,token_type:s.token_type}))"
+    "})()"
+)
 
 
 def generate_device_token():
@@ -27,35 +35,30 @@ def generate_device_token():
 
 
 def main():
+    # Copy the JS command to clipboard so the user doesn't have to
+    subprocess.run(["pbcopy"], input=JS_COMMAND.encode(), check=True)
+
     print("\nRobinhood session refresh")
     print("─" * 40)
+    print("\nThe JS command has been copied to your clipboard.")
     print("\n1. Open https://robinhood.com and log in")
-    print("2. Open DevTools  (Cmd+Option+I on Mac)")
-    print("3. Go to the Console tab")
-    print("4. Paste and run this command:\n")
-    print(f"   {JS_COMMAND}\n")
-    print("5. Copy the output, paste it below, then press Enter twice:\n")
+    print("2. Open DevTools (Cmd+Option+I) → Console tab")
+    print("3. Paste and run the command — it will copy your token to the clipboard")
+    print("\nPress Enter when done...")
+    input()
 
-    lines = []
-    try:
-        while True:
-            line = input()
-            if not line and lines:
-                break
-            lines.append(line)
-    except EOFError:
-        pass
+    # Read the token the browser's copy() put in the clipboard
+    result = subprocess.run(["pbpaste"], capture_output=True, text=True)
+    raw = result.stdout.strip().strip("'")
 
-    raw = "\n".join(lines).strip()
     if not raw:
-        print("No input received.")
+        print("Clipboard is empty. Make sure the JS command ran successfully.")
         sys.exit(1)
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"Could not parse JSON: {e}")
-        print("Make sure you used JSON.stringify() in the console command.")
+        print(f"Could not parse token: {e}")
         sys.exit(1)
 
     for key in ("access_token", "refresh_token", "token_type"):
@@ -72,7 +75,7 @@ def main():
             "device_token": generate_device_token(),
         }, f)
 
-    print(f"\nSession saved to {PICKLE_PATH}")
+    print(f"Session saved to {PICKLE_PATH}")
     print("Run portfolio_monitor.py to verify.")
 
 
