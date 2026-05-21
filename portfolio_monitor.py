@@ -225,20 +225,31 @@ def git_commit_tickers():
 
 
 # ── Robinhood auth ────────────────────────────────────────────────────────────
+REAUTH_INSTRUCTIONS = (
+    "To fix, run reauth.py:\n"
+    "  cd ~/Claude/robinhood-monitor && .venv/bin/python reauth.py\n\n"
+    "It will prompt you to run this in the Robinhood browser console:\n"
+    "  JSON.stringify(JSON.parse(localStorage.getItem('web:auth_state')))"
+)
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    return "429" in str(exc) or "too many" in str(exc).lower()
+
+
 def robinhood_login():
     """
-    Log in to Robinhood with session caching.
+    Log in to Robinhood, preferring the cached pickle over the full auth flow.
 
-    On first run, Robinhood will trigger an MFA/device-approval flow via SMS or
-    the app. Follow the prompts in the terminal. The approved session is saved to
-    ROBIN_TOKEN_PATH (~/.tokens/robinhood.robin_token.pickle) so subsequent runs are silent.
+    Loads and injects the pickle session ourselves so we can distinguish a
+    real auth failure from a transient 429 — robin_stocks treats both the same
+    and would cascade into a re-auth push-notification loop on a rate limit.
 
-    r.login() can return without error even when a cached token has expired.
-    We validate the session immediately and, if it's dead, delete the stale token
-    and perform a fresh credential login. Since the device is already approved,
-    this does not trigger MFA.
+    If the pickle is missing or genuinely expired, falls through to r.login()
+    which triggers the device-approval flow. On repeated failure, raises with
+    instructions to run reauth.py.
     """
-    def _login():
+    def _do_login():
         r.login(
             username=os.getenv("ROBINHOOD_USERNAME"),
             password=os.getenv("ROBINHOOD_PASSWORD"),
@@ -246,28 +257,42 @@ def robinhood_login():
             pickle_name=ROBIN_TOKEN_NAME,
         )
 
-    _login()
+    # Load the pickle ourselves so we can handle 429 on validation without
+    # misreading it as an expired token and triggering unnecessary re-auth.
+    if os.path.exists(ROBIN_TOKEN_PATH):
+        try:
+            with open(ROBIN_TOKEN_PATH, "rb") as f:
+                import pickle as _pickle
+                data = _pickle.load(f)
+            r.helper.update_session("Authorization", f"{data['token_type']} {data['access_token']}")
+            r.authentication.set_login_state(True)
+            try:
+                r.load_portfolio_profile()
+                log.info("Loaded cached Robinhood session")
+                return
+            except Exception as e:
+                if _is_rate_limited(e):
+                    # Rate-limited during validation — session is probably still valid.
+                    # Proceed and let the actual API calls fail with a clear error if needed.
+                    log.warning("Rate-limited during session validation — assuming session still valid")
+                    return
+                log.warning("Cached session invalid — attempting fresh login")
+        except Exception:
+            log.warning("Could not load pickle — attempting fresh login")
 
+    # No valid pickle: trigger the push-notification auth flow.
+    _do_login()
     try:
         r.load_portfolio_profile()
-    except Exception:
-        log.warning("Session invalid after login — stale token, retrying with fresh credentials")
-        if os.path.exists(ROBIN_TOKEN_PATH):
-            os.remove(ROBIN_TOKEN_PATH)
-        # Wait before retrying — Robinhood rate-limits push-approval polling (429)
-        # and a back-to-back attempt will fail the same way.
-        time.sleep(60)
-        _login()
-        try:
-            r.load_portfolio_profile()
-        except Exception as e:
+    except Exception as e:
+        if _is_rate_limited(e):
             raise RuntimeError(
-                "Robinhood session could not be established after two attempts.\n\n"
-                "To fix, run reauth.py:\n"
-                "  cd ~/Claude/robinhood-monitor && .venv/bin/python reauth.py\n\n"
-                "It will prompt you to run this in the Robinhood browser console:\n"
-                "  JSON.stringify(JSON.parse(localStorage.getItem('web:auth_state')))"
+                "Robinhood API is rate-limiting this account. Wait and retry, or:\n\n"
+                + REAUTH_INSTRUCTIONS
             ) from e
+        raise RuntimeError(
+            "Robinhood session could not be established.\n\n" + REAUTH_INSTRUCTIONS
+        ) from e
 
 
 # ── Positions ─────────────────────────────────────────────────────────────────
