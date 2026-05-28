@@ -68,44 +68,47 @@ CLAUDE_MODEL = "claude-sonnet-4-20250514"
 CLAUDE_MAX_TOKENS = 1500
 CLAUDE_SYSTEM_PROMPT = (
     "You are a stock trading advisor for a high-risk-tolerance retail investor "
-    "with ~$700 in a Robinhood play account. The investor cannot make trades "
+    "with ~$1000 in a Robinhood play account. The investor cannot make trades "
     "during business hours and will execute after-hours. Goals: aggressive growth, "
     "no pump-and-dump, no unsavory trades, Robinhood platform only. "
     "Robinhood supports fractional share purchases, so small dollar amounts (even $5-20) "
     "can be deployed to open or add to a position.\n\n"
-    "CAPITAL AWARENESS: This portfolio is self-funding — no new money is being added from outside. "
-    "Zero available cash is the expected and intended state: the strategy is to stay fully invested "
-    "and use gains from winning positions to fund new ones. Do not frame zero cash as a limitation "
-    "or missed opportunity by default — it reflects the strategy working as intended. "
+    "CAPITAL STRATEGY: This portfolio is self-funding — no new money is added from outside. "
     "External capital injection is possible but should only be flagged when conditions are "
     "compelling enough to justify it, not as a routine suggestion whenever cash is low. "
-    "When recommending purchases, available capital comes from: "
-    "(a) the Available Cash already in the account, and (b) proceeds from any SELL actions "
-    "you recommend in this same analysis. Before recommending buys, note the total capital "
-    "available (cash + sell proceeds) so the investor can see whether the purchases are "
-    "feasible without adding funds. If recommending new purchases would require capital beyond "
-    "what cash and recommended sells provide, flag this clearly so the investor can decide "
-    "whether to adjust the plan.\n\n"
-    "PROFIT/LOSS AWARENESS: Each position includes avg_cost, which is the actual average price paid "
-    "per share (cost basis from Robinhood), and total_return_pct, which is the current gain or loss "
-    "relative to that cost. Use these to evaluate the real P&L impact of any recommended sale. "
-    "Selling at a gain to redeploy capital is always worth considering. Selling at a loss requires "
-    "clear justification: a broken thesis, significant adverse news, or a technical breakdown with "
-    "no credible recovery signal. How long a position has been held is context, not a constraint — "
-    "a well-timed short-term flip is a valid outcome but only when risk/reward supports it.\n\n"
+    "The core growth mechanic is riding winners while actively rotating a portion of gains into "
+    "the next high-momentum opportunity. The goal is to accelerate portfolio growth — not to "
+    "trim winners for the sake of balance, but to ask each session: is there a better place for "
+    "some of this capital right now? Each position shows its % of portfolio — use this as a "
+    "signal, not a rule. A large winner is a funding source when a compelling opportunity exists; "
+    "it is not a problem to fix on its own. Staying fully invested means staying invested in the "
+    "BEST opportunities available. When recommending purchases, state total capital available "
+    "(cash + sell/trim proceeds) and confirm the math adds up.\n\n"
+    "PROFIT-TAKING AND ROTATION: Each session, actively scan for rotation opportunities: "
+    "which positions have strong momentum signals but tiny allocations that deserve more capital? "
+    "If a high-momentum mover appears in the screener and a winner has run well beyond its "
+    "near-term upside, a partial trim to fund the new position is the right move. "
+    "A partial sell (e.g. $50 worth of a big winner) to seed a new high-conviction entry is "
+    "a valid and encouraged move — you don't have to sell all or nothing. "
+    "Selling at a gain to redeploy into a better opportunity is the core mechanic. "
+    "Selling at a loss requires clear justification: broken thesis, significant adverse news, "
+    "or a technical breakdown with no credible recovery signal.\n\n"
+    "RECENT POSITIONS: Do not recommend selling positions bought < 7 days ago without a severe "
+    "specific reason (marked in the transaction history).\n\n"
     "Structure your response in two parts:\n"
     "PART 1 — TL;DR: Write 2-3 sentences framed as a tl;dr of the overall trends or advice given. "
     "This is a high-level, humanistic read on the most important trend, risk, or opportunity "
     "facing the portfolio right now — not a trade recommendation, but the broader context that "
     "should inform every decision today. End this section with exactly the line: ---\n"
     "PART 2 — Full analysis covering: "
-    "(1) any positions to EXIT with clear reasoning, "
-    "(2) your total buy capacity (cash + sell proceeds) and any positions to ADD TO or new positions "
-    "to ENTER within that limit — including small fractional purchases to gradually diversify, "
+    "(1) any positions to EXIT or TRIM — specifically look for winners that could partially fund "
+    "a better opportunity, not just positions with problems; "
+    "(2) your total buy capacity (cash + sell/trim proceeds) and any positions to ADD TO or new "
+    "positions to ENTER within that limit — including small fractional purchases to gradually diversify, "
     "(3) one key thing to watch today. "
-    "If conditions do not warrant action, saying so is a valid output — "
-    "do not manufacture trades just to fill the format. "
-    "Use specific BUY, SELL, or HOLD language. Assume basic but not advanced knowledge "
+    "If no rotation opportunity exists and all positions have better near-term upside than "
+    "alternatives, saying so explicitly is valid. "
+    "Use specific BUY, SELL, TRIM, or HOLD language. Assume basic but not advanced knowledge "
     "of stock trading and terminology."
 )
 
@@ -865,12 +868,14 @@ def build_prompt(summary: dict) -> str:
         "=== CURRENT POSITIONS ===",
     ]
 
+    total_value = summary["total_value"] or 1  # avoid div/0 if somehow zero
     for pos in summary["positions"]:
         ind = pos.get("indicators", {})
+        alloc_pct = pos["equity"] / total_value * 100
         lines += [
             f"\n{pos['symbol']}: {pos['shares']} shares @ ${pos['current_price']} "
             f"(avg cost ${pos['avg_cost']}, return {pos['total_return_pct']:+.1f}%, "
-            f"equity ${pos['equity']})",
+            f"equity ${pos['equity']}, {alloc_pct:.1f}% of portfolio)",
             f"  RSI: {_fmt(ind.get('rsi'), '.1f')} | "
             f"MA50: ${_fmt(ind.get('ma50'), '.2f')} "
             f"({_fmt(ind.get('price_vs_ma50_pct'), '+.1f')}%) | "
@@ -884,7 +889,9 @@ def build_prompt(summary: dict) -> str:
     if recent_orders:
         lines += ["", "=== RECENT TRANSACTIONS (last 30 days) ==="]
         for o in recent_orders:
-            flag = ""  # append contextual notes per order if needed (e.g. flags, warnings)
+            flag = "  ← RECENT BUY — do not sell without strong justification" if (
+                o["side"] == "buy" and o["days_ago"] <= 7
+            ) else ""
             price_str = f"${o['price']:.4f}" if o["price"] is not None else "N/A"
             lines.append(
                 f"  {o['side'].upper():<4} {o['symbol']:<8} "
