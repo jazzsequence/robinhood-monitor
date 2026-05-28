@@ -65,7 +65,7 @@ WATCHLIST_MIN_SCORE = 15  # minimum momentum score to surface a watchlist ticker
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
-CLAUDE_MAX_TOKENS = 1500
+CLAUDE_MAX_TOKENS = 2500
 CLAUDE_SYSTEM_PROMPT = (
     "You are a stock trading advisor for a high-risk-tolerance retail investor "
     "with ~$1000 in a Robinhood play account. The investor cannot make trades "
@@ -93,6 +93,14 @@ CLAUDE_SYSTEM_PROMPT = (
     "Selling at a gain to redeploy into a better opportunity is the core mechanic. "
     "Selling at a loss requires clear justification: broken thesis, significant adverse news, "
     "or a technical breakdown with no credible recovery signal.\n\n"
+    "NEWS INTEGRATION: The market news section (Sherwood/Robinhood) appears at the top of the "
+    "prompt — read it first and let it set the macro frame before evaluating individual positions. "
+    "Ask: what sectors or themes are these headlines pointing to? Are any of those themes "
+    "underrepresented in the current portfolio? That gap is a rotation candidate. "
+    "Each position also includes its own recent headlines — use those to validate or contradict "
+    "the hold decision (a guidance cut or competitive threat is a trim signal; a major contract "
+    "win is a hold or add signal). Cite specific headlines when making recommendations. "
+    "News should drive action, not just appear as background color.\n\n"
     "RECENT POSITIONS: Do not recommend selling positions bought < 7 days ago without a severe "
     "specific reason (marked in the transaction history).\n\n"
     "Structure your response in two parts:\n"
@@ -859,6 +867,14 @@ def build_prompt(summary: dict) -> str:
         f"Available Cash: ${summary['cash']:.2f}",
     ]
 
+    sherwood = summary.get("sherwood_news", [])
+    if sherwood:
+        lines += ["", "=== TODAY'S MARKET NEWS (Sherwood / Robinhood) ===",
+                  "Use these headlines to identify macro themes, sector trends, and rotation "
+                  "opportunities. Ask what they imply for positions not yet in this portfolio."]
+        for item in sherwood:
+            lines.append(f"• {item['title'] if isinstance(item, dict) else item}")
+
     prior = summary.get("prior_analysis")
     if prior:
         lines += [
@@ -874,6 +890,7 @@ def build_prompt(summary: dict) -> str:
     ]
 
     total_value = summary["total_value"] or 1  # avoid div/0 if somehow zero
+    ticker_news = summary.get("ticker_news", {})
     for pos in summary["positions"]:
         ind = pos.get("indicators", {})
         alloc_pct = pos["equity"] / total_value * 100
@@ -889,6 +906,11 @@ def build_prompt(summary: dict) -> str:
             f"  Today: {_fmt(ind.get('pct_change_today'), '+.2f')}% | "
             f"Volume ratio: {_fmt(ind.get('volume_ratio'), '.2f')}x",
         ]
+        sym_news = ticker_news.get(pos["symbol"], [])
+        if sym_news:
+            for item in sym_news:
+                title = item["title"] if isinstance(item, dict) else item
+                lines.append(f"  News: {title}")
 
     recent_orders = summary.get("recent_orders", [])
     if recent_orders:
@@ -912,22 +934,6 @@ def build_prompt(summary: dict) -> str:
             f"Vol ratio {_fmt(m.get('volume_ratio'), '.2f')}x | "
             f"Score {m['score']}"
         )
-
-    sherwood = summary.get("sherwood_news", [])
-    if sherwood:
-        lines += ["", "=== MARKET NEWS (Sherwood / Robinhood) ==="]
-        for item in sherwood:
-            lines.append(f"• {item['title'] if isinstance(item, dict) else item}")
-
-    ticker_news = summary.get("ticker_news", {})
-    if ticker_news:
-        lines += ["", "=== TICKER NEWS (Yahoo Finance) ==="]
-        for symbol, items in ticker_news.items():
-            lines.append(f"\n{symbol}:")
-            for item in items:
-                title = item["title"] if isinstance(item, dict) else item
-                lines.append(f"  • {title}")
-
     return "\n".join(lines)
 
 
