@@ -267,7 +267,10 @@ def robinhood_login():
             r.helper.update_session("Authorization", f"{data['token_type']} {data['access_token']}")
             r.authentication.set_login_state(True)
             try:
-                r.load_portfolio_profile()
+                profile = r.load_portfolio_profile()
+                if profile is None:
+                    # robin_stocks returns None (not an exception) on 401 — token is expired.
+                    raise ValueError("load_portfolio_profile returned None — token likely expired")
                 log.info("Loaded cached Robinhood session")
                 return
             except Exception as e:
@@ -298,9 +301,12 @@ def robinhood_login():
 # ── Positions ─────────────────────────────────────────────────────────────────
 def get_positions() -> list[dict]:
     raw = r.get_open_stock_positions()
+    if not raw:
+        log.warning("get_open_stock_positions returned empty/None — session may be invalid")
+        return []
     positions = []
 
-    for pos in raw:
+    for pos in (p for p in raw if p is not None):
         try:
             shares = float(pos["quantity"])
             if shares <= 0:
