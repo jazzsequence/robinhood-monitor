@@ -101,6 +101,15 @@ CLAUDE_SYSTEM_PROMPT = (
     "the hold decision (a guidance cut or competitive threat is a trim signal; a major contract "
     "win is a hold or add signal). Cite specific headlines when making recommendations. "
     "News should drive action, not just appear as background color.\n\n"
+    "TIMING AWARENESS: The prompt header includes the day of week, current time, and market "
+    "session. Factor this into recommendations — a pre-market analysis runs before prices are "
+    "confirmed for the day; a Monday analysis follows a weekend during which no trades could "
+    "be made. Advice should reflect what is actionable at the moment it is read.\n\n"
+    "REACTIVE SELLING RULE: A single-day price drop is not itself a trim signal. Evaluate "
+    "whether the underlying thesis has changed, not whether the price is lower than yesterday. "
+    "Sector-wide pullbacks driven by a competitor's news are distinct from company-specific "
+    "deterioration — treat them differently. A trim is warranted by broken fundamentals or a "
+    "better redeployment opportunity, not by the size of today's move.\n\n"
     "RECENT POSITIONS: Do not recommend selling positions bought < 7 days ago without a severe "
     "specific reason (marked in the transaction history).\n\n"
     "Structure your response in two parts:\n"
@@ -203,7 +212,8 @@ def send_email(subject: str, body: str, html_body: str | None = None):
 def send_error_email(context: str, exc: Exception):
     """Best-effort error notification — never raises."""
     try:
-        subject = f"Portfolio Monitor ERROR - {date.today()}"
+        hostname = socket.gethostname()
+        subject = f"Portfolio Monitor ERROR ({hostname}) - {date.today()}"
         body = f"Script failed during: {context}\n\nError: {type(exc).__name__}: {exc}"
         send_email(subject, body)
     except Exception as e:
@@ -213,7 +223,14 @@ def send_error_email(context: str, exc: Exception):
 # ── Git helpers ───────────────────────────────────────────────────────────────
 def git_pull():
     """Pull latest changes before running. Non-fatal — logs and continues on failure."""
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
     try:
+        # git 2.35.2+ rejects pulls when the repo owner differs from the running user.
+        # Register this directory as safe so cron (potentially a different uid) can pull.
+        subprocess.run(
+            ["git", "config", "--global", "--add", "safe.directory", repo_dir],
+            capture_output=True, check=False
+        )
         result = subprocess.run(
             ["git", "pull", "--ff-only"],
             capture_output=True, text=True, check=True
@@ -306,7 +323,13 @@ def robinhood_login():
     # No valid pickle: trigger the push-notification auth flow.
     _do_login()
     try:
-        r.load_portfolio_profile()
+        profile = r.load_portfolio_profile()
+        if profile is None:
+            raise RuntimeError(
+                "Robinhood session could not be established.\n\n" + REAUTH_INSTRUCTIONS
+            )
+    except RuntimeError:
+        raise
     except Exception as e:
         if _is_rate_limited(e):
             raise RuntimeError(
@@ -865,8 +888,24 @@ def save_analysis(date: str, tldr: str, analysis: str):
 
 # ── Claude analysis ───────────────────────────────────────────────────────────
 def build_prompt(summary: dict) -> str:
+    from datetime import datetime
+    import pytz
+    et = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
+    day_name = now_et.strftime("%A")
+    time_str = now_et.strftime("%I:%M %p ET")
+    hour = now_et.hour
+    if now_et.weekday() >= 5:
+        session = "Market closed (weekend)"
+    elif hour < 9 or (hour == 9 and now_et.minute < 30):
+        session = "Pre-market"
+    elif hour < 16:
+        session = "Market hours"
+    else:
+        session = "After-hours"
+
     lines = [
-        f"Portfolio Summary as of {summary['date']}",
+        f"Portfolio Summary as of {summary['date']} ({day_name}, {time_str} — {session})",
         f"Total Portfolio Value: ${summary['total_value']:.2f}",
         f"Available Cash: ${summary['cash']:.2f}",
     ]
