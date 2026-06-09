@@ -118,6 +118,46 @@ A second Claude call (Haiku model, 500 tokens) runs after the momentum scan and 
 0 6 * * 1-5 cd /path/to/robinhood-monitor && /path/to/.venv/bin/python portfolio_monitor.py >> monitor.log 2>&1
 ```
 
+## Robinhood MCP Integration
+
+The official Robinhood Agentic Trading MCP is connected to this project:
+
+```bash
+# Already registered — do not re-add
+claude mcp add robinhood-trading --transport http https://agent.robinhood.com/mcp/trading
+```
+
+**What it exposes:** accounts, positions, portfolio value, order history, equity quotes, watchlists (read/write), equity order placement, order simulation (`review_equity_order`).
+
+**Two accounts are visible:**
+- Main account (••••4532) — margin, `agentic_allowed=false` — read-only via MCP; trades not possible
+- Agentic account (••••0906) — cash, `agentic_allowed=true` — trade execution enabled; currently unfunded
+
+**Agentic trading is NOT Robinhood's AI.** It is your own AI (Claude) accessing a dedicated isolated account via official OAuth. This is the sanctioned replacement for `robin_stocks`, which reverse-engineers Robinhood's private API. The script still uses `robin_stocks` for the automated cron job; the MCP is used for interactive Claude Code sessions.
+
+**Workflow for trade decisions:**
+1. Script runs at 6am → email digest sent → `last_analysis.json` updated with full technical snapshot
+2. Open a Claude Code session here and read `last_analysis.json` — it now includes positions with RSI, MAs, volume ratios, and top momentum movers
+3. Pull live quotes via `get_equity_quotes` MCP tool to check if the 6am thesis still holds
+4. Discuss the recommendation before acting — the pre-trade conversation is the human-in-the-loop filter
+5. If a trade is warranted: fund the agentic account manually in the Robinhood app, then use `review_equity_order` + `place_equity_order` MCP tools
+
+**`last_analysis.json` schema** (as of 2026-06-09):
+```json
+{
+  "date": "...", "tldr": "...", "analysis": "...",
+  "portfolio": {
+    "total_value": 0.0, "cash": 0.0,
+    "positions": [{ "symbol": "...", "shares": 0, "avg_cost": 0, "current_price": 0,
+                    "equity": 0, "total_return_pct": 0, "rsi": 0, "ma50": 0, "ma200": 0,
+                    "price_vs_ma50_pct": 0, "price_vs_ma200_pct": 0,
+                    "volume_ratio": 0, "pct_change_today": 0 }]
+  },
+  "momentum": [{ "symbol": "...", "score": 0, "rsi": 0, "ma50": 0, "ma200": 0,
+                 "price_vs_ma50_pct": 0, "volume_ratio": 0, "pct_change_today": 0 }]
+}
+```
+
 ## Security Notes
 
 - `.env`, `.robin_token`, `.venv/`, `monitor.log`, `news.json` are all gitignored — never commit them

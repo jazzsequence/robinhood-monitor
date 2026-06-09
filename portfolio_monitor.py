@@ -112,6 +112,21 @@ CLAUDE_SYSTEM_PROMPT = (
     "better redeployment opportunity, not by the size of today's move.\n\n"
     "RECENT POSITIONS: Do not recommend selling positions bought < 7 days ago without a severe "
     "specific reason (marked in the transaction history).\n\n"
+    "COST BASIS DISCIPLINE: Before recommending any sell or trim, check the position's "
+    "total_return_pct. If it is negative, you are recommending selling at a loss. This requires "
+    "a materially stronger justification than 'underperforms the portfolio' or 'funding a better "
+    "opportunity' — those are valid reasons to trim a winner, not a loser. A losing position "
+    "should only be sold if the thesis is specifically broken (adverse news, structural change) "
+    "or the capital is urgently needed for a high-conviction entry with no other funding source. "
+    "'It has been going down' is not a thesis — price weakness alone does not justify "
+    "crystallizing a loss.\n\n"
+    "REPEATED SELL PATTERN: Check the transaction history for the symbol you are considering "
+    "selling. If it has been sold two or more times in the last 30 days at declining prices, "
+    "flag this explicitly. Continuing to sell the same stock at progressively lower prices is "
+    "capitulation, not active management. At that point the question is binary: is the thesis "
+    "broken enough to exit the entire remaining position, or is it intact enough to hold? "
+    "Another small partial trim is almost never the right answer once this pattern is established — "
+    "it just locks in more loss while leaving a rounding-error position that is too small to matter.\n\n"
     "Structure your response in two parts:\n"
     "PART 1 — TL;DR: Write 2-3 sentences framed as a tl;dr of the overall trends or advice given. "
     "This is a high-level, humanistic read on the most important trend, risk, or opportunity "
@@ -880,10 +895,43 @@ def load_last_analysis() -> dict | None:
         return None
 
 
-def save_analysis(date: str, tldr: str, analysis: str):
+def save_analysis(date: str, tldr: str, analysis: str, summary: dict | None = None):
     """Persist today's Claude analysis so tomorrow's run has continuity."""
+    payload: dict = {"date": date, "tldr": tldr, "analysis": analysis}
+
+    if summary:
+        payload["portfolio"] = {
+            "total_value": summary.get("total_value"),
+            "cash": summary.get("cash"),
+            "positions": [
+                {
+                    "symbol": pos["symbol"],
+                    "shares": pos.get("shares"),
+                    "avg_cost": pos.get("avg_cost"),
+                    "current_price": pos.get("current_price"),
+                    "equity": pos.get("equity"),
+                    "total_return_pct": pos.get("total_return_pct"),
+                    **{
+                        k: pos["indicators"].get(k)
+                        for k in ("rsi", "ma50", "ma200", "price_vs_ma50_pct",
+                                  "price_vs_ma200_pct", "volume_ratio", "pct_change_today")
+                        if pos.get("indicators")
+                    },
+                }
+                for pos in summary.get("positions", [])
+            ],
+        }
+        payload["momentum"] = [
+            {
+                k: m.get(k)
+                for k in ("symbol", "score", "rsi", "ma50", "ma200",
+                          "price_vs_ma50_pct", "volume_ratio", "pct_change_today")
+            }
+            for m in summary.get("momentum", [])
+        ]
+
     with open(ANALYSIS_FILE, "w") as f:
-        json.dump({"date": date, "tldr": tldr, "analysis": analysis}, f, indent=2)
+        json.dump(payload, f, indent=2)
 
 
 # ── Claude analysis ───────────────────────────────────────────────────────────
@@ -1696,7 +1744,7 @@ def main():
         tldr, analysis = get_claude_analysis(summary)
         summary["tldr"] = tldr
         try:
-            save_analysis(today, tldr, analysis)
+            save_analysis(today, tldr, analysis, summary)
             log.info(f"Analysis saved to {ANALYSIS_FILE}")
         except Exception as save_err:
             log.warning(f"Failed to save analysis: {save_err}")
