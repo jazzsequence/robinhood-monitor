@@ -8,8 +8,10 @@
   "AVGO",
   "CDNS",
   "CEG",
+  "CVX",
   "GOOGL",
   "INTC",
+  "LRCX",
   "MARA",
   "META",
   "MRVL",
@@ -19,9 +21,10 @@
   "PANW",
   "QCOM",
   "RKLB",
-  "SMCI",
-  "TSLA",
+  "SLB",
+  "SNPS",
   "TSM",
   "UBER",
-  "UNH"
+  "UNH",
+  "XOM"
 ]
