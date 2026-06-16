@@ -1166,11 +1166,60 @@ def _h(val) -> str:
     return str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _pipe_table_to_html(block: str) -> str:
+    """Convert a GFM pipe table block to an HTML table."""
+    rows = [r.strip() for r in block.strip().splitlines()]
+    if len(rows) < 2:
+        return block
+    def parse_row(r):
+        return [c.strip() for c in r.strip("|").split("|")]
+    headers = parse_row(rows[0])
+    html = (
+        '<table width="100%" cellpadding="0" cellspacing="0" '
+        'style="border-collapse:collapse;width:100%;margin:12px 0;">'
+        "<thead><tr>"
+    )
+    for h in headers:
+        html += (
+            f'<th style="padding:6px 10px;text-align:left;font-size:11px;'
+            f'font-weight:600;color:#94a3b8;text-transform:uppercase;'
+            f'letter-spacing:0.05em;border-bottom:2px solid #e2e8f0;">{_h(h)}</th>'
+        )
+    html += "</tr></thead><tbody>"
+    for row in rows[2:]:  # skip separator line
+        if not row.strip("|").strip():
+            continue
+        cells = parse_row(row)
+        html += "<tr>"
+        for cell in cells:
+            html += (
+                f'<td style="padding:6px 10px;border-bottom:1px solid #f1f5f9;'
+                f'font-size:13px;">{_h(cell)}</td>'
+            )
+        html += "</tr>"
+    html += "</tbody></table>"
+    return html
+
+
 def _md_to_html(text: str) -> str:
     """Convert the subset of markdown Claude uses in analysis to HTML."""
+    # Convert pipe tables before any other processing (they span multiple lines)
+    text = re.sub(
+        r"(^\|.+\|[ \t]*$\n^\|[-| :]+\|[ \t]*$(?:\n^\|.+\|[ \t]*$)*)",
+        lambda m: _pipe_table_to_html(m.group(0)),
+        text,
+        flags=re.MULTILINE,
+    )
     text = _h(text)
     # **bold** → <strong>
     text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+    # # heading lines (H1) — single hash only
+    text = re.sub(
+        r"^#(?!#)\s+(.+)$",
+        r'<div style="font-size:16px;font-weight:700;color:#0f172a;margin:24px 0 10px;">\1</div>',
+        text,
+        flags=re.MULTILINE,
+    )
     # ### heading lines → styled div
     text = re.sub(
         r"^###\s+(.+)$",
