@@ -64,7 +64,7 @@ MAX_SCREENER_TICKERS = 40
 WATCHLIST_MIN_SCORE = 15  # minimum momentum score to surface a watchlist ticker as a candidate
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 CLAUDE_MAX_TOKENS = 2500
 CLAUDE_SYSTEM_PROMPT = (
     "You are a stock trading advisor for a high-risk-tolerance retail investor "
