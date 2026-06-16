@@ -150,7 +150,8 @@ CLAUDE_SYSTEM_PROMPT = (
     "winning position — say so plainly and do not hype the new ticker. "
     "Never recommend a new entry in the same breath as 'no cash, no trims.' "
     "Use specific BUY, SELL, TRIM, or HOLD language. Assume basic but not advanced knowledge "
-    "of stock trading and terminology."
+    "of stock trading and terminology. "
+    "Do not use markdown tables anywhere in your response — write all analysis as prose paragraphs."
 )
 
 # robin_stocks stores pickles in ~/.tokens/robinhood<name>.pickle regardless of path
@@ -1047,20 +1048,25 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
         analysis_part = raw
 
     # Strip model formatting artifacts that Sonnet 4.6 adds but we don't want rendered.
-    # The model echoes structural labels from the system prompt and adds its own headings.
+    # The model echoes structural labels and may wrap them in **, ##, or # markup.
+    # Pattern matches plain, **bold**, ## heading, or # heading variants of "PART N — ..."
+    _part_label = re.compile(
+        r"^(?:[#*\s]*)PART\s+[12]\s*[-—][^\n]*\n+",
+        re.IGNORECASE | re.MULTILINE,
+    )
 
-    # TL;DR: strip any leading H1 heading and "PART 1" label
-    tldr = re.sub(r"^#[^\n]+\n+", "", tldr).strip()
-    tldr = re.sub(r"^PART\s+1\s*[-—][^\n]*\n+", "", tldr, flags=re.IGNORECASE).strip()
+    # TL;DR: strip any leading heading line and "PART 1" label in any format
+    tldr = re.sub(r"^[#\s]*#[^\n]+\n+", "", tldr).strip()  # leading # heading
+    tldr = _part_label.sub("", tldr, count=1).strip()
 
-    # Analysis: strip leading separator lines and PART 2 label (may appear in either order),
-    # then strip the TRIM SIGNALS definition block if it leaked in from the prompt.
+    # Analysis: strip leading separator lines, PART 2 label, and TRIM SIGNALS block.
+    # Iterate because they can appear in any order (---\nPART 2\n--- or PART 2\n---).
     analysis_part = analysis_part.strip()
-    for _ in range(3):  # iterate a few times since separators and labels can alternate
+    for _ in range(4):
         analysis_part = re.sub(r"^---[ \t]*\n+", "", analysis_part).strip()
-        analysis_part = re.sub(r"^PART\s+2\s*[-—][^\n]*\n+", "", analysis_part, flags=re.IGNORECASE).strip()
+        analysis_part = _part_label.sub("", analysis_part, count=1).strip()
     analysis_part = re.sub(
-        r"^TRIM SIGNALS\s*[-—].*?(?=\n\n|\Z)",
+        r"^(?:[#*\s]*)TRIM SIGNALS\s*[-—].*?(?=\n\n|\Z)",
         "",
         analysis_part,
         flags=re.IGNORECASE | re.DOTALL,
