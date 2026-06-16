@@ -1045,7 +1045,29 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
     else:
         tldr = ""
         analysis_part = raw
-    return tldr, analysis_part.strip()
+
+    # Strip model formatting artifacts that Sonnet 4.6 adds but we don't want rendered.
+    # The model echoes structural labels from the system prompt and adds its own headings.
+
+    # TL;DR: strip any leading H1 heading and "PART 1" label
+    tldr = re.sub(r"^#[^\n]+\n+", "", tldr).strip()
+    tldr = re.sub(r"^PART\s+1\s*[-—][^\n]*\n+", "", tldr, flags=re.IGNORECASE).strip()
+
+    # Analysis: strip leading separator lines and PART 2 label (may appear in either order),
+    # then strip the TRIM SIGNALS definition block if it leaked in from the prompt.
+    analysis_part = analysis_part.strip()
+    for _ in range(3):  # iterate a few times since separators and labels can alternate
+        analysis_part = re.sub(r"^---[ \t]*\n+", "", analysis_part).strip()
+        analysis_part = re.sub(r"^PART\s+2\s*[-—][^\n]*\n+", "", analysis_part, flags=re.IGNORECASE).strip()
+    analysis_part = re.sub(
+        r"^TRIM SIGNALS\s*[-—].*?(?=\n\n|\Z)",
+        "",
+        analysis_part,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+    analysis_part = re.sub(r"^---[ \t]*\n+", "", analysis_part).strip()
+
+    return tldr, analysis_part
 
 
 # ── Email digest ──────────────────────────────────────────────────────────────
@@ -1167,7 +1189,8 @@ def _h(val) -> str:
 
 
 def _pipe_table_to_html(block: str) -> str:
-    """Convert a GFM pipe table block to an HTML table."""
+    """Convert a pre-escaped GFM pipe table block to an HTML table.
+    _h() must have already run on the text before this is called."""
     rows = [r.strip() for r in block.strip().splitlines()]
     if len(rows) < 2:
         return block
@@ -1183,7 +1206,7 @@ def _pipe_table_to_html(block: str) -> str:
         html += (
             f'<th style="padding:6px 10px;text-align:left;font-size:11px;'
             f'font-weight:600;color:#94a3b8;text-transform:uppercase;'
-            f'letter-spacing:0.05em;border-bottom:2px solid #e2e8f0;">{_h(h)}</th>'
+            f'letter-spacing:0.05em;border-bottom:2px solid #e2e8f0;">{h}</th>'
         )
     html += "</tr></thead><tbody>"
     for row in rows[2:]:  # skip separator line
@@ -1194,7 +1217,7 @@ def _pipe_table_to_html(block: str) -> str:
         for cell in cells:
             html += (
                 f'<td style="padding:6px 10px;border-bottom:1px solid #f1f5f9;'
-                f'font-size:13px;">{_h(cell)}</td>'
+                f'font-size:13px;">{cell}</td>'
             )
         html += "</tr>"
     html += "</tbody></table>"
@@ -1203,14 +1226,15 @@ def _pipe_table_to_html(block: str) -> str:
 
 def _md_to_html(text: str) -> str:
     """Convert the subset of markdown Claude uses in analysis to HTML."""
-    # Convert pipe tables before any other processing (they span multiple lines)
+    # HTML-escape first so _pipe_table_to_html doesn't get its output re-escaped
+    text = _h(text)
+    # Convert pipe tables (content already escaped by _h above)
     text = re.sub(
         r"(^\|.+\|[ \t]*$\n^\|[-| :]+\|[ \t]*$(?:\n^\|.+\|[ \t]*$)*)",
         lambda m: _pipe_table_to_html(m.group(0)),
         text,
         flags=re.MULTILINE,
     )
-    text = _h(text)
     # **bold** → <strong>
     text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
     # # heading lines (H1) — single hash only
