@@ -21,6 +21,7 @@ from email.mime.multipart import MIMEMultipart
 
 import feedparser
 import pandas as pd
+import pytz
 import requests
 import yfinance as yf
 import robin_stocks.robinhood as r
@@ -64,8 +65,8 @@ MAX_SCREENER_TICKERS = 40
 WATCHLIST_MIN_SCORE = 15  # minimum momentum score to surface a watchlist ticker as a candidate
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CLAUDE_MODEL = "claude-sonnet-4-6"
-CLAUDE_MAX_TOKENS = 2500
+CLAUDE_MODEL = "claude-sonnet-5"
+CLAUDE_MAX_TOKENS = 4000
 CLAUDE_SYSTEM_PROMPT = (
     "You are a stock trading advisor for a high-risk-tolerance retail investor "
     "with ~$1000 in a Robinhood play account. The investor cannot make trades "
@@ -120,13 +121,19 @@ CLAUDE_SYSTEM_PROMPT = (
     "or the capital is urgently needed for a high-conviction entry with no other funding source. "
     "'It has been going down' is not a thesis — price weakness alone does not justify "
     "crystallizing a loss.\n\n"
-    "REPEATED SELL PATTERN: Check the transaction history for the symbol you are considering "
-    "selling. If it has been sold two or more times in the last 30 days at declining prices, "
-    "flag this explicitly. Continuing to sell the same stock at progressively lower prices is "
-    "capitulation, not active management. At that point the question is binary: is the thesis "
-    "broken enough to exit the entire remaining position, or is it intact enough to hold? "
-    "Another small partial trim is almost never the right answer once this pattern is established — "
-    "it just locks in more loss while leaving a rounding-error position that is too small to matter.\n\n"
+    "REPEATED SELL PATTERN — HARD CONSTRAINT: If a '=== TRIM COUNT WARNINGS ===' section appears "
+    "in the data below, you are FORBIDDEN from recommending another partial trim for any symbol "
+    "listed there — no exceptions, even when a new buy looks compelling and that symbol is the "
+    "obvious funding source. Your only two allowed recommendations for a flagged symbol are: "
+    "(1) HOLD — the thesis is intact, take no action, or (2) FULL EXIT — the thesis is broken, "
+    "sell the entire remaining position. Continuing to sell the same stock at progressively lower "
+    "prices is capitulation, not active management, and 'this trim only makes sense because it "
+    "funds the new opportunity' is precisely the reasoning this rule exists to block — it is not "
+    "a valid override. If a new opportunity is genuinely compelling enough to require funding, "
+    "find a different funding source that is NOT flagged, or state plainly that no compelling "
+    "funding source is currently available and the opportunity should wait for new cash or a "
+    "different position's proceeds. Do not treat the warning as advisory — it is a rule, not a "
+    "data point to weigh against the buy.\n\n"
     "Structure your response in two parts:\n"
     "PART 1 — TL;DR: Write 2-3 sentences framed as a tl;dr of the overall trends or advice given. "
     "This is a high-level, humanistic read on the most important trend, risk, or opportunity "
@@ -200,6 +207,37 @@ def calculate_rsi(closes: pd.Series, period: int = RSI_PERIOD) -> float | None:
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return round(float(rsi.iloc[-1]), 2)
+
+
+def get_market_session() -> tuple[str, str, str, bool]:
+    """
+    Return (day_name, time_str, session_label, is_stale) for the current moment in ET.
+
+    is_stale is True when the most recent daily bar from yfinance reflects the prior
+    completed session rather than anything happening right now (pre-market, before
+    yfinance has created today's bar, or a weekend with no session at all). Callers
+    must relabel "today's" % change figures in that case — they are the prior
+    session's already-realized move, not new intraday action, and presenting them
+    as fresh momentum causes a single move to be double-counted across daily runs.
+    """
+    et = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
+    day_name = now_et.strftime("%A")
+    time_str = now_et.strftime("%I:%M %p ET")
+    hour = now_et.hour
+    if now_et.weekday() >= 5:
+        session = "Market closed (weekend)"
+        is_stale = True
+    elif hour < 9 or (hour == 9 and now_et.minute < 30):
+        session = "Pre-market"
+        is_stale = True
+    elif hour < 16:
+        session = "Market hours"
+        is_stale = False
+    else:
+        session = "After-hours"
+        is_stale = False
+    return day_name, time_str, session, is_stale
 
 
 # ── Email ─────────────────────────────────────────────────────────────────────
@@ -484,6 +522,35 @@ def get_recent_orders(days: int = 30) -> list[dict]:
     return recent
 
 
+def compute_trim_warnings(recent_orders: list[dict]) -> dict[str, str]:
+    """
+    Flag symbols sold 2+ times in the last 30 days at non-increasing prices.
+
+    This grounds the REPEATED SELL PATTERN rule in actual order data rather than
+    leaving Claude to infer the pattern from prose — the trim count and price
+    trail are computed here and injected as an explicit, unmissable warning.
+    """
+    sells_by_symbol: dict[str, list[dict]] = {}
+    for o in recent_orders:
+        if o["side"] == "sell" and o["price"] is not None:
+            sells_by_symbol.setdefault(o["symbol"], []).append(o)
+
+    warnings = {}
+    for symbol, sells in sells_by_symbol.items():
+        if len(sells) < 2:
+            continue
+        chronological = sorted(sells, key=lambda o: o["date"])
+        prices = [s["price"] for s in chronological]
+        if all(later <= earlier for earlier, later in zip(prices, prices[1:])):
+            price_trail = " → ".join(f"${p:.2f}" for p in prices)
+            warnings[symbol] = (
+                f"{symbol} has been sold {len(sells)}x in the last 30 days at "
+                f"declining prices ({price_trail}). Only HOLD or FULL EXIT are "
+                f"permitted for {symbol} today — no further partial trims."
+            )
+    return warnings
+
+
 # ── Watchlists ────────────────────────────────────────────────────────────────
 # User-curated lists are prioritised over Robinhood-provided lists in the
 # ticker recommendation prompt. Any list name not in either set is treated
@@ -677,10 +744,12 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
     portfolio_symbols = {p["symbol"] for p in summary["positions"]}
     slots_available = MAX_SCREENER_TICKERS - len(screener_tickers)
     max_adds = min(3, slots_available)
+    _, _, _, is_stale = get_market_session()
+    change_label = "Last session" if is_stale else "Today"
 
     momentum_lines = "\n".join(
         f"  {m['symbol']}: RSI {_fmt(m.get('rsi'), '.1f')} | "
-        f"Today {_fmt(m.get('pct_change_today'), '+.2f')}% | "
+        f"{change_label} {_fmt(m.get('pct_change_today'), '+.2f')}% | "
         f"Vol {_fmt(m.get('volume_ratio'), '.2f')}x | Score {m['score']}"
         for m in summary["momentum"]
     ) or "  (none)"
@@ -708,7 +777,7 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
             return "  (none)"
         return "\n".join(
             f"  {c['symbol']}: RSI {_fmt(c.get('rsi'), '.1f')} | "
-            f"Today {_fmt(c.get('pct_change_today'), '+.2f')}% | "
+            f"{change_label} {_fmt(c.get('pct_change_today'), '+.2f')}% | "
             f"Vol {_fmt(c.get('volume_ratio'), '.2f')}x | Score {c['score']}"
             for c in candidates
         )
@@ -729,14 +798,23 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
         if prior and prior.get("tldr") else ""
     )
 
+    stale_note = (
+        "NOTE: No new trading session has started yet, so every "
+        f'"{change_label}" percentage below is the prior completed session\'s '
+        "already-known move, not new intraday action — do not treat it as fresh "
+        "momentum on top of what the prior analysis TL;DR above already reported.\n\n"
+        if is_stale else ""
+    )
+
     prompt = (
         f"{prior_tldr_line}"
+        f"{stale_note}"
         f"Current screener watchlist ({len(screener_tickers)} tickers, max {MAX_SCREENER_TICKERS}):\n"
         f"{', '.join(screener_tickers)}\n\n"
         f"{removal_note}\n\n"
         f"Portfolio positions (do not add these):\n"
         f"{', '.join(portfolio_symbols)}\n\n"
-        f"Today's top momentum movers (from the screener scan):\n"
+        f"{change_label}'s top momentum movers (from the screener scan):\n"
         f"{momentum_lines}\n\n"
         f"Tickers from the USER'S OWN watchlists (Gaming, Tech, My First List) with momentum "
         f"signals — these are highest priority for addition:\n"
@@ -942,27 +1020,24 @@ def save_analysis(date: str, tldr: str, analysis: str, summary: dict | None = No
 
 # ── Claude analysis ───────────────────────────────────────────────────────────
 def build_prompt(summary: dict) -> str:
-    from datetime import datetime
-    import pytz
-    et = pytz.timezone("America/New_York")
-    now_et = datetime.now(et)
-    day_name = now_et.strftime("%A")
-    time_str = now_et.strftime("%I:%M %p ET")
-    hour = now_et.hour
-    if now_et.weekday() >= 5:
-        session = "Market closed (weekend)"
-    elif hour < 9 or (hour == 9 and now_et.minute < 30):
-        session = "Pre-market"
-    elif hour < 16:
-        session = "Market hours"
-    else:
-        session = "After-hours"
+    day_name, time_str, session, is_stale = get_market_session()
+    change_label = "Last session" if is_stale else "Today"
 
     lines = [
         f"Portfolio Summary as of {summary['date']} ({day_name}, {time_str} — {session})",
         f"Total Portfolio Value: ${summary['total_value']:.2f}",
         f"Available Cash: ${summary['cash']:.2f}",
     ]
+    if is_stale:
+        lines.append(
+            "NOTE: No new trading session has started yet, so every "
+            f'"{change_label}" percentage below is the prior completed session\'s '
+            "move — it already happened and was already knowable in the PRIOR RUN "
+            "ANALYSIS section (if one appears further down). Do not narrate it as "
+            "happening 'this morning' or as an additional day of momentum on top "
+            "of what the prior run already reported — check the prior run's date "
+            "against today's date before treating a move as new."
+        )
 
     sherwood = summary.get("sherwood_news", [])
     if sherwood:
@@ -1000,7 +1075,7 @@ def build_prompt(summary: dict) -> str:
             f"({_fmt(ind.get('price_vs_ma50_pct'), '+.1f')}%) | "
             f"MA200: ${_fmt(ind.get('ma200'), '.2f')} "
             f"({_fmt(ind.get('price_vs_ma200_pct'), '+.1f')}%)",
-            f"  Today: {_fmt(ind.get('pct_change_today'), '+.2f')}% | "
+            f"  {change_label}: {_fmt(ind.get('pct_change_today'), '+.2f')}% | "
             f"Volume ratio: {_fmt(ind.get('volume_ratio'), '.2f')}x",
         ]
         sym_news = ticker_news.get(pos["symbol"], [])
@@ -1023,11 +1098,17 @@ def build_prompt(summary: dict) -> str:
                 f"{o['date']} ({o['days_ago']}d ago){flag}"
             )
 
+    trim_warnings = compute_trim_warnings(recent_orders)
+    if trim_warnings:
+        lines += ["", "=== TRIM COUNT WARNINGS ==="]
+        for warning in trim_warnings.values():
+            lines.append(f"⚠ {warning}")
+
     lines += ["", "=== TOP MOMENTUM MOVERS (not in portfolio) ==="]
     for m in summary["momentum"]:
         lines.append(
             f"\n{m['symbol']}: RSI {_fmt(m.get('rsi'), '.1f')} | "
-            f"Today {_fmt(m.get('pct_change_today'), '+.2f')}% | "
+            f"{change_label} {_fmt(m.get('pct_change_today'), '+.2f')}% | "
             f"Vol ratio {_fmt(m.get('volume_ratio'), '.2f')}x | "
             f"Score {m['score']}"
         )
@@ -1041,6 +1122,7 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
     message = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=CLAUDE_MAX_TOKENS,
+        thinking={"type": "disabled"},
         system=CLAUDE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -1052,7 +1134,7 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
         tldr = ""
         analysis_part = raw
 
-    # Strip model formatting artifacts that Sonnet 4.6 adds but we don't want rendered.
+    # Strip model formatting artifacts that Claude adds but we don't want rendered.
     # The model echoes structural labels and may wrap them in **, ##, or # markup.
     # Pattern matches plain, **bold**, ## heading, or # heading variants of "PART N — ..."
     _part_label = re.compile(

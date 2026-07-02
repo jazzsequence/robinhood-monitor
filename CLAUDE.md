@@ -59,8 +59,8 @@ Python 3.11+ required (uses `float | None` union type syntax).
 | `MIN_SCREENER_TICKERS` | `25` | Minimum watchlist size |
 | `MAX_SCREENER_TICKERS` | `40` | Hard cap on watchlist size |
 | `WATCHLIST_MIN_SCORE` | `15` | Minimum momentum score to surface a Robinhood watchlist ticker |
-| `CLAUDE_MODEL` | `claude-sonnet-4-20250514` | Model for portfolio analysis |
-| `CLAUDE_MAX_TOKENS` | `1500` | Max response length for analysis |
+| `CLAUDE_MODEL` | `claude-sonnet-5` | Model for portfolio analysis (thinking explicitly disabled — see below) |
+| `CLAUDE_MAX_TOKENS` | `4000` | Max response length for analysis |
 | `RSI_PERIOD` | `14` | RSI calculation window |
 | `MOMENTUM_TOP_N` | `10` | Max momentum candidates returned |
 | `USER_WATCHLISTS` | `{"My First List", "Gaming", "Tech"}` | Your watchlists (highest priority) |
