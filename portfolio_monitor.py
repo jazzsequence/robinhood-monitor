@@ -113,12 +113,21 @@ CLAUDE_SYSTEM_PROMPT = (
     "better redeployment opportunity, not by the size of today's move.\n\n"
     "RECENT POSITIONS: Do not recommend selling positions bought < 7 days ago without a severe "
     "specific reason (marked in the transaction history).\n\n"
-    "COST BASIS DISCIPLINE: Before recommending any sell or trim, check the position's "
-    "total_return_pct. If it is negative, you are recommending selling at a loss. This requires "
-    "a materially stronger justification than 'underperforms the portfolio' or 'funding a better "
-    "opportunity' — those are valid reasons to trim a winner, not a loser. A losing position "
-    "should only be sold if the thesis is specifically broken (adverse news, structural change) "
-    "or the capital is urgently needed for a high-conviction entry with no other funding source. "
+    "COST BASIS DISCIPLINE — HARD CONSTRAINT: Each position below is tagged FUNDING-ELIGIBLE or "
+    "NOT FUNDING-ELIGIBLE, computed from its actual total_return_pct — not from today's price "
+    "move, RSI, or distance from its moving averages, all of which describe short-term technical "
+    "strength and say nothing about whether the position is a gain or a loss on cost basis. A "
+    "position can be up today and above its MA50 while still being NOT FUNDING-ELIGIBLE because "
+    "it is underwater on cost basis — that is not a contradiction, and today's move does not "
+    "override it. The '=== ELIGIBLE FUNDING SOURCES ===' list is the complete set of positions "
+    "you may trim to fund a new buy. Trim from that list, best-first, unless you explicitly state "
+    "why you are overriding it. The only valid overrides are: (1) the position's thesis is "
+    "specifically broken (adverse news, structural change) and you are selling for that reason, "
+    "independent of funding a new buy, or (2) the eligible list is empty or insufficient and the "
+    "capital is urgently needed with no other option. If you recommend trimming a NOT "
+    "FUNDING-ELIGIBLE position without invoking one of these two overrides by name, your output "
+    "is invalid. When you do recommend a trim, state the position's total_return_pct in your "
+    "one-sentence reasoning so the funding source is verifiably a winner, not just a mover. "
     "'It has been going down' is not a thesis — price weakness alone does not justify "
     "crystallizing a loss.\n\n"
     "REPEATED SELL PATTERN — HARD CONSTRAINT: If a '=== TRIM COUNT WARNINGS ===' section appears "
@@ -530,11 +539,17 @@ def get_recent_orders(days: int = 30) -> list[dict]:
 
 def compute_trim_warnings(recent_orders: list[dict]) -> dict[str, str]:
     """
-    Flag symbols sold 2+ times in the last 30 days at non-increasing prices.
+    Flag symbols sold 2+ times in the last 30 days where the most recent sale
+    undercut every prior sale in the window (a capitulation pattern).
 
     This grounds the REPEATED SELL PATTERN rule in actual order data rather than
     leaving Claude to infer the pattern from prose — the trim count and price
     trail are computed here and injected as an explicit, unmissable warning.
+
+    Uses "latest <= min(all prior)" rather than requiring every consecutive pair
+    to be non-increasing — a single mid-sequence uptick (e.g. a brief bounce
+    between two otherwise-declining trims) would otherwise silently defeat
+    detection of an overall declining/capitulation pattern.
     """
     sells_by_symbol: dict[str, list[dict]] = {}
     for o in recent_orders:
@@ -547,7 +562,7 @@ def compute_trim_warnings(recent_orders: list[dict]) -> dict[str, str]:
             continue
         chronological = sorted(sells, key=lambda o: o["date"])
         prices = [s["price"] for s in chronological]
-        if all(later <= earlier for earlier, later in zip(prices, prices[1:])):
+        if prices[-1] <= min(prices[:-1]):
             price_trail = " → ".join(f"${p:.2f}" for p in prices)
             warnings[symbol] = (
                 f"{symbol} has been sold {len(sells)}x in the last 30 days at "
@@ -1067,15 +1082,38 @@ def build_prompt(summary: dict) -> str:
         "=== CURRENT POSITIONS ===",
     ]
 
+    # Compute these up front (not just at the transactions section further down)
+    # so each position can be tagged with its funding eligibility inline. Leaving
+    # Claude to eyeball total_return_pct in prose was how a loser (MRVL, -13.2%)
+    # got described as "not a loser" and recommended as a funding source — this
+    # makes the winner/loser and restricted/unrestricted status an explicit,
+    # unmissable field per position instead of an inference the model has to make.
+    recent_orders = summary.get("recent_orders", [])
+    trim_warnings = compute_trim_warnings(recent_orders)
+    protected_symbols = {
+        o["symbol"] for o in recent_orders
+        if o["side"] == "buy" and o["days_ago"] <= 7
+    }
+
     total_value = summary["total_value"] or 1  # avoid div/0 if somehow zero
     ticker_news = summary.get("ticker_news", {})
     for pos in summary["positions"]:
         ind = pos.get("indicators", {})
         alloc_pct = pos["equity"] / total_value * 100
+        symbol = pos["symbol"]
+        is_winner = pos["total_return_pct"] > 0
+        if not is_winner:
+            funding_tag = "NOT FUNDING-ELIGIBLE — losing position (see COST BASIS DISCIPLINE)"
+        elif symbol in trim_warnings:
+            funding_tag = "NOT FUNDING-ELIGIBLE — repeated-sell hard stop (see TRIM COUNT WARNINGS)"
+        elif symbol in protected_symbols:
+            funding_tag = "NOT FUNDING-ELIGIBLE — bought within the last 7 days"
+        else:
+            funding_tag = "FUNDING-ELIGIBLE — winner, unrestricted"
         lines += [
-            f"\n{pos['symbol']}: {pos['shares']} shares @ ${pos['current_price']} "
+            f"\n{symbol}: {pos['shares']} shares @ ${pos['current_price']} "
             f"(avg cost ${pos['avg_cost']}, return {pos['total_return_pct']:+.1f}%, "
-            f"equity ${pos['equity']}, {alloc_pct:.1f}% of portfolio)",
+            f"equity ${pos['equity']}, {alloc_pct:.1f}% of portfolio)  [{funding_tag}]",
             f"  RSI: {_fmt(ind.get('rsi'), '.1f')} | "
             f"MA50: ${_fmt(ind.get('ma50'), '.2f')} "
             f"({_fmt(ind.get('price_vs_ma50_pct'), '+.1f')}%) | "
@@ -1084,13 +1122,30 @@ def build_prompt(summary: dict) -> str:
             f"  {change_label}: {_fmt(ind.get('pct_change_today'), '+.2f')}% | "
             f"Volume ratio: {_fmt(ind.get('volume_ratio'), '.2f')}x",
         ]
-        sym_news = ticker_news.get(pos["symbol"], [])
+        sym_news = ticker_news.get(symbol, [])
         if sym_news:
             for item in sym_news:
                 title = item["title"] if isinstance(item, dict) else item
                 lines.append(f"  News: {title}")
 
-    recent_orders = summary.get("recent_orders", [])
+    eligible = sorted(
+        (p for p in summary["positions"]
+         if p["total_return_pct"] > 0
+         and p["symbol"] not in trim_warnings
+         and p["symbol"] not in protected_symbols),
+        key=lambda p: p["total_return_pct"],
+        reverse=True,
+    )
+    lines += ["", "=== ELIGIBLE FUNDING SOURCES (winners, unrestricted, best first) ==="]
+    if eligible:
+        for p in eligible:
+            lines.append(
+                f"  {p['symbol']:<8} return {p['total_return_pct']:+.1f}%  "
+                f"equity ${p['equity']:.2f}"
+            )
+    else:
+        lines.append("  None — every position is currently either a loser or restricted.")
+
     if recent_orders:
         lines += ["", "=== RECENT TRANSACTIONS (last 30 days) ==="]
         for o in recent_orders:
@@ -1104,7 +1159,6 @@ def build_prompt(summary: dict) -> str:
                 f"{o['date']} ({o['days_ago']}d ago){flag}"
             )
 
-    trim_warnings = compute_trim_warnings(recent_orders)
     if trim_warnings:
         lines += ["", "=== TRIM COUNT WARNINGS ==="]
         for warning in trim_warnings.values():
