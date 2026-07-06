@@ -134,17 +134,16 @@ CLAUDE_SYSTEM_PROMPT = (
     "funding source is currently available and the opportunity should wait for new cash or a "
     "different position's proceeds. Do not treat the warning as advisory — it is a rule, not a "
     "data point to weigh against the buy.\n\n"
-    "Structure your response in two parts:\n"
-    "PART 1 — TL;DR: Write 2-3 sentences framed as a tl;dr of the overall trends or advice given. "
+    "First, write 2-3 sentences framed as a tl;dr of the overall trends or advice given. "
     "This is a high-level, humanistic read on the most important trend, risk, or opportunity "
     "facing the portfolio right now — not a trade recommendation, but the broader context that "
-    "should inform every decision today. End this section with exactly the line: ---\n"
+    "should inform every decision today. End this paragraph with exactly the line: ---\n"
     "TRIM SIGNALS — consider a partial trim (even without a broken thesis) when a position is "
     "30%+ above its MA50, a single position exceeds 35% of portfolio, or a high-momentum "
     "opportunity exists that the portfolio doesn't yet capture. "
     "A partial trim means selling $25–100 worth, not exiting. Riding a winner and taking partial "
     "profits are not mutually exclusive.\n\n"
-    "PART 2 — Full analysis in three blocks. Do not use --- as dividers between blocks. "
+    "Then write a full analysis in three blocks. Do not use --- as dividers between blocks. "
     "Avoid trading jargon — write plainly for someone who trades casually but is not an expert.\n\n"
     "TRIMS/EXITS: Only list positions actually being trimmed or exited — one bold action line "
     "per trim (e.g. **TRIM ARM — Sell $50**) followed by one sentence of reasoning. "
@@ -152,16 +151,23 @@ CLAUDE_SYSTEM_PROMPT = (
     "If nothing to trim, say so in one sentence.\n\n"
     "BUYS: State total capital available (cash + trim proceeds) in one line. Then one bold action "
     "line per buy (e.g. **BUY MRVL — $35**) with one sentence of reasoning. "
-    "Do not include a capital math summary — state each buy exactly once.\n\n"
+    "Do not include a capital math summary — state each buy exactly once. "
+    "If a move is genuinely compelling but there is no internal funding source (no cash, no "
+    "reasonable trim, everything else restricted or a loser), do not just say 'no buys today' — "
+    "say explicitly that the opportunity is worth funding with outside cash (a deposit) even "
+    "though nothing internal can fund it, and name the ticker and why.\n\n"
     "HOLDS: List each held position on its own line with a brief reason. "
     "Do not group positions into categories.\n\n"
     "End with **ONE KEY THING TO WATCH TODAY:** followed by one sentence describing something "
     "not yet actionable. If it is actionable, put it in TRIMS or BUYS instead.\n\n"
     "INTERNAL CONSISTENCY RULE: If you identify a compelling new entry opportunity but have no cash "
-    "and recommend no trims, your output is self-contradicting. You must resolve it one of two ways: "
-    "the opportunity IS compelling — identify a trim to fund it and recommend both together — or "
-    "the opportunity is NOT compelling enough to justify disrupting a winning position, in which case "
-    "say so plainly. Never recommend a new entry alongside 'no cash, no trims.' "
+    "and recommend no trims, your output is self-contradicting unless you explicitly resolve it one "
+    "of three ways: (1) the opportunity IS compelling — identify a trim to fund it and recommend "
+    "both together; (2) the opportunity is NOT compelling enough to justify disrupting a winning "
+    "position — say so plainly; or (3) the opportunity IS compelling but no internal funding source "
+    "exists right now — say so plainly and flag it as worth funding with a deposit instead of letting "
+    "it pass silently. Never recommend a new entry alongside 'no cash, no trims' without picking one "
+    "of these three. "
     "Use specific BUY, SELL, TRIM, or HOLD language. Be concise — lead with the decision, "
     "one sentence of reasoning per position. Do not output systematic check tables or grids."
 )
@@ -1134,24 +1140,34 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
         tldr = ""
         analysis_part = raw
 
-    # Strip model formatting artifacts that Claude adds but we don't want rendered.
-    # The model echoes structural labels and may wrap them in **, ##, or # markup.
-    # Pattern matches plain, **bold**, ## heading, or # heading variants of "PART N — ..."
-    _part_label = re.compile(
-        r"^(?:[#*\s]*)PART\s+[12]\s*[-—][^\n]*\n+",
-        re.IGNORECASE | re.MULTILINE,
+    # Strip model formatting artifacts that Claude sometimes echoes but we don't want
+    # rendered — e.g. a stray "PART 1"/"TL;DR:" label, whether it's glued onto the
+    # start of the real content on the same line ("PART 1 — TL;DR: Chips are...") or
+    # sitting alone on its own line ("PART 2\n\nTRIMS/EXITS..."). Only strip when the
+    # matched prefix actually contains one of these labels, so legitimate leading
+    # markdown (e.g. "**TRIM ARM**") is never touched.
+    _FILLER = r"[\s#*\-—:]*"
+    _label_re = re.compile(
+        rf"^{_FILLER}(?:PART\s+[12]\b{_FILLER})?(?:TL;DR{_FILLER})?",
+        re.IGNORECASE,
     )
 
-    # TL;DR: strip any leading heading line and "PART 1" label in any format
-    tldr = re.sub(r"^[#\s]*#[^\n]+\n+", "", tldr).strip()  # leading # heading
-    tldr = _part_label.sub("", tldr, count=1).strip()
+    def _strip_label(text: str) -> str:
+        m = _label_re.match(text)
+        if m and re.search(r"PART\s+[12]\b|TL;DR", m.group(0), re.IGNORECASE):
+            return text[m.end():].lstrip()
+        return text
 
-    # Analysis: strip leading separator lines, PART 2 label, and TRIM SIGNALS block.
-    # Iterate because they can appear in any order (---\nPART 2\n--- or PART 2\n---).
+    # TL;DR: strip any leading heading line, then a leading "PART 1"/"TL;DR:" label.
+    tldr = re.sub(r"^[#\s]*#[^\n]+\n+", "", tldr).strip()  # leading # heading
+    tldr = _strip_label(tldr).strip()
+
+    # Analysis: strip leading separator lines, a "PART 2" label, and TRIM SIGNALS
+    # block. Iterate because they can appear in any order.
     analysis_part = analysis_part.strip()
     for _ in range(4):
         analysis_part = re.sub(r"^---[ \t]*\n+", "", analysis_part).strip()
-        analysis_part = _part_label.sub("", analysis_part, count=1).strip()
+        analysis_part = _strip_label(analysis_part).strip()
     analysis_part = re.sub(
         r"^(?:[#*\s]*)TRIM SIGNALS\s*[-—].*?(?=\n\n|\Z)",
         "",
