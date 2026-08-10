@@ -63,6 +63,10 @@ ANALYSIS_FILE = "last_analysis.json"
 MIN_SCREENER_TICKERS = 25
 MAX_SCREENER_TICKERS = 40
 WATCHLIST_MIN_SCORE = 15  # minimum momentum score to surface a watchlist ticker as a candidate
+PROTECTED_SYMBOLS = {"COST"}  # core long-term holdings; see PROTECTED SYMBOL rule in CLAUDE_SYSTEM_PROMPT
+PROTECTED_TRIM_MAX_PCT = 0.10  # max fraction of a protected symbol's OWN equity trimmable per action
+PROTECTED_COMMITMENTS_FILE = "protected_commitments.json"
+SMALL_POSITION_THRESHOLD = 10  # equity ($) at/under which a position is a cleanup candidate
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CLAUDE_MODEL = "claude-sonnet-5"
@@ -156,6 +160,35 @@ CLAUDE_SYSTEM_PROMPT = (
     "equity and the trim as a share of it (e.g. 'Sell $20 of a $95 position, ~21%') so the sizing is "
     "verifiable. The fixed-dollar examples elsewhere in this prompt are illustrative only and never "
     "override this ratio.\n\n"
+    "PROTECTED SYMBOL RULE: Symbols tagged LIMITED FUNDING SOURCE or FUNDING BLOCKED in the "
+    "position data are core long-term holdings and should almost never be trimmed to fund "
+    "something else — they are not off-limits, but heavily constrained. A trim of a protected "
+    "symbol must not exceed the dollar cap given in the '=== PROTECTED SYMBOLS ===' section (10% "
+    "of that position's own equity) — this overrides the normal ~50% POSITION-SIZE-AWARE TRIM "
+    "SIZING rule for these symbols specifically. Any trim of a protected symbol must be paired, "
+    "in the same recommendation, with an explicit reinvestment condition: a price at or below "
+    "the trim's sale price, or a named technical pullback/support level. A plan that would only "
+    "buy back at a higher price is not acceptable — recommend HOLD instead. The small mandatory "
+    "size plus the required reinvestment plan are intentional: trimming a protected symbol should "
+    "be rare, not routine.\n\n"
+    "PROTECTED SYMBOL REINVESTMENT — HARD CONSTRAINT: If a symbol appears in the "
+    "'=== OUTSTANDING REINVESTMENT COMMITMENTS ===' section, you are FORBIDDEN from recommending "
+    "another partial trim of it — no exceptions — until that commitment no longer appears there. "
+    "This is tracked by the script from actual order history, not from anything stated in a prior "
+    "analysis, so there is no way to satisfy it except a real buy-back — restating the plan again "
+    "does not clear it. The only allowed override is a FULL EXIT for a specifically broken thesis "
+    "(adverse news, structural change), named explicitly. If the current price shown alongside "
+    "the commitment has already reached the committed level, prioritize recommending that "
+    "reinvestment buy this session over other new entries.\n\n"
+    "SMALL POSITION CLEANUP RULE: Positions tagged [SMALL POSITION] default to a full-exit "
+    "candidate rather than an automatic hold. Recommend a full exit when the position is stale — "
+    "no momentum signal (RSI outside the 55-75 momentum zone, price flat against MA50, volume "
+    "ratio near 1x, little movement today), no supportive recent news, and not bought in the last "
+    "30 days. Keep it only with a specific stated reason — a live catalyst, a still-developing "
+    "recent buy, an active momentum signal, or supportive news — named explicitly in HOLDS. This "
+    "is an explicit exception to COST BASIS DISCIPLINE: a small stale position may be closed even "
+    "at a loss, citing 'SMALL POSITION CLEANUP' instead of a broken-thesis reason, because the "
+    "action is portfolio hygiene, not funding a new buy.\n\n"
     "First, write 2-3 sentences framed as a tl;dr of the overall trends or advice given. "
     "This is a high-level, humanistic read on the most important trend, risk, or opportunity "
     "facing the portfolio right now — not a trade recommendation, but the broader context that "
@@ -169,7 +202,9 @@ CLAUDE_SYSTEM_PROMPT = (
     "Then write a full analysis in three blocks. Do not use --- as dividers between blocks. "
     "Avoid trading jargon — write plainly for someone who trades casually but is not an expert.\n\n"
     "TRIMS/EXITS: Only list positions actually being trimmed or exited — one bold action line "
-    "per trim (e.g. **TRIM ARM — Sell $50**) followed by one sentence of reasoning. "
+    "per trim (e.g. **TRIM ARM — Sell $50**) followed by one sentence of reasoning. For a "
+    "protected-symbol trim, state the reinvestment condition in that same sentence — this is "
+    "required for the commitment to be tracked. "
     "Do not mention positions that are merely being held; those go in HOLDS. "
     "If nothing to trim, say so in one sentence.\n\n"
     "BUYS: State total capital available (cash + trim proceeds) in one line. Then one bold action "
@@ -584,6 +619,98 @@ def compute_trim_warnings(recent_orders: list[dict]) -> dict[str, str]:
                 f"permitted for {symbol} today — no further partial trims."
             )
     return warnings
+
+
+def load_protected_commitments() -> list[dict]:
+    """Load outstanding protected-symbol reinvestment commitments. [] if missing/invalid."""
+    try:
+        with open(PROTECTED_COMMITMENTS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_protected_commitments(commitments: list[dict]) -> None:
+    with open(PROTECTED_COMMITMENTS_FILE, "w") as f:
+        json.dump(commitments, f, indent=2)
+
+
+def resolve_protected_commitments(
+    commitments: list[dict], recent_orders: list[dict], held_symbols: set[str]
+) -> list[dict]:
+    """
+    Drop commitments that are no longer outstanding: the symbol was fully exited,
+    or a real buy order at/below the committed price landed after the trim.
+
+    Only real order history (or the position vanishing) clears a commitment —
+    never anything the model says in a later run's analysis. This is what makes
+    the PROTECTED SYMBOL REINVESTMENT hard constraint actually enforceable
+    instead of an honor-system request repeated each run.
+    """
+    still_outstanding = []
+    for c in commitments:
+        symbol = c["symbol"]
+        if symbol not in held_symbols:
+            continue  # fully exited — nothing left to enforce a reinvestment into
+
+        fulfilled = any(
+            o["symbol"] == symbol
+            and o["side"] == "buy"
+            and o["price"] is not None
+            and o["price"] <= c["reinvest_price"]
+            and o["date"] > c["trim_date"]
+            for o in recent_orders
+        )
+        if not fulfilled:
+            still_outstanding.append(c)
+    return still_outstanding
+
+
+def extract_protected_commitment(
+    analysis_text: str, protected_held: list[str], today: str
+) -> list[dict]:
+    """
+    Pull any protected-symbol trim + its stated reinvestment condition out of
+    today's analysis text, so it can be persisted and enforced on future runs.
+    Returns [] (and logs a warning) on any failure — never blocks the digest.
+    """
+    prompt = (
+        f"Protected symbols: {', '.join(protected_held)}\n\n"
+        f"Today's portfolio analysis:\n{analysis_text}\n\n"
+        f"Did this analysis recommend a TRIM (partial sell) of any protected symbol "
+        f"listed above? For each one, extract the trim dollar amount and the stated "
+        f"reinvestment condition (a target price to buy back at or below). "
+        f"Respond with ONLY valid JSON — no markdown, no explanation:\n"
+        f'{{"trims": [{{"symbol": "SYM", "trim_amount": 0.0, "reinvest_price": 0.0}}]}}\n\n'
+        f"Return an empty list if no protected symbol was trimmed today, or if no "
+        f"explicit reinvestment price/level was stated."
+    )
+    try:
+        client = Anthropic()
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system="You extract structured trim commitments from prose. Return only valid JSON.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = "\n".join(raw.split("\n")[1:])
+            raw = raw.rsplit("```", 1)[0].strip()
+        trims = json.loads(raw).get("trims", [])
+        return [
+            {
+                "symbol": t["symbol"],
+                "trim_amount": float(t["trim_amount"]),
+                "reinvest_price": float(t["reinvest_price"]),
+                "trim_date": today,
+            }
+            for t in trims
+            if t.get("symbol") in protected_held and t.get("reinvest_price")
+        ]
+    except Exception as e:
+        log.warning(f"Protected commitment extraction failed: {e}")
+        return []
 
 
 # ── Watchlists ────────────────────────────────────────────────────────────────
@@ -1104,10 +1231,11 @@ def build_prompt(summary: dict) -> str:
     # unmissable field per position instead of an inference the model has to make.
     recent_orders = summary.get("recent_orders", [])
     trim_warnings = compute_trim_warnings(recent_orders)
-    protected_symbols = {
+    recent_buy_symbols = {
         o["symbol"] for o in recent_orders
         if o["side"] == "buy" and o["days_ago"] <= 7
     }
+    outstanding_by_symbol = {c["symbol"]: c for c in summary.get("protected_commitments", [])}
 
     total_value = summary["total_value"] or 1  # avoid div/0 if somehow zero
     ticker_news = summary.get("ticker_news", {})
@@ -1120,14 +1248,32 @@ def build_prompt(summary: dict) -> str:
             funding_tag = "NOT FUNDING-ELIGIBLE — losing position (see COST BASIS DISCIPLINE)"
         elif symbol in trim_warnings:
             funding_tag = "NOT FUNDING-ELIGIBLE — repeated-sell hard stop (see TRIM COUNT WARNINGS)"
-        elif symbol in protected_symbols:
+        elif symbol in recent_buy_symbols:
             funding_tag = "NOT FUNDING-ELIGIBLE — bought within the last 7 days"
+        elif symbol in PROTECTED_SYMBOLS:
+            if symbol in outstanding_by_symbol:
+                c = outstanding_by_symbol[symbol]
+                funding_tag = (
+                    f"FUNDING BLOCKED — protected symbol has an unresolved reinvestment "
+                    f"commitment from {c['trim_date']} (see OUTSTANDING REINVESTMENT COMMITMENTS)"
+                )
+            else:
+                cap = pos["equity"] * PROTECTED_TRIM_MAX_PCT
+                funding_tag = (
+                    f"LIMITED FUNDING SOURCE — protected symbol, max ${cap:.2f} "
+                    f"({PROTECTED_TRIM_MAX_PCT:.0%} of equity) per trim, reinvestment plan required"
+                )
         else:
             funding_tag = "FUNDING-ELIGIBLE — winner, unrestricted"
+        small_tag = (
+            f"  [SMALL POSITION — equity ${pos['equity']:.2f}, evaluate for cleanup per "
+            f"SMALL POSITION CLEANUP rule]"
+            if pos["equity"] <= SMALL_POSITION_THRESHOLD else ""
+        )
         lines += [
             f"\n{symbol}: {pos['shares']} shares @ ${pos['current_price']} "
             f"(avg cost ${pos['avg_cost']}, return {pos['total_return_pct']:+.1f}%, "
-            f"equity ${pos['equity']}, {alloc_pct:.1f}% of portfolio)  [{funding_tag}]",
+            f"equity ${pos['equity']}, {alloc_pct:.1f}% of portfolio)  [{funding_tag}]{small_tag}",
             f"  RSI: {_fmt(ind.get('rsi'), '.1f')} | "
             f"MA50: ${_fmt(ind.get('ma50'), '.2f')} "
             f"({_fmt(ind.get('price_vs_ma50_pct'), '+.1f')}%) | "
@@ -1146,7 +1292,8 @@ def build_prompt(summary: dict) -> str:
         (p for p in summary["positions"]
          if p["total_return_pct"] > 0
          and p["symbol"] not in trim_warnings
-         and p["symbol"] not in protected_symbols),
+         and p["symbol"] not in recent_buy_symbols
+         and p["symbol"] not in PROTECTED_SYMBOLS),
         key=lambda p: p["total_return_pct"],
         reverse=True,
     )
@@ -1159,6 +1306,41 @@ def build_prompt(summary: dict) -> str:
             )
     else:
         lines.append("  None — every position is currently either a loser or restricted.")
+
+    protected_held = [
+        p for p in summary["positions"]
+        if p["symbol"] in PROTECTED_SYMBOLS
+        and p["total_return_pct"] > 0
+        and p["symbol"] not in trim_warnings
+        and p["symbol"] not in recent_buy_symbols
+        and p["symbol"] not in outstanding_by_symbol
+    ]
+    if protected_held:
+        lines += ["", "=== PROTECTED SYMBOLS (limited funding sources) ==="]
+        for p in protected_held:
+            cap = p["equity"] * PROTECTED_TRIM_MAX_PCT
+            lines.append(
+                f"  {p['symbol']:<8} return {p['total_return_pct']:+.1f}%  "
+                f"equity ${p['equity']:.2f}  max trim this action: ${cap:.2f} "
+                f"({PROTECTED_TRIM_MAX_PCT:.0%})"
+            )
+
+    outstanding = summary.get("protected_commitments", [])
+    if outstanding:
+        lines += ["", "=== OUTSTANDING REINVESTMENT COMMITMENTS ==="]
+        price_by_symbol = {p["symbol"]: p["current_price"] for p in summary["positions"]}
+        for c in outstanding:
+            current_price = price_by_symbol.get(c["symbol"])
+            met = (
+                "condition MET — reinvest now"
+                if current_price is not None and current_price <= c["reinvest_price"]
+                else "condition not yet met"
+            )
+            lines.append(
+                f"  {c['symbol']:<8} trimmed ${c['trim_amount']:.2f} on {c['trim_date']}, "
+                f"reinvest at/below ${c['reinvest_price']:.2f} "
+                f"(current ${_fmt(current_price, '.2f')}) — {met}"
+            )
 
     if recent_orders:
         lines += ["", "=== RECENT TRANSACTIONS (last 30 days) ==="]
@@ -1951,6 +2133,22 @@ def main():
         "prior_analysis": prior_analysis,
     }
 
+    # 7b. Resolve protected-symbol reinvestment commitments against real order history
+    try:
+        outstanding_commitments = resolve_protected_commitments(
+            load_protected_commitments(), recent_orders, portfolio_symbols
+        )
+        save_protected_commitments(outstanding_commitments)
+        summary["protected_commitments"] = outstanding_commitments
+        if outstanding_commitments:
+            log.info(
+                f"Outstanding protected-symbol commitments: "
+                f"{[c['symbol'] for c in outstanding_commitments]}"
+            )
+    except Exception as e:
+        log.warning(f"Protected commitment resolution failed: {e}")
+        summary["protected_commitments"] = []
+
     # 8. Fetch market and ticker news
     try:
         log.info("Fetching Sherwood news")
@@ -1989,10 +2187,12 @@ def main():
         summary["ticker_changes"] = {"added": [], "removed": []}
 
     # 10. Claude analysis
+    analysis_ok = False
     try:
         log.info("Requesting Claude analysis")
         tldr, analysis = get_claude_analysis(summary)
         summary["tldr"] = tldr
+        analysis_ok = True
         try:
             save_analysis(today, tldr, analysis, summary)
             log.info(f"Analysis saved to {ANALYSIS_FILE}")
@@ -2004,6 +2204,21 @@ def main():
         tldr = ""
         analysis = f"[Claude analysis unavailable: {e}]"
         summary["tldr"] = ""
+
+    # 10b. Extract & persist any new protected-symbol reinvestment commitment
+    protected_held_syms = sorted(PROTECTED_SYMBOLS & portfolio_symbols)
+    if analysis_ok and protected_held_syms:
+        try:
+            new_commitments = extract_protected_commitment(analysis, protected_held_syms, today)
+            if new_commitments:
+                updated_commitments = summary["protected_commitments"] + new_commitments
+                save_protected_commitments(updated_commitments)
+                log.info(
+                    f"New protected-symbol commitments recorded: "
+                    f"{[c['symbol'] for c in new_commitments]}"
+                )
+        except Exception as e:
+            log.warning(f"Protected commitment extraction failed: {e}")
 
     # 11. Format and send email digest
     try:
