@@ -70,6 +70,13 @@ PROTECTED_COMMITMENTS_FILE = "protected_commitments.json"
 SMALL_POSITION_THRESHOLD = 10  # equity ($) at/under which a position is a cleanup candidate
 ETHICAL_EXCLUSIONS_FILE = "ethical_exclusions.json"
 
+# ANALYSIS_FILE and PROTECTED_COMMITMENTS_FILE carry real dollar figures from
+# the user's account, so — unlike tickers.json/ethical_exclusions.json — they
+# stay out of git (this repo is public) and instead get repointed at a
+# Dropbox-synced directory by resolve_sync_paths(), since this script runs
+# from more than one machine and both need to see the same current state.
+SYNC_DIR = os.path.expanduser("~/Dropbox/robinhood-monitor")
+
 # ── Config ────────────────────────────────────────────────────────────────────
 CLAUDE_MODEL = "claude-sonnet-5"
 CLAUDE_MAX_TOKENS = 4000
@@ -359,6 +366,24 @@ def send_error_email(context: str, exc: Exception):
         log.error(f"Failed to send error email: {e}")
 
 
+# ── Cross-machine state sync ─────────────────────────────────────────────────
+def resolve_sync_paths():
+    """
+    Repoint ANALYSIS_FILE and PROTECTED_COMMITMENTS_FILE at SYNC_DIR (a Dropbox
+    folder) so both machines this script runs from read/write the same file,
+    instead of each keeping its own local copy that only updates when *that*
+    machine happens to run. Falls back to the local repo-relative filename
+    (no cross-machine sync) if the Dropbox folder can't be created.
+    """
+    global ANALYSIS_FILE, PROTECTED_COMMITMENTS_FILE
+    try:
+        os.makedirs(SYNC_DIR, exist_ok=True)
+        ANALYSIS_FILE = os.path.join(SYNC_DIR, "last_analysis.json")
+        PROTECTED_COMMITMENTS_FILE = os.path.join(SYNC_DIR, "protected_commitments.json")
+    except OSError as e:
+        log.warning(f"Dropbox sync dir unavailable ({e}) — using local files, no cross-machine sync")
+
+
 # ── Git helpers ───────────────────────────────────────────────────────────────
 def git_pull():
     """Pull latest changes before running. Non-fatal — logs and continues on failure."""
@@ -388,27 +413,16 @@ def git_commit_ethical_exclusions():
     """
     Commit and push ethical_exclusions.json if it has changed. Non-fatal.
 
-    Same reasoning as protected_commitments.json: this is mechanically-enforced
-    state (excluded symbols are stripped from tickers.json, watchlist candidates,
-    and ticker-recommendation output), not just a local cache. Leaving it
-    unsynced means a second machine re-screens every symbol from scratch and
-    could — since screening is an LLM call, not a fixed lookup — reach a
-    different verdict than the first machine did.
+    This is mechanically-enforced state (excluded symbols are stripped from
+    tickers.json, watchlist candidates, and ticker-recommendation output), not
+    just a local cache — leaving it unsynced means a second machine re-screens
+    every symbol from scratch and could, since screening is an LLM call rather
+    than a fixed lookup, reach a different verdict than the first machine did.
+    Unlike last_analysis.json/protected_commitments.json, this file carries no
+    dollar figures, so it's fine to sync via the (public) git repo rather than
+    needing the Dropbox path in resolve_sync_paths().
     """
     git_commit_file(ETHICAL_EXCLUSIONS_FILE, "chore: update ethical exclusions [skip ci]")
-
-
-def git_commit_protected_commitments():
-    """
-    Commit and push protected_commitments.json if it has changed. Non-fatal.
-
-    This state enforces a hard constraint (no further protected-symbol trims
-    until a reinvestment commitment clears) — if it only lives locally, a
-    second machine (or a fresh clone) starts blind to any outstanding
-    commitment and won't know a symbol is supposed to be off-limits. Mirrors
-    the same auto-commit pattern already used for tickers.json.
-    """
-    git_commit_file(PROTECTED_COMMITMENTS_FILE, "chore: update protected commitments [skip ci]")
 
 
 def git_commit_file(path: str, message: str):
@@ -2204,6 +2218,7 @@ def main():
     load_dotenv()
     log.info("Starting portfolio monitor")
     git_pull()
+    resolve_sync_paths()
     today = date.today().isoformat()
     hostname = socket.gethostname()
 
@@ -2497,10 +2512,11 @@ def main():
         sys.exit(1)
 
     # 12. Commit and push tickers.json if Claude updated the watchlist, and
-    # protected_commitments.json if any commitment was created/confirmed/cleared —
-    # so a second machine (or fresh clone) stays in sync on what's off-limits.
+    # ethical_exclusions.json if any symbol was newly screened. last_analysis.json
+    # and protected_commitments.json are synced separately via Dropbox (see
+    # resolve_sync_paths) rather than git, since this repo is public and both
+    # carry real dollar figures from the user's account.
     git_commit_tickers()
-    git_commit_protected_commitments()
     git_commit_ethical_exclusions()
 
     log.info("Portfolio monitor complete")

@@ -11,8 +11,9 @@ Daily Robinhood portfolio digest: pulls live positions, enriches with technical 
 | `portfolio_monitor.py` | Single-file main script — all logic lives here |
 | `tickers.json` | Screener watchlist — read at startup, rewritten by Claude each run |
 | `news.json` | Latest run's fetched news with URLs (overwritten each run, gitignored) |
-| `protected_commitments.json` | Outstanding protected-symbol reinvestment commitments (committed — auto-pushed by the script; syncs across machines) |
-| `ethical_exclusions.json` | Ethically-screened symbols and screening cache (committed — auto-pushed by the script; syncs across machines) |
+| `last_analysis.json` | Full daily technical snapshot + analysis. Lives in `~/Dropbox/robinhood-monitor/` (gitignored — repo is public and this carries real dollar figures), synced across machines via Dropbox instead |
+| `protected_commitments.json` | Outstanding protected-symbol reinvestment commitments. Also Dropbox-synced, same reasoning as above |
+| `ethical_exclusions.json` | Ethically-screened symbols and screening cache (committed — auto-pushed by the script; syncs across machines via git, since it carries no dollar figures) |
 | `requirements.txt` | Python dependencies |
 | `.env` | Credentials (never commit) |
 | `.env.example` | Credentials template |
@@ -111,7 +112,7 @@ That reinvestment condition is **mechanically enforced across runs, not just req
 - Checks each pending commitment against real order history (`get_recent_orders`) for a matching sell — only then is it promoted to **confirmed** and actually enforced. If no matching trade shows up within `PROTECTED_COMMITMENT_PENDING_DAYS` (7 days), the pending commitment is dropped as never executed.
 - Resolves each *confirmed* commitment against real order history — a qualifying buy-back, or the position being fully exited, clears it. Nothing the model says clears or confirms a commitment; only real trade data does.
 - Injects any confirmed, still-outstanding commitment into the prompt as `=== OUTSTANDING REINVESTMENT COMMITMENTS ===`, and the `PROTECTED SYMBOL REINVESTMENT` hard constraint forbids recommending another partial trim of that symbol until it's gone (a full exit for a specifically broken thesis is the only override). Pending (unconfirmed) commitments don't block anything yet.
-- `protected_commitments.json` is auto-committed and pushed by the script itself (`git_commit_protected_commitments()`, same pattern as `tickers.json`) whenever it changes, so the state stays in sync if the script ever runs from a different machine.
+- `protected_commitments.json` lives in `~/Dropbox/robinhood-monitor/` (via `resolve_sync_paths()`, called at the top of `main()`), not the repo, so the state stays in sync across the two machines this script runs from without putting real dollar figures in the (public) git history.
 
 This is the second place in the codebase (after `compute_trim_warnings`/TRIM COUNT WARNINGS) where Python-tracked state — not model self-restraint — blocks what the analysis is allowed to recommend.
 
@@ -166,8 +167,8 @@ claude mcp add robinhood-trading --transport http https://agent.robinhood.com/mc
 **Agentic trading is NOT Robinhood's AI.** It is your own AI (Claude) accessing a dedicated isolated account via official OAuth. This is the sanctioned replacement for `robin_stocks`, which reverse-engineers Robinhood's private API. The script still uses `robin_stocks` for the automated cron job; the MCP is used for interactive Claude Code sessions.
 
 **Workflow for trade decisions:**
-1. Script runs at 6am → email digest sent → `last_analysis.json` updated with full technical snapshot
-2. Open a Claude Code session here and read `last_analysis.json` — it now includes positions with RSI, MAs, volume ratios, and top momentum movers
+1. Script runs at 6am → email digest sent → `last_analysis.json` updated with full technical snapshot in `~/Dropbox/robinhood-monitor/` (see Security Notes), current regardless of which machine ran it
+2. Open a Claude Code session here and read `last_analysis.json` (in `~/Dropbox/robinhood-monitor/` — Dropbox syncs it automatically, no git pull needed) — it now includes positions with RSI, MAs, volume ratios, and top momentum movers
 3. Pull live quotes via `get_equity_quotes` MCP tool to check if the 6am thesis still holds
 4. Discuss the recommendation before acting — the pre-trade conversation is the human-in-the-loop filter
 5. If a trade is warranted: fund the agentic account manually in the Robinhood app, then use `review_equity_order` + `place_equity_order` MCP tools
@@ -191,7 +192,8 @@ claude mcp add robinhood-trading --transport http https://agent.robinhood.com/mc
 ## Security Notes
 
 - `.env`, `.robin_token`, `.venv/`, `monitor.log`, `news.json` are all gitignored — never commit them
-- `protected_commitments.json` and `ethical_exclusions.json` are intentionally *not* gitignored — both are small, non-secret, mechanically-enforced state that must sync across machines (see Protected Symbols and Ethical Investment Screen sections above)
+- `ethical_exclusions.json` is intentionally *not* gitignored — it carries no dollar figures, and syncing it via git (auto-committed by the script) lets a symbol screened on one machine avoid re-screening on the other (see Ethical Investment Screen above)
+- `last_analysis.json` and `protected_commitments.json` *are* gitignored — this repo is public, and both carry real dollar figures from the user's account. Since the script legitimately runs from two machines, they're instead synced via `~/Dropbox/robinhood-monitor/` (`resolve_sync_paths()`, called at the top of `main()`) rather than committed anywhere (see Robinhood MCP Integration and Protected Symbols sections above)
 - Gmail requires an App Password (not the account password)
 - `chmod 600 .env` recommended
 
