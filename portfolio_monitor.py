@@ -2290,7 +2290,14 @@ def main():
         screener_data = {}
 
     # Auto-remove screener tickers that returned no data (likely delisted/halted).
-    # Bypass Claude for these — there's nothing to analyse. Min-size guard still applies.
+    # Bypass Claude for these — there's nothing to analyse. The MIN_SCREENER_TICKERS
+    # floor deliberately does NOT apply here: it exists to protect a pool of
+    # scannable candidates, and a delisted symbol was never contributing to that
+    # pool in the first place (fetch_bulk_market_data can never return data for
+    # it) — keeping it around just to satisfy the count is pure dead weight, not
+    # a real candidate. If this drops the list below the floor, that's a signal
+    # for the ticker-recommendation step below to prioritize backfilling it, not
+    # a reason to leave a permanently-broken ticker stuck in the watchlist.
     no_data_tickers = [
         t for t in screener_tickers
         if t not in portfolio_symbols and t not in screener_data
@@ -2298,15 +2305,14 @@ def main():
     if no_data_tickers:
         auto_removed = []
         for t in no_data_tickers:
-            if len(screener_tickers) - 1 < MIN_SCREENER_TICKERS:
-                log.warning(
-                    f"Cannot auto-remove {t} (no data / possible delisting): "
-                    f"list would drop below minimum ({MIN_SCREENER_TICKERS})"
-                )
-                continue
             screener_tickers.remove(t)
             auto_removed.append(t)
             log.warning(f"Auto-removed {t} from screener: no market data returned (possible delisting)")
+        if len(screener_tickers) < MIN_SCREENER_TICKERS:
+            log.warning(
+                f"Screener list now below minimum ({len(screener_tickers)}/{MIN_SCREENER_TICKERS}) "
+                f"after removing delisted ticker(s) — ticker recommendations below should backfill it"
+            )
         if auto_removed:
             with open(TICKERS_FILE, "w") as _f:
                 json.dump(sorted(screener_tickers), _f, indent=2)
