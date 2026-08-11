@@ -1,0 +1,40 @@
+{
+  "excluded": {
+    "PLTR": {
+      "reason": "Palantir is a major defense/intelligence contractor (Gotham platform) and builds surveillance/data-analytics infrastructure used by ICE and law enforcement agencies.",
+      "added": "2026-08-10"
+    },
+    "SMCI": {
+      "reason": "Super Micro Computer is primarily a data center builder/operator specializing in data center hardware, server construction, and cooling/power infrastructure for data centers (criterion 4).",
+      "added": "2026-08-10"
+    }
+  },
+  "screened": [
+    "AMAT",
+    "AMD",
+    "AMKR",
+    "AMZN",
+    "ARM",
+    "ASML",
+    "AVGO",
+    "COST",
+    "DELL",
+    "GOOGL",
+    "KLAC",
+    "LRCX",
+    "MARA",
+    "META",
+    "MRVL",
+    "MSFT",
+    "MU",
+    "NVDA",
+    "PANW",
+    "PLTR",
+    "QCOM",
+    "RKLB",
+    "SMCI",
+    "SPY",
+    "TSM",
+    "UNH"
+  ]
+}

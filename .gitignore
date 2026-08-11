@@ -4,7 +4,6 @@
 monitor.log
 news.json
 last_analysis.json
-protected_commitments.json
 session_notes.md
 __pycache__/
 *.pyc

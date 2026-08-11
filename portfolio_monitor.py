@@ -65,8 +65,10 @@ MAX_SCREENER_TICKERS = 40
 WATCHLIST_MIN_SCORE = 15  # minimum momentum score to surface a watchlist ticker as a candidate
 PROTECTED_SYMBOLS = {"COST"}  # core long-term holdings; see PROTECTED SYMBOL rule in CLAUDE_SYSTEM_PROMPT
 PROTECTED_TRIM_MAX_PCT = 0.10  # max fraction of a protected symbol's OWN equity trimmable per action
+PROTECTED_COMMITMENT_PENDING_DAYS = 7  # days to wait for a recommended trim to actually execute before dropping it
 PROTECTED_COMMITMENTS_FILE = "protected_commitments.json"
 SMALL_POSITION_THRESHOLD = 10  # equity ($) at/under which a position is a cleanup candidate
+ETHICAL_EXCLUSIONS_FILE = "ethical_exclusions.json"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CLAUDE_MODEL = "claude-sonnet-5"
@@ -78,6 +80,20 @@ CLAUDE_SYSTEM_PROMPT = (
     "no pump-and-dump, no unsavory trades, Robinhood platform only. "
     "Robinhood supports fractional share purchases, so small dollar amounts (even $5-20) "
     "can be deployed to open or add to a position.\n\n"
+    "ETHICAL INVESTMENT SCREEN — HARD CONSTRAINT: This portfolio is screened against a "
+    "defined policy, not vague sentiment — see ETHICAL_SCREEN_CRITERIA for the full "
+    "exclusion criteria (weapons/defense contractors, mass-surveillance/policing/ICE "
+    "contractors, fossil fuel extraction, data center builders/operators, private prisons, "
+    "predatory lenders, factory farming; tobacco/gambling/cannabis/vice industries are NOT "
+    "excluded). This is enforced mechanically before you ever see a candidate — any symbol "
+    "already known to violate the policy is stripped from the screener, watchlist "
+    "candidates, and momentum data before this prompt is built, so it will not appear "
+    "below as a buy candidate. If a position below is tagged [ETHICAL SCREEN: reason] it is "
+    "something you already hold that was screened and found to violate the policy — do not "
+    "force an immediate sale, but recommend a full exit and state the ethical reason "
+    "explicitly, subject to normal RECENT POSITIONS timing (do not exit something bought "
+    "days ago without also naming that tension). This is not optional to address when the "
+    "tag is present.\n\n"
     "CAPITAL STRATEGY: This portfolio is self-funding — no new money is added from outside. "
     "External capital injection is possible but should only be flagged when conditions are "
     "compelling enough to justify it, not as a routine suggestion whenever cash is low. "
@@ -365,23 +381,57 @@ def git_pull():
 
 def git_commit_tickers():
     """Commit and push tickers.json if it has changed. Non-fatal."""
+    git_commit_file(TICKERS_FILE, "chore: update screener watchlist [skip ci]")
+
+
+def git_commit_ethical_exclusions():
+    """
+    Commit and push ethical_exclusions.json if it has changed. Non-fatal.
+
+    Same reasoning as protected_commitments.json: this is mechanically-enforced
+    state (excluded symbols are stripped from tickers.json, watchlist candidates,
+    and ticker-recommendation output), not just a local cache. Leaving it
+    unsynced means a second machine re-screens every symbol from scratch and
+    could — since screening is an LLM call, not a fixed lookup — reach a
+    different verdict than the first machine did.
+    """
+    git_commit_file(ETHICAL_EXCLUSIONS_FILE, "chore: update ethical exclusions [skip ci]")
+
+
+def git_commit_protected_commitments():
+    """
+    Commit and push protected_commitments.json if it has changed. Non-fatal.
+
+    This state enforces a hard constraint (no further protected-symbol trims
+    until a reinvestment commitment clears) — if it only lives locally, a
+    second machine (or a fresh clone) starts blind to any outstanding
+    commitment and won't know a symbol is supposed to be off-limits. Mirrors
+    the same auto-commit pattern already used for tickers.json.
+    """
+    git_commit_file(PROTECTED_COMMITMENTS_FILE, "chore: update protected commitments [skip ci]")
+
+
+def git_commit_file(path: str, message: str):
+    """Force-add and commit `path` (even if gitignored) if it has changed, then push. Non-fatal."""
     try:
-        diff = subprocess.run(
-            ["git", "diff", "--quiet", TICKERS_FILE],
-            capture_output=True
+        # `git diff` alone misses the "never tracked yet" case for gitignored
+        # files (nothing to diff against), so check status instead.
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--ignored", "--", path],
+            capture_output=True, text=True, check=True
         )
-        if diff.returncode == 0:
-            log.info("tickers.json unchanged — skipping git commit")
+        if not status.stdout.strip():
+            log.info(f"{path} unchanged — skipping git commit")
             return
-        subprocess.run(["git", "add", TICKERS_FILE], check=True)
+        subprocess.run(["git", "add", "-f", path], check=True)
         subprocess.run(
-            ["git", "commit", "-m", "chore: update screener watchlist [skip ci]"],
+            ["git", "commit", "-m", message],
             check=True, capture_output=True
         )
         subprocess.run(["git", "push"], check=True, capture_output=True)
-        log.info("tickers.json committed and pushed")
+        log.info(f"{path} committed and pushed")
     except subprocess.CalledProcessError as e:
-        log.warning(f"git commit/push of tickers.json failed: {e.stderr.strip() if e.stderr else e}")
+        log.warning(f"git commit/push of {path} failed: {e.stderr.strip() if e.stderr else e}")
 
 
 # ── Robinhood auth ────────────────────────────────────────────────────────────
@@ -636,22 +686,58 @@ def save_protected_commitments(commitments: list[dict]) -> None:
 
 
 def resolve_protected_commitments(
-    commitments: list[dict], recent_orders: list[dict], held_symbols: set[str]
+    commitments: list[dict], recent_orders: list[dict], held_symbols: set[str], today: str
 ) -> list[dict]:
     """
-    Drop commitments that are no longer outstanding: the symbol was fully exited,
-    or a real buy order at/below the committed price landed after the trim.
+    Advance each commitment through pending -> confirmed -> cleared, using only
+    real order history — never anything the model says in a later run's analysis.
+    This is what makes the PROTECTED SYMBOL REINVESTMENT hard constraint actually
+    enforceable instead of an honor-system request repeated each run.
 
-    Only real order history (or the position vanishing) clears a commitment —
-    never anything the model says in a later run's analysis. This is what makes
-    the PROTECTED SYMBOL REINVESTMENT hard constraint actually enforceable
-    instead of an honor-system request repeated each run.
+    Pending commitments (a trim Claude's analysis *recommended* but this script
+    never executes itself — trades happen manually, later) are only promoted to
+    confirmed once a real matching sell order shows up. If nothing matches within
+    PROTECTED_COMMITMENT_PENDING_DAYS, the recommendation was evidently never
+    acted on and the commitment is dropped rather than permanently blocking
+    future trims of that symbol.
+
+    Confirmed commitments are dropped once the symbol is fully exited, or a real
+    buy order at/below the committed price lands after the trim.
     """
     still_outstanding = []
     for c in commitments:
         symbol = c["symbol"]
         if symbol not in held_symbols:
             continue  # fully exited — nothing left to enforce a reinvestment into
+
+        if c.get("status", "confirmed") == "pending":
+            match = next(
+                (
+                    o for o in recent_orders
+                    if o["symbol"] == symbol
+                    and o["side"] == "sell"
+                    and o["price"] is not None
+                    and o["date"] >= c["recommended_date"]
+                    and _dollar_amount_matches(o["quantity"] * o["price"], c["trim_amount"])
+                ),
+                None,
+            )
+            if match:
+                still_outstanding.append({
+                    **c,
+                    "status": "confirmed",
+                    "trim_amount": round(match["quantity"] * match["price"], 2),
+                    "trim_date": match["date"],
+                })
+            elif _days_between(c["recommended_date"], today) <= PROTECTED_COMMITMENT_PENDING_DAYS:
+                still_outstanding.append(c)  # still within the grace window — keep waiting
+            else:
+                log.info(
+                    f"Dropping pending {symbol} commitment recommended on "
+                    f"{c['recommended_date']}: no matching trade in "
+                    f"{PROTECTED_COMMITMENT_PENDING_DAYS} days — never executed"
+                )
+            continue
 
         fulfilled = any(
             o["symbol"] == symbol
@@ -666,12 +752,28 @@ def resolve_protected_commitments(
     return still_outstanding
 
 
+def _days_between(start_iso: str, end_iso: str) -> int:
+    return (date.fromisoformat(end_iso) - date.fromisoformat(start_iso)).days
+
+
+def _dollar_amount_matches(actual: float, expected: float, tolerance: float = 0.4) -> bool:
+    """Loose match — the recommended trim $ amount and the eventual manual trade's
+    $ amount will differ (share rounding, days-later price movement), so this only
+    needs to rule out an unrelated sell, not require an exact figure."""
+    return abs(actual - expected) <= max(5.0, expected * tolerance)
+
+
 def extract_protected_commitment(
     analysis_text: str, protected_held: list[str], today: str
 ) -> list[dict]:
     """
-    Pull any protected-symbol trim + its stated reinvestment condition out of
-    today's analysis text, so it can be persisted and enforced on future runs.
+    Pull any protected-symbol trim RECOMMENDATION + its stated reinvestment
+    condition out of today's analysis text, so it can be watched for on future
+    runs. This script never places trades itself (see CLAUDE.md's manual,
+    human-in-the-loop trading workflow) — the analysis text only says a trim
+    was recommended, not that one happened. So these are persisted as "pending"
+    and only promoted to an enforced commitment by resolve_protected_commitments
+    once a matching real sell order actually appears in order history.
     Returns [] (and logs a warning) on any failure — never blocks the digest.
     """
     prompt = (
@@ -698,19 +800,107 @@ def extract_protected_commitment(
             raw = "\n".join(raw.split("\n")[1:])
             raw = raw.rsplit("```", 1)[0].strip()
         trims = json.loads(raw).get("trims", [])
-        return [
-            {
-                "symbol": t["symbol"],
-                "trim_amount": float(t["trim_amount"]),
-                "reinvest_price": float(t["reinvest_price"]),
-                "trim_date": today,
-            }
-            for t in trims
-            if t.get("symbol") in protected_held and t.get("reinvest_price")
-        ]
+        commitments = []
+        for t in trims:
+            if t.get("symbol") not in protected_held or not t.get("reinvest_price") or not t.get("trim_amount"):
+                continue
+            try:
+                commitments.append({
+                    "symbol": t["symbol"],
+                    "trim_amount": float(t["trim_amount"]),
+                    "reinvest_price": float(t["reinvest_price"]),
+                    "recommended_date": today,
+                    "status": "pending",
+                })
+            except (TypeError, ValueError):
+                log.warning(f"Skipping malformed trim extraction for {t.get('symbol')}: {t}")
+        return commitments
     except Exception as e:
         log.warning(f"Protected commitment extraction failed: {e}")
         return []
+
+
+# ── Ethical screen ───────────────────────────────────────────────────────────
+# Symbols are screened once (LLM judgment call) and the verdict is persisted to
+# ETHICAL_EXCLUSIONS_FILE, then enforced mechanically on every subsequent run —
+# same pattern as protected-symbol commitments above. The user never hand-curates
+# the exclusion list; Claude populates it against this fixed rubric.
+ETHICAL_SCREEN_CRITERIA = (
+    "Exclude a company if it: (1) manufactures weapons or is a defense contractor "
+    "(prime or major subcontractor), (2) builds or sells mass-surveillance, policing, "
+    "or ICE/immigration-enforcement technology, (3) is primarily a fossil fuel "
+    "extraction company (oil, gas, or coal production/exploration), (4) is primarily a "
+    "data center builder or operator — data center REITs, colocation/hosting providers, "
+    "data center construction/engineering firms, or data center cooling/power "
+    "infrastructure specialists (NOT chipmakers, cloud hyperscalers, or general "
+    "hardware/software companies whose products merely run inside data centers), "
+    "(5) operates private prisons or immigration detention facilities, (6) is a "
+    "predatory lender (payday loans, extreme-APR consumer credit), or (7) is primarily "
+    "a factory-farming / industrial animal agriculture operator. Tobacco, gambling, "
+    "cannabis, alcohol, and other vice industries are NOT grounds for exclusion on "
+    "their own."
+)
+
+
+def load_ethical_exclusions() -> dict:
+    """{'excluded': {SYM: {reason, added}}, 'screened': [SYM, ...]}. Empty shell if missing/invalid."""
+    try:
+        with open(ETHICAL_EXCLUSIONS_FILE) as f:
+            data = json.load(f)
+        data.setdefault("excluded", {})
+        data.setdefault("screened", [])
+        return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"excluded": {}, "screened": []}
+
+
+def save_ethical_exclusions(state: dict) -> None:
+    with open(ETHICAL_EXCLUSIONS_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def screen_ethical_exclusions(candidates: set[str], state: dict, today: str) -> dict:
+    """
+    Screen any candidate symbol not already screened against ETHICAL_SCREEN_CRITERIA.
+    Mutates and returns `state` with newly-excluded symbols recorded and all candidates
+    marked screened (so passing symbols aren't re-asked about every run). Never blocks
+    the run — on failure, leaves the new candidates unscreened so they're retried next run.
+    """
+    new = sorted(candidates - set(state["screened"]))
+    if not new:
+        return state
+
+    prompt = (
+        f"{ETHICAL_SCREEN_CRITERIA}\n\n"
+        f"Screen these ticker symbols against the criteria above: {', '.join(new)}\n\n"
+        f"For each symbol that should be EXCLUDED, give a one-sentence reason citing "
+        f"which criterion applies. Only exclude when you have reasonable confidence the "
+        f"company's actual business fits a criterion — do not exclude on a guess.\n\n"
+        f"Respond with ONLY valid JSON — no markdown, no explanation:\n"
+        f'{{"excluded": [{{"symbol": "SYM", "reason": "one sentence"}}]}}\n\n'
+        f"Return an empty list if none of these symbols should be excluded."
+    )
+    try:
+        client = Anthropic()
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            system="You screen stock tickers against an ethical investment policy. Return only valid JSON.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = "\n".join(raw.split("\n")[1:])
+            raw = raw.rsplit("```", 1)[0].strip()
+        result = json.loads(raw)
+        for item in result.get("excluded", []):
+            sym = item.get("symbol", "").upper()
+            if sym in new:
+                state["excluded"][sym] = {"reason": item["reason"], "added": today}
+        state["screened"] = sorted(set(state["screened"]) | set(new))
+    except Exception as e:
+        log.warning(f"Ethical screen failed, will retry unscreened symbols next run: {e}")
+    return state
 
 
 # ── Watchlists ────────────────────────────────────────────────────────────────
@@ -1027,13 +1217,28 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
 
 
 def apply_ticker_changes(
-    current: list[str], changes: dict
+    current: list[str], changes: dict, excluded: set[str] | None = None
 ) -> tuple[list[str], list[dict], list[dict]]:
     """
     Apply add/remove changes, write tickers.json, return (new_list, added, removed).
     added/removed are lists of {"ticker": ..., "reason": ...} for what was actually applied.
+
+    `excluded` (ethically-screened symbols) is enforced here regardless of what the
+    model proposed — the same "Python-tracked state blocks it" pattern as other hard
+    constraints in this file, so a model suggestion can't route around the screen.
     """
-    add_items = {item["ticker"].upper(): item["reason"] for item in changes.get("add", [])}
+    excluded = excluded or set()
+    blocked = [
+        item["ticker"].upper() for item in changes.get("add", [])
+        if item["ticker"].upper() in excluded
+    ]
+    if blocked:
+        log.warning(f"Blocked ethically-excluded ticker(s) from screener add: {blocked}")
+    add_items = {
+        item["ticker"].upper(): item["reason"]
+        for item in changes.get("add", [])
+        if item["ticker"].upper() not in excluded
+    }
     remove_items = {item["ticker"].upper(): item["reason"] for item in changes.get("remove", [])}
 
     # Enforce minimum: skip removals that would drop the list below MIN_SCREENER_TICKERS
@@ -1236,6 +1441,7 @@ def build_prompt(summary: dict) -> str:
         if o["side"] == "buy" and o["days_ago"] <= 7
     }
     outstanding_by_symbol = {c["symbol"]: c for c in summary.get("protected_commitments", [])}
+    ethical_reason_by_symbol = {h["symbol"]: h["reason"] for h in summary.get("ethical_held", [])}
 
     total_value = summary["total_value"] or 1  # avoid div/0 if somehow zero
     ticker_news = summary.get("ticker_news", {})
@@ -1270,10 +1476,14 @@ def build_prompt(summary: dict) -> str:
             f"SMALL POSITION CLEANUP rule]"
             if pos["equity"] <= SMALL_POSITION_THRESHOLD else ""
         )
+        ethical_tag = (
+            f"  [ETHICAL SCREEN: {ethical_reason_by_symbol[symbol]}]"
+            if symbol in ethical_reason_by_symbol else ""
+        )
         lines += [
             f"\n{symbol}: {pos['shares']} shares @ ${pos['current_price']} "
             f"(avg cost ${pos['avg_cost']}, return {pos['total_return_pct']:+.1f}%, "
-            f"equity ${pos['equity']}, {alloc_pct:.1f}% of portfolio)  [{funding_tag}]{small_tag}",
+            f"equity ${pos['equity']}, {alloc_pct:.1f}% of portfolio)  [{funding_tag}]{small_tag}{ethical_tag}",
             f"  RSI: {_fmt(ind.get('rsi'), '.1f')} | "
             f"MA50: ${_fmt(ind.get('ma50'), '.2f')} "
             f"({_fmt(ind.get('price_vs_ma50_pct'), '+.1f')}%) | "
@@ -1359,6 +1569,15 @@ def build_prompt(summary: dict) -> str:
         lines += ["", "=== TRIM COUNT WARNINGS ==="]
         for warning in trim_warnings.values():
             lines.append(f"⚠ {warning}")
+
+    ethical_held = summary.get("ethical_held", [])
+    if ethical_held:
+        lines += ["", "=== ETHICAL SCREEN — HELD POSITIONS FLAGGED ==="]
+        for h in ethical_held:
+            lines.append(
+                f"⚠ {h['symbol']}: {h['reason']} — recommend a full exit and state this "
+                f"reason explicitly (see ETHICAL INVESTMENT SCREEN)."
+            )
 
     lines += ["", "=== TOP MOMENTUM MOVERS (not in portfolio) ==="]
     for m in summary["momentum"]:
@@ -2107,6 +2326,35 @@ def main():
     except Exception as e:
         log.warning(f"Watchlist evaluation failed: {e}")
 
+    # 5b. Ethical screen — screen any new candidate symbol, then mechanically strip
+    # anything already known to violate the policy before it can reach the momentum
+    # scan, the ticker-recommendation prompt, or the analysis prompt.
+    ethical_state = load_ethical_exclusions()
+    try:
+        candidates = set(screener_tickers) | {c["symbol"] for c in watchlist_candidates} | portfolio_symbols
+        ethical_state = screen_ethical_exclusions(candidates, ethical_state, today)
+        save_ethical_exclusions(ethical_state)
+    except Exception as e:
+        log.warning(f"Ethical screen failed: {e}")
+    excluded_syms = set(ethical_state["excluded"].keys())
+
+    ethically_removed = [t for t in screener_tickers if t in excluded_syms]
+    if ethically_removed:
+        screener_tickers = [t for t in screener_tickers if t not in excluded_syms]
+        with open(TICKERS_FILE, "w") as _f:
+            json.dump(sorted(screener_tickers), _f, indent=2)
+        log.warning(f"Removed ethically-excluded ticker(s) from screener: {ethically_removed}")
+
+    watchlist_candidates = [c for c in watchlist_candidates if c["symbol"] not in excluded_syms]
+
+    ethical_held = [
+        {"symbol": s, "reason": ethical_state["excluded"][s]["reason"]}
+        for s in sorted(portfolio_symbols)
+        if s in excluded_syms
+    ]
+    if ethical_held:
+        log.warning(f"Currently-held position(s) flagged by ethical screen: {[h['symbol'] for h in ethical_held]}")
+
     # 6. Momentum scan (screener tickers only — watchlist candidates handled separately above)
     try:
         momentum = run_momentum_scan(portfolio_symbols, screener_data, screener_tickers)
@@ -2131,20 +2379,30 @@ def main():
         "watchlist_candidates": watchlist_candidates,
         "recent_orders": recent_orders,
         "prior_analysis": prior_analysis,
+        "ethical_held": ethical_held,
     }
 
     # 7b. Resolve protected-symbol reinvestment commitments against real order history
+    all_commitments: list[dict] = []
     try:
-        outstanding_commitments = resolve_protected_commitments(
-            load_protected_commitments(), recent_orders, portfolio_symbols
+        all_commitments = resolve_protected_commitments(
+            load_protected_commitments(), recent_orders, portfolio_symbols, today
         )
-        save_protected_commitments(outstanding_commitments)
-        summary["protected_commitments"] = outstanding_commitments
-        if outstanding_commitments:
+        save_protected_commitments(all_commitments)
+        # Only confirmed commitments (a real matching trade was found) are enforced
+        # in the prompt — pending ones are still waiting to see if the recommended
+        # trim actually gets executed, and shouldn't block funding decisions yet.
+        summary["protected_commitments"] = [
+            c for c in all_commitments if c.get("status", "confirmed") == "confirmed"
+        ]
+        if summary["protected_commitments"]:
             log.info(
                 f"Outstanding protected-symbol commitments: "
-                f"{[c['symbol'] for c in outstanding_commitments]}"
+                f"{[c['symbol'] for c in summary['protected_commitments']]}"
             )
+        pending = [c for c in all_commitments if c.get("status") == "pending"]
+        if pending:
+            log.info(f"Pending (unconfirmed) protected-symbol commitments: {[c['symbol'] for c in pending]}")
     except Exception as e:
         log.warning(f"Protected commitment resolution failed: {e}")
         summary["protected_commitments"] = []
@@ -2174,7 +2432,7 @@ def main():
     try:
         log.info("Requesting ticker recommendations")
         changes = get_ticker_recommendations(summary, screener_tickers)
-        _, added, removed = apply_ticker_changes(screener_tickers, changes)
+        _, added, removed = apply_ticker_changes(screener_tickers, changes, excluded=excluded_syms)
         summary["ticker_changes"] = {"added": added, "removed": removed}
         if added:
             log.info(f"Tickers added: {[x['ticker'] for x in added]}")
@@ -2205,16 +2463,22 @@ def main():
         analysis = f"[Claude analysis unavailable: {e}]"
         summary["tldr"] = ""
 
-    # 10b. Extract & persist any new protected-symbol reinvestment commitment
+    # 10b. Extract & persist any new protected-symbol reinvestment commitment.
+    # These start "pending" — see extract_protected_commitment — and only become
+    # enforced once a matching real trade is found by resolve_protected_commitments
+    # on a later run.
     protected_held_syms = sorted(PROTECTED_SYMBOLS & portfolio_symbols)
     if analysis_ok and protected_held_syms:
         try:
-            new_commitments = extract_protected_commitment(analysis, protected_held_syms, today)
+            already_tracked = {c["symbol"] for c in all_commitments}
+            new_commitments = [
+                c for c in extract_protected_commitment(analysis, protected_held_syms, today)
+                if c["symbol"] not in already_tracked
+            ]
             if new_commitments:
-                updated_commitments = summary["protected_commitments"] + new_commitments
-                save_protected_commitments(updated_commitments)
+                save_protected_commitments(all_commitments + new_commitments)
                 log.info(
-                    f"New protected-symbol commitments recorded: "
+                    f"New pending protected-symbol commitments recorded: "
                     f"{[c['symbol'] for c in new_commitments]}"
                 )
         except Exception as e:
@@ -2232,8 +2496,12 @@ def main():
         send_error_email("sending email digest", e)
         sys.exit(1)
 
-    # 12. Commit and push tickers.json if Claude updated the watchlist
+    # 12. Commit and push tickers.json if Claude updated the watchlist, and
+    # protected_commitments.json if any commitment was created/confirmed/cleared —
+    # so a second machine (or fresh clone) stays in sync on what's off-limits.
     git_commit_tickers()
+    git_commit_protected_commitments()
+    git_commit_ethical_exclusions()
 
     log.info("Portfolio monitor complete")
 

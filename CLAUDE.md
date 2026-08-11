@@ -11,7 +11,8 @@ Daily Robinhood portfolio digest: pulls live positions, enriches with technical 
 | `portfolio_monitor.py` | Single-file main script — all logic lives here |
 | `tickers.json` | Screener watchlist — read at startup, rewritten by Claude each run |
 | `news.json` | Latest run's fetched news with URLs (overwritten each run, gitignored) |
-| `protected_commitments.json` | Outstanding protected-symbol reinvestment commitments (gitignored, runtime state) |
+| `protected_commitments.json` | Outstanding protected-symbol reinvestment commitments (committed — auto-pushed by the script; syncs across machines) |
+| `ethical_exclusions.json` | Ethically-screened symbols and screening cache (committed — auto-pushed by the script; syncs across machines) |
 | `requirements.txt` | Python dependencies |
 | `.env` | Credentials (never commit) |
 | `.env.example` | Credentials template |
@@ -69,6 +70,7 @@ Python 3.11+ required (uses `float | None` union type syntax).
 | `PROTECTED_SYMBOLS` | `{"COST"}` | Core long-term holdings — trims are heavily constrained, see below |
 | `PROTECTED_TRIM_MAX_PCT` | `0.10` | Max fraction of a protected symbol's own equity trimmable per action |
 | `SMALL_POSITION_THRESHOLD` | `10` | Equity ($) at/under which a position is a stale-cleanup candidate |
+| `ETHICAL_SCREEN_CRITERIA` | (see below) | Exclusion rubric applied by the ethical screen — not a user-curated symbol list |
 
 ## Script Flow
 
@@ -105,13 +107,25 @@ Reads all Robinhood watchlists each run. Tickers not already in `tickers.json` o
 
 **Protected symbols** (`PROTECTED_SYMBOLS`, e.g. Costco) are core long-term holdings that shouldn't get trimmed just for being a consistent winner. They aren't off-limits, but every trim is capped at `PROTECTED_TRIM_MAX_PCT` (10%) of *that symbol's own equity* — far stricter than the normal ~50%-of-position trim rule — and must come with a stated reinvestment condition (buy back at/below the sale price, or a named dip/support level).
 
-That reinvestment condition is **mechanically enforced across runs, not just requested in the prompt**. When the daily analysis recommends a protected-symbol trim, a small follow-up Claude call extracts the trim amount and reinvestment price into `protected_commitments.json`. Every subsequent run:
-- Resolves each outstanding commitment against real order history (`get_recent_orders`) — a qualifying buy-back, or the position being fully exited, clears it. Nothing the model says clears a commitment; only real trade data does.
-- Injects any still-outstanding commitment into the prompt as `=== OUTSTANDING REINVESTMENT COMMITMENTS ===`, and the `PROTECTED SYMBOL REINVESTMENT` hard constraint forbids recommending another partial trim of that symbol until it's gone (a full exit for a specifically broken thesis is the only override).
+That reinvestment condition is **mechanically enforced across runs, not just requested in the prompt**. When the daily analysis *recommends* a protected-symbol trim, a small follow-up Claude call extracts the trim amount and reinvestment price into `protected_commitments.json` — but only as a **pending** commitment, since this script never places trades itself (trading is manual/human-in-the-loop, see the MCP workflow below). A recommendation is not a trade. Every subsequent run:
+- Checks each pending commitment against real order history (`get_recent_orders`) for a matching sell — only then is it promoted to **confirmed** and actually enforced. If no matching trade shows up within `PROTECTED_COMMITMENT_PENDING_DAYS` (7 days), the pending commitment is dropped as never executed.
+- Resolves each *confirmed* commitment against real order history — a qualifying buy-back, or the position being fully exited, clears it. Nothing the model says clears or confirms a commitment; only real trade data does.
+- Injects any confirmed, still-outstanding commitment into the prompt as `=== OUTSTANDING REINVESTMENT COMMITMENTS ===`, and the `PROTECTED SYMBOL REINVESTMENT` hard constraint forbids recommending another partial trim of that symbol until it's gone (a full exit for a specifically broken thesis is the only override). Pending (unconfirmed) commitments don't block anything yet.
+- `protected_commitments.json` is auto-committed and pushed by the script itself (`git_commit_protected_commitments()`, same pattern as `tickers.json`) whenever it changes, so the state stays in sync if the script ever runs from a different machine.
 
 This is the second place in the codebase (after `compute_trim_warnings`/TRIM COUNT WARNINGS) where Python-tracked state — not model self-restraint — blocks what the analysis is allowed to recommend.
 
 **Small position cleanup**: any position at/under `SMALL_POSITION_THRESHOLD` ($10) is tagged `[SMALL POSITION]` in the prompt. The `SMALL POSITION CLEANUP` rule defaults to recommending a full exit when it's stale (no momentum signal, no supportive news, not bought in the last 30 days) — and, unlike normal positions, this may happen even at a loss, since it's cleanup rather than funding a new buy.
+
+## Ethical Investment Screen
+
+The system prompt frames the analyst as pursuing "ethically responsible" investing, but that phrase alone has no teeth — it's judged fresh each run with no persisted criteria or memory. The screen fixes that with the same **Python-tracked state, not model self-restraint** pattern used for protected-symbol commitments and trim warnings:
+
+- `ETHICAL_SCREEN_CRITERIA` (in `portfolio_monitor.py`) is a fixed rubric excluding: weapons/defense contractors, mass-surveillance/policing/ICE contractors, fossil fuel extraction, data center *builders/operators* (REITs, colocation, construction/cooling/power infrastructure — **not** chipmakers, cloud hyperscalers, or general hardware/software companies whose products merely run in data centers), private prisons, predatory lenders, and factory farming. Tobacco, gambling, cannabis, and other vice industries are explicitly **not** excluded.
+- Nobody hand-curates a symbol list. Each run, `screen_ethical_exclusions()` sends any *new* symbol (screener tickers, watchlist candidates, portfolio holdings) not already in `ethical_exclusions.json`'s `screened` set to Claude Haiku for a verdict against the rubric, then persists the result — so a symbol is judged once, not re-litigated daily.
+- Enforcement is mechanical: excluded symbols are stripped from `tickers.json`, from watchlist candidates, and — via `apply_ticker_changes(excluded=...)` — from the ticker-recommendation call's own `add` output, regardless of what that call proposes. An excluded symbol simply never reaches the main analysis prompt as a buy candidate.
+- A currently-*held* position that gets flagged is **not** force-sold. It's tagged `[ETHICAL SCREEN: reason]` in the position line and surfaced in a dedicated `=== ETHICAL SCREEN — HELD POSITIONS FLAGGED ===` prompt section; the `ETHICAL INVESTMENT SCREEN` system-prompt rule asks the analysis to recommend a full exit and state the reason, subject to normal `RECENT POSITIONS` timing — but this one recommendation, unlike the trim/commitment rules, is not mechanically forced.
+- `ethical_exclusions.json` is auto-committed and pushed by the script itself (`git_commit_ethical_exclusions()`, same pattern as `tickers.json`/`protected_commitments.json`) whenever it changes, so a symbol screened on one machine doesn't get re-screened (and potentially re-judged differently) on another.
 
 ## Ticker Recommendation Logic
 
@@ -176,7 +190,8 @@ claude mcp add robinhood-trading --transport http https://agent.robinhood.com/mc
 
 ## Security Notes
 
-- `.env`, `.robin_token`, `.venv/`, `monitor.log`, `news.json`, `protected_commitments.json` are all gitignored — never commit them
+- `.env`, `.robin_token`, `.venv/`, `monitor.log`, `news.json` are all gitignored — never commit them
+- `protected_commitments.json` and `ethical_exclusions.json` are intentionally *not* gitignored — both are small, non-secret, mechanically-enforced state that must sync across machines (see Protected Symbols and Ethical Investment Screen sections above)
 - Gmail requires an App Password (not the account password)
 - `chmod 600 .env` recommended
 
