@@ -576,9 +576,18 @@ def get_positions() -> list[dict]:
 
 
 def get_cash() -> float:
+    """
+    Return the account's actual cash balance.
+
+    Deliberately NOT load_portfolio_profile()['withdrawable_amount'] — on a
+    margin account that reflects cash cleared for withdrawal under margin/
+    regulatory holds and routinely reads $0 even while real spendable cash
+    sits in the account. load_account_profile()['cash'] is the account's
+    actual cash balance, matching what the Robinhood app shows.
+    """
     try:
-        profile = r.load_portfolio_profile()
-        return round(float(profile.get("withdrawable_amount", 0)), 2)
+        profile = r.load_account_profile()
+        return round(float(profile.get("cash", 0)), 2)
     except Exception as e:
         log.warning(f"Could not fetch cash balance: {e}")
         return 0.0
