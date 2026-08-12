@@ -579,14 +579,12 @@ def get_cash() -> float:
     """
     Return the account's cash balance.
 
-    Two guesses at the right field/account have both still read $0
-    (withdrawable_amount, then a single account's "cash") — rather than
-    guess a third time, this logs every cash-adjacent field from every
-    account and endpoint robin_stocks exposes, so the next mismatch is
-    diagnosable from monitor.log's "CASH DIAGNOSTIC" lines instead of
-    another blind guess. The returned value (sum of "cash" across
-    whatever load_account_profile(dataType="results") returns) is a
-    best-effort current guess, not a confirmed-correct one yet.
+    "cash" and "withdrawable_amount" both read $0 here — margin accounts hold
+    settled cash against margin, so those fields don't reflect actual
+    spendable balance. "portfolio_cash" is the confirmed-correct field:
+    verified against a live account by cross-checking
+    load_portfolio_profile()'s equity - market_value, which matches
+    portfolio_cash exactly.
     """
     try:
         accounts = r.load_account_profile(dataType="results") or []
@@ -595,45 +593,11 @@ def get_cash() -> float:
         return 0.0
 
     if not accounts:
-        log.warning("CASH DIAGNOSTIC: load_account_profile(dataType='results') returned no accounts")
+        log.warning("get_cash(): load_account_profile(dataType='results') returned no accounts")
         return 0.0
 
-    cash_fields = (
-        "cash", "cash_available_for_withdrawal", "unsettled_funds",
-        "uncleared_deposits", "cash_held_for_orders", "buying_power",
-        "portfolio_cash", "sma", "sma_held_for_orders",
-    )
-    for a in accounts:
-        fields_str = " ".join(f"{f}={a.get(f)}" for f in cash_fields)
-        log.info(
-            f"CASH DIAGNOSTIC account={a.get('account_number')} "
-            f"type={a.get('type')} {fields_str}"
-        )
-
-    try:
-        phoenix = r.load_phoenix_account() or {}
-        log.info(
-            "CASH DIAGNOSTIC phoenix "
-            f"uninvested_cash={phoenix.get('uninvested_cash')} "
-            f"withdrawable_cash={phoenix.get('withdrawable_cash')} "
-            f"cash_held_for_orders={phoenix.get('cash_held_for_orders')} "
-            f"account_buying_power={phoenix.get('account_buying_power')}"
-        )
-    except Exception as e:
-        log.info(f"CASH DIAGNOSTIC phoenix fetch failed: {e}")
-
-    try:
-        portfolio_profile = r.load_portfolio_profile() or {}
-        log.info(
-            "CASH DIAGNOSTIC portfolio_profile "
-            f"withdrawable_amount={portfolio_profile.get('withdrawable_amount')} "
-            f"excess_margin={portfolio_profile.get('excess_margin')}"
-        )
-    except Exception as e:
-        log.info(f"CASH DIAGNOSTIC portfolio_profile fetch failed: {e}")
-
-    total = round(sum(float(a.get("cash", 0) or 0) for a in accounts), 2)
-    log.info(f"get_cash() returning {total} (sum of 'cash' across {len(accounts)} account(s))")
+    total = round(sum(float(a.get("portfolio_cash", 0) or 0) for a in accounts), 2)
+    log.info(f"get_cash() returning {total} (sum of 'portfolio_cash' across {len(accounts)} account(s))")
     return total
 
 
