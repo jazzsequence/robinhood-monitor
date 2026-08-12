@@ -577,35 +577,28 @@ def get_positions() -> list[dict]:
 
 def get_cash() -> float:
     """
-    Return total cash across every Robinhood account on this login, summed.
+    Return the account's cash balance.
 
-    account_profile_url() with no account_number hits
-    accounts/?default_to_all_accounts=true — this login has more than one
-    account (the main margin brokerage account, and a separate agentic-
-    trading cash account — see CLAUDE.md's Robinhood MCP Integration
-    section), and load_account_profile()'s default dataType="indexzero"
-    just grabs results[0], an arbitrary first entry. That previously read
-    $0 because it silently landed on the (currently unfunded) agentic
-    account instead of the funded main account — not because "cash" was
-    the wrong field. Fetching every account and summing sidesteps needing
-    to identify "the right" one, and is the correct total anyway for the
-    digest's capital math. Logs each account's contribution so a future
-    mismatch is diagnosable from monitor.log instead of another guess.
+    "cash" and "withdrawable_amount" both read $0 here — margin accounts hold
+    settled cash against margin, so those fields don't reflect actual
+    spendable balance. "portfolio_cash" is the confirmed-correct field:
+    verified against a live account by cross-checking
+    load_portfolio_profile()'s equity - market_value, which matches
+    portfolio_cash exactly.
     """
     try:
         accounts = r.load_account_profile(dataType="results") or []
-        if not accounts:
-            log.warning("load_account_profile(dataType='results') returned no accounts")
-            return 0.0
-        per_account = [
-            (a.get("account_number"), round(float(a.get("cash", 0) or 0), 2))
-            for a in accounts
-        ]
-        log.info(f"Cash by account: {per_account}")
-        return round(sum(c for _, c in per_account), 2)
     except Exception as e:
         log.warning(f"Could not fetch cash balance: {e}")
         return 0.0
+
+    if not accounts:
+        log.warning("get_cash(): load_account_profile(dataType='results') returned no accounts")
+        return 0.0
+
+    total = round(sum(float(a.get("portfolio_cash", 0) or 0) for a in accounts), 2)
+    log.info(f"get_cash() returning {total} (sum of 'portfolio_cash' across {len(accounts)} account(s))")
+    return total
 
 
 # ── Recent order history ──────────────────────────────────────────────────────
@@ -1454,9 +1447,34 @@ def build_prompt(summary: dict) -> str:
 
     prior = summary.get("prior_analysis")
     if prior:
+        elapsed_note = ""
+        try:
+            days_elapsed = (
+                date.fromisoformat(summary["date"]) - date.fromisoformat(prior["date"])
+            ).days
+            if days_elapsed <= 0:
+                elapsed_note = (
+                    f"NOTE: This prior analysis ({prior['date']}) is from EARLIER TODAY, not a "
+                    "prior trading day — this run is a same-day rerun (e.g. manual testing), not "
+                    "a new trading session. No new day has passed: do not describe any position's "
+                    "price action, RSI, or other indicator as new movement since that run — the "
+                    "portfolio data below is essentially the same snapshot unless a genuinely new "
+                    "headline appears above. Do not repeat recommendations already acted on above "
+                    "as if they're fresh.\n"
+                )
+            else:
+                day_word = "day" if days_elapsed == 1 else "days"
+                elapsed_note = (
+                    f"NOTE: {days_elapsed} calendar {day_word} since the prior run "
+                    f"({prior['date']}) — a new trading session has occurred, so today's price "
+                    "action and indicators reflect genuinely new movement.\n"
+                )
+        except (ValueError, TypeError, KeyError):
+            pass
         lines += [
             "",
             f"=== PRIOR RUN ANALYSIS ({prior['date']}) ===",
+            elapsed_note,
             f"TL;DR: {prior['tldr']}" if prior.get("tldr") else "",
             prior.get("analysis", ""),
         ]
