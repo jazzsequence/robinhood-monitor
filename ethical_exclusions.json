@@ -7,6 +7,10 @@
     "SMCI": {
       "reason": "Super Micro Computer is primarily a data center builder/operator specializing in data center hardware, server construction, and cooling/power infrastructure for data centers (criterion 4).",
       "added": "2026-08-10"
+    },
+    "CCI": {
+      "reason": "Crown Castle International is primarily a data center operator and builder, operating extensive data center real estate and infrastructure that falls under criterion (4).",
+      "added": "2026-08-12"
     }
   },
   "screened": [
@@ -17,6 +21,7 @@
     "ARM",
     "ASML",
     "AVGO",
+    "CCI",
     "COST",
     "CRWD",
     "DELL",
