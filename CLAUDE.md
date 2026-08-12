@@ -90,9 +90,9 @@ Python 3.11+ required (uses `float | None` union type syntax).
 13. Format HTML + plain text digest (includes watchlist changes with linked articles, news sections)
 14. Send via Gmail SMTP SSL (port 465)
 
-## Cash Balance (unresolved — under diagnosis)
+## Cash Balance
 
-`get_cash()` has gone through two wrong fixes (`load_portfolio_profile()['withdrawable_amount']`, then a single account's `load_account_profile()['cash']`) that both still read $0 against a real non-zero balance. Root cause isn't confirmed yet. It currently logs every cash-adjacent field from every account `load_account_profile(dataType="results")` returns, plus `load_phoenix_account()` and `load_portfolio_profile()`, as `CASH DIAGNOSTIC` lines in `monitor.log` — check those against the real Robinhood app balance after a run to identify the correct field/account before trusting the digest's cash figure.
+`get_cash()` sums the `portfolio_cash` field across `load_account_profile(dataType="results")`. Two earlier fixes (`load_portfolio_profile()['withdrawable_amount']`, then a single account's `load_account_profile()['cash']`) both read $0 — this account is on margin, and margin accounts hold settled cash against margin, so neither field reflects actual spendable balance. `portfolio_cash` was confirmed against a live account: it matched `load_portfolio_profile()`'s `equity - market_value` exactly, and matched the real balance shown in the Robinhood app.
 
 ## Same-Day Rerun Detection
 
