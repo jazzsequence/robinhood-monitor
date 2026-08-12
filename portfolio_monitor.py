@@ -577,17 +577,32 @@ def get_positions() -> list[dict]:
 
 def get_cash() -> float:
     """
-    Return the account's actual cash balance.
+    Return total cash across every Robinhood account on this login, summed.
 
-    Deliberately NOT load_portfolio_profile()['withdrawable_amount'] — on a
-    margin account that reflects cash cleared for withdrawal under margin/
-    regulatory holds and routinely reads $0 even while real spendable cash
-    sits in the account. load_account_profile()['cash'] is the account's
-    actual cash balance, matching what the Robinhood app shows.
+    account_profile_url() with no account_number hits
+    accounts/?default_to_all_accounts=true — this login has more than one
+    account (the main margin brokerage account, and a separate agentic-
+    trading cash account — see CLAUDE.md's Robinhood MCP Integration
+    section), and load_account_profile()'s default dataType="indexzero"
+    just grabs results[0], an arbitrary first entry. That previously read
+    $0 because it silently landed on the (currently unfunded) agentic
+    account instead of the funded main account — not because "cash" was
+    the wrong field. Fetching every account and summing sidesteps needing
+    to identify "the right" one, and is the correct total anyway for the
+    digest's capital math. Logs each account's contribution so a future
+    mismatch is diagnosable from monitor.log instead of another guess.
     """
     try:
-        profile = r.load_account_profile()
-        return round(float(profile.get("cash", 0)), 2)
+        accounts = r.load_account_profile(dataType="results") or []
+        if not accounts:
+            log.warning("load_account_profile(dataType='results') returned no accounts")
+            return 0.0
+        per_account = [
+            (a.get("account_number"), round(float(a.get("cash", 0) or 0), 2))
+            for a in accounts
+        ]
+        log.info(f"Cash by account: {per_account}")
+        return round(sum(c for _, c in per_account), 2)
     except Exception as e:
         log.warning(f"Could not fetch cash balance: {e}")
         return 0.0
