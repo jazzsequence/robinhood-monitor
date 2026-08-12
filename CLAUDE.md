@@ -90,6 +90,14 @@ Python 3.11+ required (uses `float | None` union type syntax).
 13. Format HTML + plain text digest (includes watchlist changes with linked articles, news sections)
 14. Send via Gmail SMTP SSL (port 465)
 
+## Cash Balance (unresolved — under diagnosis)
+
+`get_cash()` has gone through two wrong fixes (`load_portfolio_profile()['withdrawable_amount']`, then a single account's `load_account_profile()['cash']`) that both still read $0 against a real non-zero balance. Root cause isn't confirmed yet. It currently logs every cash-adjacent field from every account `load_account_profile(dataType="results")` returns, plus `load_phoenix_account()` and `load_portfolio_profile()`, as `CASH DIAGNOSTIC` lines in `monitor.log` — check those against the real Robinhood app balance after a run to identify the correct field/account before trusting the digest's cash figure.
+
+## Same-Day Rerun Detection
+
+`build_prompt()` compares `prior_analysis['date']` to the current run's date and injects an explicit note: if 0 days have elapsed, the analysis is told this is a same-day rerun (e.g. manual testing) and not to describe any position's price action as new movement since the prior run; if 1+ days have elapsed, it's told a new trading session has genuinely occurred.
+
 ## Momentum Scoring
 
 Scores 0–100 across four signals:

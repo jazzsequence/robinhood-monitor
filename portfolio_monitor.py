@@ -577,35 +577,64 @@ def get_positions() -> list[dict]:
 
 def get_cash() -> float:
     """
-    Return total cash across every Robinhood account on this login, summed.
+    Return the account's cash balance.
 
-    account_profile_url() with no account_number hits
-    accounts/?default_to_all_accounts=true — this login has more than one
-    account (the main margin brokerage account, and a separate agentic-
-    trading cash account — see CLAUDE.md's Robinhood MCP Integration
-    section), and load_account_profile()'s default dataType="indexzero"
-    just grabs results[0], an arbitrary first entry. That previously read
-    $0 because it silently landed on the (currently unfunded) agentic
-    account instead of the funded main account — not because "cash" was
-    the wrong field. Fetching every account and summing sidesteps needing
-    to identify "the right" one, and is the correct total anyway for the
-    digest's capital math. Logs each account's contribution so a future
-    mismatch is diagnosable from monitor.log instead of another guess.
+    Two guesses at the right field/account have both still read $0
+    (withdrawable_amount, then a single account's "cash") — rather than
+    guess a third time, this logs every cash-adjacent field from every
+    account and endpoint robin_stocks exposes, so the next mismatch is
+    diagnosable from monitor.log's "CASH DIAGNOSTIC" lines instead of
+    another blind guess. The returned value (sum of "cash" across
+    whatever load_account_profile(dataType="results") returns) is a
+    best-effort current guess, not a confirmed-correct one yet.
     """
     try:
         accounts = r.load_account_profile(dataType="results") or []
-        if not accounts:
-            log.warning("load_account_profile(dataType='results') returned no accounts")
-            return 0.0
-        per_account = [
-            (a.get("account_number"), round(float(a.get("cash", 0) or 0), 2))
-            for a in accounts
-        ]
-        log.info(f"Cash by account: {per_account}")
-        return round(sum(c for _, c in per_account), 2)
     except Exception as e:
         log.warning(f"Could not fetch cash balance: {e}")
         return 0.0
+
+    if not accounts:
+        log.warning("CASH DIAGNOSTIC: load_account_profile(dataType='results') returned no accounts")
+        return 0.0
+
+    cash_fields = (
+        "cash", "cash_available_for_withdrawal", "unsettled_funds",
+        "uncleared_deposits", "cash_held_for_orders", "buying_power",
+        "portfolio_cash", "sma", "sma_held_for_orders",
+    )
+    for a in accounts:
+        fields_str = " ".join(f"{f}={a.get(f)}" for f in cash_fields)
+        log.info(
+            f"CASH DIAGNOSTIC account={a.get('account_number')} "
+            f"type={a.get('type')} {fields_str}"
+        )
+
+    try:
+        phoenix = r.load_phoenix_account() or {}
+        log.info(
+            "CASH DIAGNOSTIC phoenix "
+            f"uninvested_cash={phoenix.get('uninvested_cash')} "
+            f"withdrawable_cash={phoenix.get('withdrawable_cash')} "
+            f"cash_held_for_orders={phoenix.get('cash_held_for_orders')} "
+            f"account_buying_power={phoenix.get('account_buying_power')}"
+        )
+    except Exception as e:
+        log.info(f"CASH DIAGNOSTIC phoenix fetch failed: {e}")
+
+    try:
+        portfolio_profile = r.load_portfolio_profile() or {}
+        log.info(
+            "CASH DIAGNOSTIC portfolio_profile "
+            f"withdrawable_amount={portfolio_profile.get('withdrawable_amount')} "
+            f"excess_margin={portfolio_profile.get('excess_margin')}"
+        )
+    except Exception as e:
+        log.info(f"CASH DIAGNOSTIC portfolio_profile fetch failed: {e}")
+
+    total = round(sum(float(a.get("cash", 0) or 0) for a in accounts), 2)
+    log.info(f"get_cash() returning {total} (sum of 'cash' across {len(accounts)} account(s))")
+    return total
 
 
 # ── Recent order history ──────────────────────────────────────────────────────
@@ -1454,9 +1483,34 @@ def build_prompt(summary: dict) -> str:
 
     prior = summary.get("prior_analysis")
     if prior:
+        elapsed_note = ""
+        try:
+            days_elapsed = (
+                date.fromisoformat(summary["date"]) - date.fromisoformat(prior["date"])
+            ).days
+            if days_elapsed <= 0:
+                elapsed_note = (
+                    f"NOTE: This prior analysis ({prior['date']}) is from EARLIER TODAY, not a "
+                    "prior trading day — this run is a same-day rerun (e.g. manual testing), not "
+                    "a new trading session. No new day has passed: do not describe any position's "
+                    "price action, RSI, or other indicator as new movement since that run — the "
+                    "portfolio data below is essentially the same snapshot unless a genuinely new "
+                    "headline appears above. Do not repeat recommendations already acted on above "
+                    "as if they're fresh.\n"
+                )
+            else:
+                day_word = "day" if days_elapsed == 1 else "days"
+                elapsed_note = (
+                    f"NOTE: {days_elapsed} calendar {day_word} since the prior run "
+                    f"({prior['date']}) — a new trading session has occurred, so today's price "
+                    "action and indicators reflect genuinely new movement.\n"
+                )
+        except (ValueError, TypeError, KeyError):
+            pass
         lines += [
             "",
             f"=== PRIOR RUN ANALYSIS ({prior['date']}) ===",
+            elapsed_note,
             f"TL;DR: {prior['tldr']}" if prior.get("tldr") else "",
             prior.get("analysis", ""),
         ]
