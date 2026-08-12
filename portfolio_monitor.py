@@ -1459,8 +1459,12 @@ def build_prompt(summary: dict) -> str:
                     "a new trading session. No new day has passed: do not describe any position's "
                     "price action, RSI, or other indicator as new movement since that run — the "
                     "portfolio data below is essentially the same snapshot unless a genuinely new "
-                    "headline appears above. Do not repeat recommendations already acted on above "
-                    "as if they're fresh.\n"
+                    "headline appears above. This script never places trades itself — a prior "
+                    "recommendation is NOT evidence it was executed; only a real trade would remove "
+                    "or shrink a position. Trust the CURRENT POSITIONS section below (today's live "
+                    "data) over the prior analysis's text: if a symbol still appears there, no exit "
+                    "or trim happened, no matter what the prior analysis recommended, and the same "
+                    "recommendation should be repeated (not described as already done or as new).\n"
                 )
             else:
                 day_word = "day" if days_elapsed == 1 else "days"
