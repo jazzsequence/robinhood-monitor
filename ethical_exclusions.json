@@ -14,6 +14,7 @@
     }
   },
   "screened": [
+    "ALAB",
     "AMAT",
     "AMD",
     "AMKR",
@@ -27,6 +28,8 @@
     "DELL",
     "GOOGL",
     "INTC",
+    "IONQ",
+    "JD",
     "KLAC",
     "LRCX",
     "MARA",
