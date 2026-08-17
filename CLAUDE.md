@@ -78,7 +78,7 @@ Python 3.11+ required (uses `float | None` union type syntax).
 1. Load `.env` via `python-dotenv`
 2. Load `tickers.json` into screener watchlist
 3. Robinhood login (session-cached in `.robin_token`)
-4. Fetch open positions + cash balance via `robin_stocks`
+4. Fetch open positions + cash balance via `robin_stocks`, plus filled order history and **pending (unfilled) orders** — see Pending (Unfilled) Orders
 5. Fetch market data for portfolio symbols + screener tickers (yfinance, bulk)
 6. Score Robinhood watchlist tickers not in screener/portfolio — surface interesting ones as preferred add candidates
 7. Compute indicators per symbol: RSI, MA50, MA200, volume ratio, daily % change
@@ -93,6 +93,38 @@ Python 3.11+ required (uses `float | None` union type syntax).
 ## Cash Balance
 
 `get_cash()` sums the `portfolio_cash` field across `load_account_profile(dataType="results")`. Two earlier fixes (`load_portfolio_profile()['withdrawable_amount']`, then a single account's `load_account_profile()['cash']`) both read $0 — this account is on margin, and margin accounts hold settled cash against margin, so neither field reflects actual spendable balance. `portfolio_cash` was confirmed against a live account: it matched `load_portfolio_profile()`'s `equity - market_value` exactly, and matched the real balance shown in the Robinhood app.
+
+## Pending (Unfilled) Orders
+
+An order placed over a weekend or after hours sits in Robinhood in a `queued`/`confirmed`/
+`unconfirmed`/`partially_filled` state until the next session opens. Such an order is invisible to
+**both** account reads the script otherwise trusts: `get_open_stock_positions()` (no shares are held
+yet) and `get_recent_orders()` (which keeps only `state == "filled"`). That blind spot produced a
+real failure on 2026-08-17 — a weekend IONQ buy left the symbol looking unowned *and* left its
+committed cash looking spendable, so the 6am Monday analysis recommended buying IONQ with money
+already spent on IONQ.
+
+`get_pending_orders()` closes it, via `r.get_all_open_stock_orders()`. Enforcement is mechanical,
+the same pattern as trim warnings and protected commitments:
+
+- **Pending buys count as owned.** `committed_symbols = portfolio_symbols | pending_buy_symbols`
+  feeds the momentum scan, the screener data fetch, and the watchlist-candidate exclude set, so the
+  symbol can never surface as a candidate. `build_prompt` filters held/pending symbols out of the
+  momentum section a second time at render, since that section's header is the one place the prompt
+  asserts a symbol is unowned.
+- **Pending sells are not funding sources.** The position is tagged NOT FUNDING-ELIGIBLE and dropped
+  from ELIGIBLE FUNDING SOURCES / PROTECTED SYMBOLS, so proceeds already in flight can't be
+  double-counted.
+- **Committed cash is not spendable.** `uncommitted_cash = cash - committed_cash` (summed notional of
+  open buys). Robinhood does not reliably deduct a queued order from `portfolio_cash`, so this is
+  netted in Python. The prompt's `Available Cash:` line, both digests, and `last_analysis.json` all
+  lead with the deployable figure, showing the gross total only as a parenthetical.
+- The `PENDING ORDERS` hard constraint in `CLAUDE_SYSTEM_PROMPT` states that absence from CURRENT
+  POSITIONS and RECENT TRANSACTIONS is *not* evidence a symbol is unowned.
+
+`_order_notional()` reads the dollar value across Robinhood's several order shapes: nested
+`dollar_based_amount`/`total_notional`/`executed_notional` blocks (dollar-based fractional orders
+often carry no `quantity` until they fill), falling back to `quantity × price`.
 
 ## Same-Day Rerun Detection
 
@@ -142,6 +174,7 @@ A second Claude call (Haiku model, 500 tokens) runs after the momentum scan and 
 
 ## Email Sections
 
+0. Pending Orders (table — only rendered when unfilled orders exist)
 1. Current Positions (table, colour-coded returns)
 2. Technical Indicators (table, colour-coded RSI/MA/vol)
 3. Top Momentum Movers (table)
@@ -177,16 +210,19 @@ claude mcp add robinhood-trading --transport http https://agent.robinhood.com/mc
 **Workflow for trade decisions:**
 1. Script runs at 6am → email digest sent → `last_analysis.json` updated with full technical snapshot in `~/Dropbox/robinhood-monitor/` (see Security Notes), current regardless of which machine ran it
 2. Open a Claude Code session here and read `last_analysis.json` (in `~/Dropbox/robinhood-monitor/` — Dropbox syncs it automatically, no git pull needed) — it now includes positions with RSI, MAs, volume ratios, and top momentum movers
-3. Pull live quotes via `get_equity_quotes` MCP tool to check if the 6am thesis still holds
+3. Pull live quotes via `get_equity_quotes` MCP tool to check if the 6am thesis still holds. Check `portfolio.pending_orders` too — an order placed since the last session may have filled, changing what's actually owned and what cash is free
 4. Discuss the recommendation before acting — the pre-trade conversation is the human-in-the-loop filter
 5. If a trade is warranted: fund the agentic account manually in the Robinhood app, then use `review_equity_order` + `place_equity_order` MCP tools
 
-**`last_analysis.json` schema** (as of 2026-06-09):
+**`last_analysis.json` schema** (as of 2026-08-17):
 ```json
 {
   "date": "...", "tldr": "...", "analysis": "...",
   "portfolio": {
     "total_value": 0.0, "cash": 0.0,
+    "committed_cash": 0.0, "uncommitted_cash": 0.0,
+    "pending_orders": [{ "symbol": "...", "side": "buy", "quantity": 0, "price": 0,
+                         "notional": 0, "date": "...", "state": "queued" }],
     "positions": [{ "symbol": "...", "shares": 0, "avg_cost": 0, "current_price": 0,
                     "equity": 0, "total_return_pct": 0, "rsi": 0, "ma50": 0, "ma200": 0,
                     "price_vs_ma50_pct": 0, "price_vs_ma200_pct": 0,

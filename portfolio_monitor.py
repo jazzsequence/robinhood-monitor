@@ -141,6 +141,18 @@ CLAUDE_SYSTEM_PROMPT = (
     "better redeployment opportunity, not by the size of today's move.\n\n"
     "RECENT POSITIONS: Do not recommend selling positions bought < 7 days ago without a severe "
     "specific reason (marked in the transaction history).\n\n"
+    "PENDING ORDERS — HARD CONSTRAINT: If a '=== PENDING ORDERS (placed, NOT yet filled) ===' "
+    "section appears below, those orders are already committed and simply have not executed yet "
+    "(an order placed over a weekend or after hours stays queued until the next session opens). "
+    "A pending order holds no shares and is not a completed transaction, so its symbol will be "
+    "absent from CURRENT POSITIONS and from RECENT TRANSACTIONS — that absence is NOT evidence "
+    "the symbol is unowned. For any symbol with a pending BUY you are FORBIDDEN from "
+    "recommending a buy or describing it as an unowned opportunity, a gap in the portfolio, or "
+    "missing exposure; it is already bought. For any symbol with a pending SELL, do not "
+    "recommend selling or trimming it again and do not count its proceeds as available capital — "
+    "that sale is already in flight. Cash committed to unfilled buy orders is likewise NOT "
+    "spendable: use only the 'Available Cash' figure at the top of the prompt, which is already "
+    "net of those commitments, and never the larger gross total shown beside it.\n\n"
     "COST BASIS DISCIPLINE — HARD CONSTRAINT: Each position below is tagged FUNDING-ELIGIBLE or "
     "NOT FUNDING-ELIGIBLE, computed from its actual total_return_pct — not from today's price "
     "move, RSI, or distance from its moving averages, all of which describe short-term technical "
@@ -672,6 +684,108 @@ def get_recent_orders(days: int = 30) -> list[dict]:
         })
 
     return recent
+
+
+# Robinhood order states meaning "placed, accepted, but not yet executed". An
+# order placed over a weekend or after hours sits in one of these until the next
+# session opens, which makes it invisible to BOTH sources the script otherwise
+# trusts: get_open_stock_positions() (no shares are held yet) and
+# get_recent_orders() (which keeps only state == "filled"). That blind spot is
+# how a 6am pre-market run can recommend buying a stock the user already
+# committed to over the weekend, funded with cash that order has already spent.
+PENDING_ORDER_STATES = {"queued", "unconfirmed", "confirmed", "partially_filled"}
+
+
+def _order_notional(order: dict) -> float | None:
+    """
+    Best-effort dollar value of an order.
+
+    Robinhood reports this differently depending on how the order was placed:
+    dollar-based fractional orders carry a nested amount block and often no
+    quantity at all until they fill, while share-based orders carry quantity
+    plus a limit price. Try the notional blocks first, then fall back to
+    quantity x price.
+    """
+    for key in ("dollar_based_amount", "total_notional", "executed_notional"):
+        block = order.get(key)
+        if isinstance(block, dict):
+            try:
+                amount = float(block.get("amount"))
+            except (TypeError, ValueError):
+                continue
+            if amount > 0:
+                return round(amount, 2)
+
+    try:
+        qty = float(order.get("quantity") or 0)
+        raw_price = order.get("average_price") or order.get("price")
+        if qty > 0 and raw_price:
+            return round(qty * float(raw_price), 2)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def get_pending_orders() -> list[dict]:
+    """
+    Return stock orders that are placed but not yet filled, newest first.
+    Each entry: {symbol, side, quantity, price, notional, date, state}.
+
+    See PENDING_ORDER_STATES above for why this matters: without it, a
+    weekend-placed order is invisible to every other account read the script
+    makes.
+    """
+    try:
+        raw = r.get_all_open_stock_orders() or []
+    except Exception as e:
+        log.warning(f"Could not fetch open orders: {e}")
+        return []
+
+    instrument_cache: dict[str, str] = {}
+    pending = []
+
+    for order in raw:
+        if order.get("state") not in PENDING_ORDER_STATES:
+            continue
+
+        instrument_url = order.get("instrument", "")
+        if not instrument_url:
+            continue
+        if instrument_url not in instrument_cache:
+            try:
+                instrument = r.get_instrument_by_url(instrument_url)
+                instrument_cache[instrument_url] = instrument.get("symbol", "")
+            except Exception:
+                instrument_cache[instrument_url] = ""
+
+        symbol = instrument_cache[instrument_url]
+        if not symbol:
+            continue
+
+        try:
+            qty = round(float(order.get("quantity") or 0), 4) or None
+        except (TypeError, ValueError):
+            qty = None
+        try:
+            raw_price = order.get("price")
+            price = round(float(raw_price), 4) if raw_price else None
+        except (TypeError, ValueError):
+            price = None
+
+        created = (order.get("created_at") or "")[:10]
+
+        pending.append({
+            "symbol": symbol,
+            "side": order.get("side", ""),
+            "quantity": qty,
+            "price": price,
+            "notional": _order_notional(order),
+            "date": created,
+            "state": order.get("state", ""),
+        })
+
+    pending.sort(key=lambda o: o["date"], reverse=True)
+    return pending
 
 
 def compute_trim_warnings(recent_orders: list[dict]) -> dict[str, str]:
@@ -1392,6 +1506,12 @@ def save_analysis(date: str, tldr: str, analysis: str, summary: dict | None = No
         payload["portfolio"] = {
             "total_value": summary.get("total_value"),
             "cash": summary.get("cash"),
+            "committed_cash": summary.get("committed_cash", 0.0),
+            "uncommitted_cash": summary.get("uncommitted_cash", summary.get("cash")),
+            # Carried so an interactive MCP session reading this file sees the
+            # same in-flight orders the digest did — a pending buy's symbol is
+            # absent from "positions" and would otherwise look unowned there too.
+            "pending_orders": summary.get("pending_orders", []),
             "positions": [
                 {
                     "symbol": pos["symbol"],
@@ -1428,11 +1548,24 @@ def build_prompt(summary: dict) -> str:
     day_name, time_str, session, is_stale = get_market_session()
     change_label = "Last session" if is_stale else "Today"
 
+    pending_orders = summary.get("pending_orders", [])
+    pending_buy_symbols = {o["symbol"] for o in pending_orders if o["side"] == "buy"}
+    pending_sell_symbols = {o["symbol"] for o in pending_orders if o["side"] == "sell"}
+    committed_cash = summary.get("committed_cash", 0.0)
+    uncommitted_cash = summary.get("uncommitted_cash", summary["cash"])
+
     lines = [
         f"Portfolio Summary as of {summary['date']} ({day_name}, {time_str} — {session})",
         f"Total Portfolio Value: ${summary['total_value']:.2f}",
-        f"Available Cash: ${summary['cash']:.2f}",
+        f"Available Cash: ${uncommitted_cash:.2f}",
     ]
+    if committed_cash:
+        lines.append(
+            f"  (${summary['cash']:.2f} total cash, less ${committed_cash:.2f} already "
+            f"committed to unfilled buy orders — see PENDING ORDERS. Only the "
+            f"${uncommitted_cash:.2f} figure above is deployable; do not treat the "
+            f"total as spendable.)"
+        )
     if is_stale:
         lines.append(
             "NOTE: No new trading session has started yet, so every "
@@ -1521,7 +1654,12 @@ def build_prompt(summary: dict) -> str:
         alloc_pct = pos["equity"] / total_value * 100
         symbol = pos["symbol"]
         is_winner = pos["total_return_pct"] > 0
-        if not is_winner:
+        if symbol in pending_sell_symbols:
+            funding_tag = (
+                "NOT FUNDING-ELIGIBLE — an unfilled sell order is already placed on "
+                "this position (see PENDING ORDERS); its proceeds are already spoken for"
+            )
+        elif not is_winner:
             funding_tag = "NOT FUNDING-ELIGIBLE — losing position (see COST BASIS DISCIPLINE)"
         elif symbol in trim_warnings:
             funding_tag = "NOT FUNDING-ELIGIBLE — repeated-sell hard stop (see TRIM COUNT WARNINGS)"
@@ -1574,6 +1712,7 @@ def build_prompt(summary: dict) -> str:
          if p["total_return_pct"] > 0
          and p["symbol"] not in trim_warnings
          and p["symbol"] not in recent_buy_symbols
+         and p["symbol"] not in pending_sell_symbols
          and p["symbol"] not in PROTECTED_SYMBOLS),
         key=lambda p: p["total_return_pct"],
         reverse=True,
@@ -1594,6 +1733,7 @@ def build_prompt(summary: dict) -> str:
         and p["total_return_pct"] > 0
         and p["symbol"] not in trim_warnings
         and p["symbol"] not in recent_buy_symbols
+        and p["symbol"] not in pending_sell_symbols
         and p["symbol"] not in outstanding_by_symbol
     ]
     if protected_held:
@@ -1623,6 +1763,26 @@ def build_prompt(summary: dict) -> str:
                 f"(current ${_fmt(current_price, '.2f')}) — {met}"
             )
 
+    if pending_orders:
+        lines += [
+            "",
+            "=== PENDING ORDERS (placed, NOT yet filled) ===",
+            "These orders are already committed but have not executed — typically "
+            "placed over a weekend or after hours and queued until the next session "
+            "opens. They hold no shares yet, so the buys below do NOT appear in "
+            "CURRENT POSITIONS and their symbols are NOT unowned. Treat a pending buy "
+            "as already bought: do not recommend buying that symbol again, and do not "
+            "describe it as a gap in the portfolio.",
+        ]
+        for o in pending_orders:
+            qty_str = f"{o['quantity']:.4f} shares" if o["quantity"] else "fractional"
+            notional_str = f"${o['notional']:.2f}" if o["notional"] is not None else "amount unknown"
+            price_str = f" @ ${o['price']:.4f}" if o["price"] is not None else ""
+            lines.append(
+                f"  {o['side'].upper():<4} {o['symbol']:<8} {qty_str}{price_str} "
+                f"({notional_str})  placed {o['date']} — state: {o['state']}"
+            )
+
     if recent_orders:
         lines += ["", "=== RECENT TRANSACTIONS (last 30 days) ==="]
         for o in recent_orders:
@@ -1650,8 +1810,15 @@ def build_prompt(summary: dict) -> str:
                 f"reason explicitly (see ETHICAL INVESTMENT SCREEN)."
             )
 
+    # Final guard on the "(not in portfolio)" claim in this header. The momentum
+    # scan already excludes held and pending-buy symbols upstream, but this
+    # section is the one place the prompt asserts a symbol is unowned, so filter
+    # again here rather than trusting that the upstream set was complete.
+    held_or_pending = {p["symbol"] for p in summary["positions"]} | pending_buy_symbols
     lines += ["", "=== TOP MOMENTUM MOVERS (not in portfolio) ==="]
     for m in summary["momentum"]:
+        if m["symbol"] in held_or_pending:
+            continue
         lines.append(
             f"\n{m['symbol']}: RSI {_fmt(m.get('rsi'), '.1f')} | "
             f"{change_label} {_fmt(m.get('pct_change_today'), '+.2f')}% | "
@@ -1725,12 +1892,28 @@ def format_digest(summary: dict, analysis: str) -> str:
     sep = "-" * 64
 
     tldr = summary.get("tldr", "")
+    committed_cash = summary.get("committed_cash", 0.0)
+    uncommitted_cash = summary.get("uncommitted_cash", summary["cash"])
+    cash_str = f"${uncommitted_cash:.2f}"
+    if committed_cash:
+        cash_str += f" (of ${summary['cash']:.2f}; ${committed_cash:.2f} on unfilled orders)"
     lines = [
         SEP,
         f"PORTFOLIO DIGEST — {summary['date']}",
-        f"Total Value: ${summary['total_value']:.2f}  |  Cash: ${summary['cash']:.2f}",
+        f"Total Value: ${summary['total_value']:.2f}  |  Cash: {cash_str}",
         SEP,
     ]
+
+    pending_orders = summary.get("pending_orders", [])
+    if pending_orders:
+        lines += ["", "PENDING ORDERS (placed, not yet filled)", sep]
+        for o in pending_orders:
+            qty_str = f"{o['quantity']:.4f} sh" if o["quantity"] else "fractional"
+            notional_str = f"${o['notional']:.2f}" if o["notional"] is not None else "—"
+            lines.append(
+                f"{o['side'].upper():<4} {o['symbol']:<8} {qty_str:>14} {notional_str:>10}  "
+                f"placed {o['date']} ({o['state']})"
+            )
 
     if tldr:
         lines += [
@@ -1970,6 +2153,17 @@ def _table(header_row: str, body_rows: str) -> str:
 
 
 def format_digest_html(summary: dict, analysis: str) -> str:
+    # Headline cash is what's actually deployable — gross cash less anything
+    # unfilled buy orders have already committed.
+    committed_cash = summary.get("committed_cash", 0.0)
+    uncommitted_cash = summary.get("uncommitted_cash", summary["cash"])
+    committed_cash_note = (
+        f'<span style="display:block;color:#94a3b8;font-size:11px;font-weight:600;'
+        f'font-family:Arial,Helvetica,sans-serif;padding-top:4px;">'
+        f'of ${summary["cash"]:.2f} — ${committed_cash:.2f} on unfilled orders</span>'
+        if committed_cash else ""
+    )
+
     # ── Positions table ──────────────────────────────────────────────────────
     pos_header = "".join([
         _th("Symbol", align="left"),
@@ -2045,6 +2239,38 @@ def format_digest_html(summary: dict, analysis: str) -> str:
             + _td(str(m["score"]), bold=True, mono=True, color="#0f172a")
             + "</tr>"
         )
+
+    # ── Pending orders ───────────────────────────────────────────────────────
+    pending_orders = summary.get("pending_orders", [])
+    pending_header = "".join([
+        _th("Side", align="left"),
+        _th("Symbol", align="left"),
+        _th("Quantity"),
+        _th("Amount"),
+        _th("Placed", align="left"),
+        _th("State", align="left"),
+    ])
+    pending_rows = ""
+    for o in pending_orders:
+        is_buy = o["side"] == "buy"
+        pending_rows += (
+            "<tr>"
+            + _td(_h(o["side"].upper()), align="left", bold=True,
+                  color="#16a34a" if is_buy else "#dc2626")
+            + _td(_h(o["symbol"]), align="left", bold=True, color="#0f172a")
+            + _td(f"{o['quantity']:.4f}" if o["quantity"] else "fractional", mono=True)
+            + _td(f"${o['notional']:.2f}" if o["notional"] is not None else "—",
+                  mono=True, bold=True, color="#0f172a")
+            + _td(_h(o["date"]), align="left", mono=True)
+            + _td(_h(o["state"]), align="left")
+            + "</tr>"
+        )
+    pending_content = (
+        '<p style="margin:0 0 10px;font-size:13px;color:#64748b;line-height:1.5;">'
+        "Already committed but not yet executed — these hold no shares and spend no "
+        "cash until they fill, so they do not appear in Current Positions.</p>"
+        + _table(pending_header, pending_rows)
+    )
 
     # ── Watchlist updates ────────────────────────────────────────────────────
     ticker_changes = summary.get("ticker_changes", {})
@@ -2157,6 +2383,7 @@ def format_digest_html(summary: dict, analysis: str) -> str:
     # ── Assemble ─────────────────────────────────────────────────────────────
     body_content = (
         tldr_block
+        + (_section("Pending Orders", pending_content) if pending_orders else "")
         + _section("Current Positions", _table(pos_header, pos_rows))
         + _section("Technical Indicators", _table(ind_header, ind_rows))
         + _section("Top Momentum Movers", _table(mom_header, mom_rows))
@@ -2206,7 +2433,7 @@ def format_digest_html(summary: dict, analysis: str) -> str:
           <td style="color:#f8fafc;font-size:24px;font-weight:700;font-family:monospace;">
             ${summary["total_value"]:.2f}</td>
           <td style="color:#f8fafc;font-size:24px;font-weight:700;font-family:monospace;">
-            ${summary["cash"]:.2f}</td>
+            ${uncommitted_cash:.2f}{committed_cash_note}</td>
         </tr>
       </table>
     </td>
@@ -2328,6 +2555,44 @@ def main():
         log.warning(f"Could not fetch recent orders: {e}")
         recent_orders = []
 
+    # 3c. Fetch orders that are placed but not yet filled. An order placed over a
+    # weekend or after hours holds no shares and is not "filled", so without this
+    # it is invisible to both reads above — the symbol looks unowned and the cash
+    # it has already committed looks spendable.
+    try:
+        pending_orders = get_pending_orders()
+        log.info(f"Fetched {len(pending_orders)} pending (unfilled) orders")
+    except Exception as e:
+        log.warning(f"Could not fetch pending orders: {e}")
+        pending_orders = []
+
+    pending_buy_symbols = {o["symbol"] for o in pending_orders if o["side"] == "buy"}
+    pending_sell_symbols = {o["symbol"] for o in pending_orders if o["side"] == "sell"}
+    committed_cash = round(
+        sum(o["notional"] or 0 for o in pending_orders if o["side"] == "buy"), 2
+    )
+    if pending_orders:
+        log.info(
+            f"Pending buys: {sorted(pending_buy_symbols) or 'none'} "
+            f"(${committed_cash:.2f} committed) | "
+            f"pending sells: {sorted(pending_sell_symbols) or 'none'}"
+        )
+
+    # Cash the analysis may actually deploy: gross cash minus what open buy
+    # orders have already spoken for. Robinhood does not always deduct a queued
+    # order from portfolio_cash, so this has to be netted here.
+    uncommitted_cash = round(max(cash - committed_cash, 0.0), 2)
+    if committed_cash:
+        log.info(
+            f"Cash ${cash:.2f} gross, ${committed_cash:.2f} committed to open "
+            f"buys, ${uncommitted_cash:.2f} deployable"
+        )
+
+    # A symbol with an open buy is already bought as far as any new
+    # recommendation is concerned — treat it exactly like a held position so it
+    # can never resurface as an "unowned" candidate.
+    committed_symbols = portfolio_symbols | pending_buy_symbols
+
     # 4. Bulk fetch market data for portfolio + screener in two calls
     try:
         portfolio_data = fetch_bulk_market_data(sorted(portfolio_symbols))
@@ -2340,7 +2605,7 @@ def main():
 
     try:
         screener_data = fetch_bulk_market_data(
-            [t for t in screener_tickers if t not in portfolio_symbols]
+            [t for t in screener_tickers if t not in committed_symbols]
         )
     except Exception as e:
         log.error(f"Screener market data failed: {e}")
@@ -2357,7 +2622,7 @@ def main():
     # a reason to leave a permanently-broken ticker stuck in the watchlist.
     no_data_tickers = [
         t for t in screener_tickers
-        if t not in portfolio_symbols and t not in screener_data
+        if t not in committed_symbols and t not in screener_data
     ]
     if no_data_tickers:
         auto_removed = []
@@ -2379,7 +2644,7 @@ def main():
     watchlist_candidates = []
     try:
         watchlist_syms = get_watchlist_tickers(
-            exclude=portfolio_symbols | set(screener_tickers)
+            exclude=committed_symbols | set(screener_tickers)
         )
         all_watchlist_syms = watchlist_syms["user"] + watchlist_syms["robinhood"]
         if all_watchlist_syms:
@@ -2435,7 +2700,7 @@ def main():
 
     # 6. Momentum scan (screener tickers only — watchlist candidates handled separately above)
     try:
-        momentum = run_momentum_scan(portfolio_symbols, screener_data, screener_tickers)
+        momentum = run_momentum_scan(committed_symbols, screener_data, screener_tickers)
         log.info(f"Momentum scan complete: {len(momentum)} candidates")
     except Exception as e:
         log.error(f"Momentum scan failed: {e}")
@@ -2452,10 +2717,13 @@ def main():
         "hostname": hostname,
         "total_value": total_value,
         "cash": cash,
+        "committed_cash": committed_cash,
+        "uncommitted_cash": uncommitted_cash,
         "positions": positions,
         "momentum": momentum,
         "watchlist_candidates": watchlist_candidates,
         "recent_orders": recent_orders,
+        "pending_orders": pending_orders,
         "prior_analysis": prior_analysis,
         "ethical_held": ethical_held,
     }
