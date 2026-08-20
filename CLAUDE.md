@@ -126,6 +126,39 @@ the same pattern as trim warnings and protected commitments:
 `dollar_based_amount`/`total_notional`/`executed_notional` blocks (dollar-based fractional orders
 often carry no `quantity` until they fill), falling back to `quantity × price`.
 
+## TL;DR Ordering
+
+The digest's TL;DR is generated **after** the analysis blocks, not before, and the parse in
+`get_claude_analysis()` splits on the **last** `\n---\n` (`rsplit`) rather than the first.
+
+The `TL;DR — WRITTEN LAST, ON PURPOSE` rule in `CLAUDE_SYSTEM_PROMPT` asks it to do **two** jobs,
+in order:
+
+1. **Read the broad market mood** — risk-on/risk-off, which sectors are leading or breaking down,
+   how broad the move is, what the news flow is fixated on, and whether it looks like a one-day
+   wobble or something sustained. Drawn from the market news plus the *breadth* of moves across the
+   whole position list, not from any single ticker.
+2. **Connect that mood to the decisions actually recommended** — the mood is the "why now" behind
+   the advice, stated explicitly. A sector-wide selloff with intact theses is why almost everything
+   is a hold; one real catalyst breaking is why the single buy goes where it goes.
+
+The ordering is what makes job 2 possible, and it is not an implementation detail. The analysis call
+runs with `thinking={"type": "disabled"}`, so whatever the model emits first *is* its first reasoning
+about the portfolio. The original prompt said "First, write 2-3 sentences framed as a tl;dr…" and
+framed it as "not a trade recommendation, but the broader context" — so it was written before any
+trim/buy/hold decision existed *and* was pushed away from the advice, and it routinely narrated a
+market theme that contradicted the recommendations printed beneath it in the same email. Generating
+it last means the model reads the mood and then explains its own committed decisions through it.
+
+The prompt states plainly that a TL;DR telling a different story than the advice beneath it is a
+failure rather than a difference in altitude, and that if the market mood genuinely argues against
+the recommendations then the *recommendations* are what need fixing.
+
+`rsplit` also makes the parse strictly more robust than the old `split`: a stray `---` inside the
+analysis can no longer steal the boundary and swallow the recommendations. A trailing separator
+after the TL;DR is stripped before splitting, and a response with no separator at all still falls
+back to empty TL;DR + full text as analysis.
+
 ## Same-Day Rerun Detection
 
 `build_prompt()` compares `prior_analysis['date']` to the current run's date and injects an explicit note: if 0 days have elapsed, the analysis is told this is a same-day rerun (e.g. manual testing) and not to describe any position's price action as new movement since the prior run; if 1+ days have elapsed, it's told a new trading session has genuinely occurred.

@@ -224,17 +224,13 @@ CLAUDE_SYSTEM_PROMPT = (
     "is an explicit exception to COST BASIS DISCIPLINE: a small stale position may be closed even "
     "at a loss, citing 'SMALL POSITION CLEANUP' instead of a broken-thesis reason, because the "
     "action is portfolio hygiene, not funding a new buy.\n\n"
-    "First, write 2-3 sentences framed as a tl;dr of the overall trends or advice given. "
-    "This is a high-level, humanistic read on the most important trend, risk, or opportunity "
-    "facing the portfolio right now — not a trade recommendation, but the broader context that "
-    "should inform every decision today. End this paragraph with exactly the line: ---\n"
     "TRIM SIGNALS — consider a partial trim (even without a broken thesis) when a position is "
     "30%+ above its MA50, a single position exceeds 35% of portfolio, or a high-momentum "
     "opportunity exists that the portfolio doesn't yet capture. "
     "A partial trim means taking a fraction of the position off the table, not exiting — size it "
     "per POSITION-SIZE-AWARE TRIM SIZING (at most ~50% of that position's equity), not as a fixed "
     "dollar figure. Riding a winner and taking partial profits are not mutually exclusive.\n\n"
-    "Then write a full analysis in three blocks. Do not use --- as dividers between blocks. "
+    "Write the analysis in three blocks. Do not use --- as dividers between blocks. "
     "Avoid trading jargon — write plainly for someone who trades casually but is not an expert.\n\n"
     "TRIMS/EXITS: Only list positions actually being trimmed or exited — one bold action line "
     "per trim (e.g. **TRIM ARM — Sell $50**) followed by one sentence of reasoning. For a "
@@ -258,8 +254,9 @@ CLAUDE_SYSTEM_PROMPT = (
     "though nothing internal can fund it, and name the ticker and why.\n\n"
     "HOLDS: List each held position on its own line with a brief reason. "
     "Do not group positions into categories.\n\n"
-    "End with **ONE KEY THING TO WATCH TODAY:** followed by one sentence describing something "
-    "not yet actionable. If it is actionable, put it in TRIMS or BUYS instead.\n\n"
+    "End the analysis with **ONE KEY THING TO WATCH TODAY:** followed by one sentence "
+    "describing something not yet actionable. If it is actionable, put it in TRIMS or "
+    "BUYS instead.\n\n"
     "INTERNAL CONSISTENCY RULE: If you identify a compelling new entry opportunity but have no cash "
     "and recommend no trims, your output is self-contradicting unless you explicitly resolve it one "
     "of three ways: (1) the opportunity IS compelling — identify a trim to fund it and recommend "
@@ -269,7 +266,30 @@ CLAUDE_SYSTEM_PROMPT = (
     "it pass silently. Never recommend a new entry alongside 'no cash, no trims' without picking one "
     "of these three. "
     "Use specific BUY, SELL, TRIM, or HOLD language. Be concise — lead with the decision, "
-    "one sentence of reasoning per position. Do not output systematic check tables or grids."
+    "one sentence of reasoning per position. Do not output systematic check tables or grids.\n\n"
+    "TL;DR — WRITTEN LAST, ON PURPOSE: After the analysis is complete, output a line "
+    "containing exactly --- and then write a 3-4 sentence tl;dr. Write it only after the "
+    "TRIMS/EXITS, BUYS, and HOLDS blocks already exist above it, because it has to be "
+    "consistent with them.\n"
+    "It does two jobs, in this order. FIRST, read the broad market mood — what the tape and "
+    "the news flow are doing today at the macro and sector level: risk-on or risk-off, which "
+    "sectors are leading or breaking down, how broad the move is, what the headlines are "
+    "fixated on, and whether this looks like a one-day wobble or the start of something "
+    "sustained. Read this from the market news and from the breadth of moves across the whole "
+    "position list, not from any single ticker. SECOND, connect that mood to the decisions you "
+    "actually recommended: the mood is the 'why now' behind the advice, so state the link "
+    "explicitly — a sector-wide selloff with intact theses is why almost everything is a hold; "
+    "one genuine catalyst breaking today is why the single buy goes where it goes; a risk-off "
+    "tape with no eligible funding source is why a good opportunity gets flagged instead of "
+    "taken.\n"
+    "The mood you describe must be the same one the analysis reasoned from. Do not name a "
+    "trend, risk, or opportunity that is absent from the analysis or that points the opposite "
+    "way from what you recommended — a tl;dr telling a different story than the advice beneath "
+    "it is a failure, not a difference in altitude. If the market mood genuinely argues against "
+    "your recommendations, the analysis is what is wrong: go back and fix the recommendations "
+    "rather than papering over the gap here. Do not simply restate the action lines. Write it "
+    "plainly and humanistically, as the one paragraph someone would read if they read nothing "
+    "else."
 )
 
 # robin_stocks stores pickles in ~/.tokens/robinhood<name>.pickle regardless of path
@@ -1839,10 +1859,20 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
         system=CLAUDE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
-    raw = message.content[0].text
+    # The TL;DR is generated *after* the analysis blocks (see CLAUDE_SYSTEM_PROMPT) so
+    # it summarizes recommendations the model has already committed to, rather than a
+    # theme it guessed at before reasoning about any of them — thinking is disabled, so
+    # a TL;DR emitted first is literally the model's first tokens on the portfolio, and
+    # it used to routinely tell a different story than the advice below it.
+    raw = message.content[0].text.strip()
+    # Drop a trailing separator the model sometimes appends after the TL;DR; left in
+    # place it would make the rsplit below hand back an empty TL;DR.
+    raw = re.sub(r"\n-{3,}[ \t]*$", "", raw).strip()
     if "\n---\n" in raw:
-        tldr_part, analysis_part = raw.split("\n---\n", 1)
-        tldr = tldr_part.strip()
+        # rsplit, not split: the last separator is the TL;DR boundary, so a stray ---
+        # inside the analysis can't steal it.
+        analysis_part, tldr = raw.rsplit("\n---\n", 1)
+        tldr = tldr.strip()
     else:
         tldr = ""
         analysis_part = raw
@@ -1882,6 +1912,7 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
         flags=re.IGNORECASE | re.DOTALL,
     ).strip()
     analysis_part = re.sub(r"^---[ \t]*\n+", "", analysis_part).strip()
+    analysis_part = re.sub(r"\n-{3,}[ \t]*$", "", analysis_part).strip()
 
     return tldr, analysis_part
 
