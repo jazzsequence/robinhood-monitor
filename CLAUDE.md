@@ -159,6 +159,35 @@ analysis can no longer steal the boundary and swallow the recommendations. A tra
 after the TL;DR is stripped before splitting, and a response with no separator at all still falls
 back to empty TL;DR + full text as analysis.
 
+## Analysis Persistence (Dropbox is not trusted alone)
+
+`save_analysis()` writes **two** copies and `load_last_analysis()` reads whichever is intact and
+newest:
+
+| Constant | Location | Purpose |
+|----------|----------|---------|
+| `ANALYSIS_FILE` | repointed to `~/Dropbox/robinhood-monitor/` by `resolve_sync_paths()` | cross-machine sync |
+| `ANALYSIS_MIRROR_FILE` | repo-relative `last_analysis.json`, **never** repointed | survives Dropbox eating the synced copy |
+
+Both are gitignored under the same filename, so neither reaches the (public) repo.
+
+**Why the mirror exists — a confirmed, still-live Dropbox fault.** On 2026-08-19 the Dropbox copy
+read back as **0 bytes** despite the run logging `Analysis saved to …`, which broke the MCP
+workflow that reads this file. Reproduced directly: a 514-byte write with `flush()` + `os.fsync()`
+verified non-empty immediately after close, then measured 0 bytes 1.5 seconds later. A probe file
+under a *new* name in the same directory survived intact for minutes, so it is not selective sync
+or dehydration — Dropbox is actively zeroing these two specific paths, which have an existing
+(evidently corrupt) sync record. `protected_commitments.json` is in the same state.
+
+This is a Dropbox-side problem, not a code bug. The mirror means the script is correct regardless,
+but **cross-machine sync for these two files is dead until the Dropbox state is repaired** (delete
+them via the Dropbox web UI and let them be recreated, or roll back via version history). Until
+then each machine effectively uses its own local mirror.
+
+`save_analysis()` now also `fsync`s each write, verifies the file reads back non-empty, logs an
+error naming any location that fails, and raises only if *no* location persisted.
+`load_last_analysis()` treats a 0-byte file as absent (with a warning) rather than as a parse error.
+
 ## Same-Day Rerun Detection
 
 `build_prompt()` compares `prior_analysis['date']` to the current run's date and injects an explicit note: if 0 days have elapsed, the analysis is told this is a same-day rerun (e.g. manual testing) and not to describe any position's price action as new movement since the prior run; if 1+ days have elapsed, it's told a new trading session has genuinely occurred.

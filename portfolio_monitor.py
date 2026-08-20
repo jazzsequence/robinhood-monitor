@@ -60,6 +60,10 @@ _rh_auth._validate_sherrif_id = _patched_validate
 TICKERS_FILE = "tickers.json"
 NEWS_FILE = "news.json"
 ANALYSIS_FILE = "last_analysis.json"
+# Never repointed by resolve_sync_paths(). save_analysis() writes here as well as to
+# the Dropbox copy, and load_last_analysis() falls back to it, because a Dropbox path
+# can read back as a 0-byte placeholder even on a run that wrote it successfully.
+ANALYSIS_MIRROR_FILE = "last_analysis.json"
 MIN_SCREENER_TICKERS = 25
 MAX_SCREENER_TICKERS = 40
 WATCHLIST_MIN_SCORE = 15  # minimum momentum score to surface a watchlist ticker as a candidate
@@ -1509,13 +1513,40 @@ def save_news_cache(date_str: str, sherwood: list[dict], ticker_news: dict[str, 
         json.dump({"date": date_str, "sherwood": sherwood, "ticker_news": ticker_news}, f, indent=2)
 
 
-def load_last_analysis() -> dict | None:
-    """Load the prior run's analysis. Returns None if not available or malformed."""
+def _read_analysis_file(path: str) -> tuple[dict, float] | None:
+    """Read one analysis file, returning (payload, mtime) or None if unusable."""
     try:
-        with open(ANALYSIS_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        if os.path.getsize(path) == 0:
+            # A Dropbox-hosted path can report 0 bytes (dehydrated placeholder or a
+            # sync that lost the contents) even though the run that wrote it logged
+            # success — treat that as absent rather than as a parse error.
+            log.warning(f"{path} is 0 bytes — ignoring this copy")
+            return None
+        with open(path) as f:
+            return json.load(f), os.path.getmtime(path)
+    except FileNotFoundError:
         return None
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning(f"Could not read {path}: {e}")
+        return None
+
+
+def load_last_analysis() -> dict | None:
+    """
+    Load the prior run's analysis, preferring whichever of the Dropbox copy and the
+    local mirror is intact and most recent. Returns None if neither is usable.
+    """
+    candidates = []
+    for path in dict.fromkeys([ANALYSIS_FILE, ANALYSIS_MIRROR_FILE]):
+        got = _read_analysis_file(path)
+        if got:
+            candidates.append((got[1], path, got[0]))
+    if not candidates:
+        log.warning("No usable prior analysis found — continuity context unavailable")
+        return None
+    mtime, path, payload = max(candidates)
+    log.info(f"Loaded prior analysis from {path} (date: {payload.get('date', 'unknown')})")
+    return payload
 
 
 def save_analysis(date: str, tldr: str, analysis: str, summary: dict | None = None):
@@ -1559,8 +1590,26 @@ def save_analysis(date: str, tldr: str, analysis: str, summary: dict | None = No
             for m in summary.get("momentum", [])
         ]
 
-    with open(ANALYSIS_FILE, "w") as f:
-        json.dump(payload, f, indent=2)
+    # Write the Dropbox copy (cross-machine sync) and the local mirror (survives
+    # Dropbox dehydrating or zeroing the synced copy). Verify each landed non-empty:
+    # the 08-17 and 08-19 runs both logged a successful save and left 0-byte files,
+    # which went unnoticed until an MCP session tried to read one.
+    blob = json.dumps(payload, indent=2)
+    wrote_any = False
+    for path in dict.fromkeys([ANALYSIS_FILE, ANALYSIS_MIRROR_FILE]):
+        try:
+            with open(path, "w") as f:
+                f.write(blob)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.getsize(path) == 0:
+                log.error(f"Wrote {len(blob)} bytes to {path} but it reads back as 0 bytes")
+                continue
+            wrote_any = True
+        except OSError as e:
+            log.error(f"Failed writing analysis to {path}: {e}")
+    if not wrote_any:
+        raise OSError("analysis could not be persisted to any location")
 
 
 # ── Claude analysis ───────────────────────────────────────────────────────────
@@ -2740,9 +2789,8 @@ def main():
     # 7. Build summary
     total_equity = sum(p["equity"] for p in positions)
     total_value = round(total_equity + cash, 2)
+    # load_last_analysis() already logs which copy it used and that copy's date.
     prior_analysis = load_last_analysis()
-    if prior_analysis:
-        log.info(f"Loaded prior analysis from {prior_analysis['date']}")
     summary = {
         "date": today,
         "hostname": hostname,
