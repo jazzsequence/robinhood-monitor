@@ -11,6 +11,10 @@
     "CCI": {
       "reason": "Crown Castle International is primarily a data center operator and builder, operating extensive data center real estate and infrastructure that falls under criterion (4).",
       "added": "2026-08-12"
+    },
+    "AXON": {
+      "reason": "Axon Enterprise manufactures and sells mass-surveillance and policing technology, including body cameras, cloud storage platforms, and weapons such as Tasers, meeting criteria (2) and (1).",
+      "added": "2026-08-21"
     }
   },
   "screened": [
@@ -22,6 +26,7 @@
     "ARM",
     "ASML",
     "AVGO",
+    "AXON",
     "CCI",
     "COST",
     "CRWD",
