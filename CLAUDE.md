@@ -71,6 +71,10 @@ Python 3.11+ required (uses `float | None` union type syntax).
 | `PROTECTED_SYMBOLS` | `{"COST"}` | Core long-term holdings — trims are heavily constrained, see below |
 | `PROTECTED_TRIM_MAX_PCT` | `0.10` | Max fraction of a protected symbol's own equity trimmable per action |
 | `SMALL_POSITION_THRESHOLD` | `10` | Equity ($) at/under which a position is a stale-cleanup candidate |
+| `WATCH_ITEM_MAX_AGE_DAYS` | `5` | Days a "one key thing to watch" item is carried forward and re-reported |
+| `WATCH_ITEM_MAX_OPEN` | `3` | Max watch items open at once |
+| `WATCH_ITEM_MAX_SYMBOLS` | `8` | Max symbols tracked per watch item |
+| `BREADTH_HISTORY_LEN` | `5` | Sessions of portfolio breadth kept for the continuity section |
 | `ETHICAL_SCREEN_CRITERIA` | (see below) | Exclusion rubric applied by the ethical screen — not a user-curated symbol list |
 
 ## Script Flow
@@ -86,9 +90,11 @@ Python 3.11+ required (uses `float | None` union type syntax).
 9. Build summary dict
 10. Fetch Sherwood news (RSS) + per-ticker Yahoo Finance news (parallel); save to `news.json`
 11. Call Claude Haiku for ticker recommendations (JSON: adds + removes with reasons, informed by news + watchlist candidates) → rewrite `tickers.json`
-12. Call Claude Sonnet for portfolio analysis
-13. Format HTML + plain text digest (includes watchlist changes with linked articles, news sections)
-14. Send via Gmail SMTP SSL (port 465)
+12. Compute session breadth, roll the breadth history forward, and load any still-open watch items — see Session-Over-Session Continuity
+13. Call Claude Sonnet for portfolio analysis
+14. Parse the analysis's `SINCE LAST SESSION` verdicts (closing resolved/escalated watch items) and its new `ONE KEY THING TO WATCH` line (snapshotting baselines for next run)
+15. Format HTML + plain text digest (includes watchlist changes with linked articles, news sections)
+16. Send via Gmail SMTP SSL (port 465)
 
 ## Cash Balance
 
@@ -154,10 +160,78 @@ The prompt states plainly that a TL;DR telling a different story than the advice
 failure rather than a difference in altitude, and that if the market mood genuinely argues against
 the recommendations then the *recommendations* are what need fixing.
 
+The TL;DR rule also carries a continuity clause — read the breadth series and the prior TL;DR,
+say which session of a condition this is rather than re-narrating it as new, and never hint at a
+shift without either acting on it or naming the checkable trigger (which then belongs in the watch
+item). See Session-Over-Session Continuity.
+
 `rsplit` also makes the parse strictly more robust than the old `split`: a stray `---` inside the
 analysis can no longer steal the boundary and swallow the recommendations. A trailing separator
 after the TL;DR is stripped before splitting, and a response with no separator at all still falls
 back to empty TL;DR + full text as analysis.
+
+## Session-Over-Session Continuity (breadth + watch items)
+
+The digest used to have no memory of its own narrative. Several consecutive runs opened with a
+near-identical TL;DR about the same chip-sector pullback, each written as if that morning had
+discovered it, and each closing with a "watch whether this is a one-day wobble or something
+broader" line that the next run never followed up on. Both halves are structurally unfixable by
+prompt wording alone: with `thinking={"type": "disabled"}` the model sees one day's snapshot plus
+the prior run's prose, and has no measured record of what the thing it flagged actually did.
+
+So this is the third place in the codebase using the **Python-tracked state, not model
+self-restraint** pattern (after `compute_trim_warnings` and protected-symbol commitments). Both
+pieces of state ride on `last_analysis.json` rather than a new file — it is already dual-written
+with a local mirror, already gitignored (real dollar figures, public repo), and already loaded
+before the prompt is built.
+
+### Market breadth
+
+`compute_breadth()` reduces the position list to advancers/decliners, median move, and how many
+are above their MA50. `build_breadth_history()` appends it to the prior run's series (replacing a
+same-date entry, so a same-day rerun doesn't stack a duplicate) and keeps the last
+`BREADTH_HISTORY_LEN` sessions; `describe_breadth_streak()` names the current run of down- or
+up-breadth sessions. The whole series is injected as `=== MARKET BREADTH ===`, and the
+`SESSION-OVER-SESSION CONTINUITY` hard constraint tells the analysis to characterize today's mood
+*relative to* those rows and the prior TL;DR — naming which session of a condition this is rather
+than re-narrating a multi-day pullback as this morning's news, and stating plainly when the
+recommendations are unchanged plus the condition that would change them.
+
+### Watch items
+
+`ONE KEY THING TO WATCH TODAY:` is now a tracked commitment rather than a closing flourish:
+
+- `extract_watch_item()` parses the line out of the analysis (pure string work, no extra API
+  call), matches the symbols it names against the run's known universe, and **snapshots each
+  one's current price/RSI/vs-MA50/volume** as a baseline.
+- `carry_forward_watch_items()` reloads still-open items — younger than
+  `WATCH_ITEM_MAX_AGE_DAYS`, not flagged today (a same-day rerun has nothing to report yet),
+  capped at `WATCH_ITEM_MAX_OPEN`.
+- `watch_item_deltas()` computes then→now for each tracked symbol, and those figures go into the
+  prompt as `=== OPEN WATCH ITEMS ===`. The `WATCH ITEM FOLLOW-THROUGH` hard constraint requires
+  the analysis to open with a `SINCE LAST SESSION` block, one line per open item, citing the
+  supplied numbers and ending in exactly one of `RESOLVED` / `STILL OPEN` / `ESCALATED` —
+  where ESCALATED requires a matching action line in TRIMS/EXITS or BUYS, and "still open" for
+  several sessions while the numbers trend consistently one way is explicitly called a failure.
+- `apply_watch_verdicts()` closes items marked RESOLVED or ESCALATED so an answered question stops
+  being re-asked. This is the one place a verdict is taken from the model's prose rather than from
+  real data — unlike a protected-symbol commitment, nothing here moves money, and a tracker
+  silting up with zombie lines would be its own kind of daily repetition. It is deliberately
+  conservative: an item closes only when a line naming one of *its own* symbols carries the
+  verdict word, and anything unmatched stays open.
+- `merge_watch_item()` folds today's item into the open list. A restatement (any symbol overlap)
+  updates the text in place but **keeps the original `flagged_date` and baseline** — that is what
+  makes a multi-session trend measurable instead of resetting to zero every morning. The prompt
+  tells the model this, and tells it to restate deliberately rather than invent a new item when
+  the old one still matters.
+- The `ONE KEY THING TO WATCH TODAY` instruction now requires the line to be *trackable*: at least
+  one specific symbol plus a condition a later run can check against price/RSI/MA data. "Watch
+  whether the pullback continues" is invalid; "watch whether MU holds its MA50 near $X" is.
+
+The digest renders both as a **Trend Tracker** section (breadth series + each open item with a
+then→now table) directly under the TL;DR, so the follow-through is visible even if the analysis
+prose is terse about it. It shows the items that were open *at the start of the run* — what the
+analysis was asked to report on; verdict closures take effect on the next run.
 
 ## Analysis Persistence (Dropbox is not trusted alone)
 
@@ -236,15 +310,16 @@ A second Claude call (Haiku model, 500 tokens) runs after the momentum scan and 
 
 ## Email Sections
 
-0. Pending Orders (table — only rendered when unfilled orders exist)
-1. Current Positions (table, colour-coded returns)
-2. Technical Indicators (table, colour-coded RSI/MA/vol)
-3. Top Momentum Movers (table)
-4. Watchlist Updates (add/remove with reasons + linked source articles)
-5. Claude Analysis (markdown-rendered)
-6. Market News — Sherwood (linked headlines)
-7. Ticker News — Yahoo Finance per holding (linked headlines)
-8. Abbreviations glossary (footer)
+0. Trend Tracker (breadth history + open watch items with then→now deltas — only when there is something to track)
+1. Pending Orders (table — only rendered when unfilled orders exist)
+2. Current Positions (table, colour-coded returns)
+3. Technical Indicators (table, colour-coded RSI/MA/vol)
+4. Top Momentum Movers (table)
+5. Watchlist Updates (add/remove with reasons + linked source articles)
+6. Claude Analysis (markdown-rendered)
+7. Market News — Sherwood (linked headlines)
+8. Ticker News — Yahoo Finance per holding (linked headlines)
+9. Abbreviations glossary (footer)
 
 ## Cron Schedule (weekdays 6am)
 
@@ -271,15 +346,21 @@ claude mcp add robinhood-trading --transport http https://agent.robinhood.com/mc
 
 **Workflow for trade decisions:**
 1. Script runs at 6am → email digest sent → `last_analysis.json` updated with full technical snapshot in `~/Dropbox/robinhood-monitor/` (see Security Notes), current regardless of which machine ran it
-2. Open a Claude Code session here and read `last_analysis.json` (in `~/Dropbox/robinhood-monitor/` — Dropbox syncs it automatically, no git pull needed) — it now includes positions with RSI, MAs, volume ratios, and top momentum movers
+2. Open a Claude Code session here and read `last_analysis.json` (in `~/Dropbox/robinhood-monitor/` — Dropbox syncs it automatically, no git pull needed) — it now includes positions with RSI, MAs, volume ratios, top momentum movers, the open `watch_items` (each with the baseline readings it was flagged against) and the `breadth_history` series
 3. Pull live quotes via `get_equity_quotes` MCP tool to check if the 6am thesis still holds. Check `portfolio.pending_orders` too — an order placed since the last session may have filled, changing what's actually owned and what cash is free
 4. Discuss the recommendation before acting — the pre-trade conversation is the human-in-the-loop filter
 5. If a trade is warranted: fund the agentic account manually in the Robinhood app, then use `review_equity_order` + `place_equity_order` MCP tools
 
-**`last_analysis.json` schema** (as of 2026-08-17):
+**`last_analysis.json` schema** (as of 2026-09-10):
 ```json
 {
   "date": "...", "tldr": "...", "analysis": "...",
+  "watch_items": [{ "flagged_date": "...", "restated_date": "...", "text": "...",
+                    "symbols": ["..."],
+                    "baseline": { "SYM": { "current_price": 0, "rsi": 0,
+                                           "price_vs_ma50_pct": 0, "volume_ratio": 0 } } }],
+  "breadth_history": [{ "date": "...", "total": 0, "up": 0, "down": 0,
+                        "median_pct": 0, "above_ma50": 0, "with_ma50": 0 }],
   "portfolio": {
     "total_value": 0.0, "cash": 0.0,
     "committed_cash": 0.0, "uncommitted_cash": 0.0,

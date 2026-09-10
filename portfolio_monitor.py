@@ -9,6 +9,7 @@ import json
 import os
 import re
 import socket
+import statistics
 import subprocess
 import sys
 import logging
@@ -73,6 +74,13 @@ PROTECTED_COMMITMENT_PENDING_DAYS = 7  # days to wait for a recommended trim to 
 PROTECTED_COMMITMENTS_FILE = "protected_commitments.json"
 SMALL_POSITION_THRESHOLD = 10  # equity ($) at/under which a position is a cleanup candidate
 ETHICAL_EXCLUSIONS_FILE = "ethical_exclusions.json"
+# Continuity tracking (see the "Continuity" section further down): how long a
+# "ONE KEY THING TO WATCH" item is carried forward and forcibly re-reported, how
+# many can be open at once, and how many sessions of breadth history are kept.
+WATCH_ITEM_MAX_AGE_DAYS = 5
+WATCH_ITEM_MAX_OPEN = 3
+WATCH_ITEM_MAX_SYMBOLS = 8  # a sector-wide watch legitimately names most of a sector
+BREADTH_HISTORY_LEN = 5
 
 # ANALYSIS_FILE and PROTECTED_COMMITMENTS_FILE carry real dollar figures from
 # the user's account, so — unlike tickers.json/ethical_exclusions.json — they
@@ -234,7 +242,43 @@ CLAUDE_SYSTEM_PROMPT = (
     "A partial trim means taking a fraction of the position off the table, not exiting — size it "
     "per POSITION-SIZE-AWARE TRIM SIZING (at most ~50% of that position's equity), not as a fixed "
     "dollar figure. Riding a winner and taking partial profits are not mutually exclusive.\n\n"
-    "Write the analysis in three blocks. Do not use --- as dividers between blocks. "
+    "WATCH ITEM FOLLOW-THROUGH — HARD CONSTRAINT: If an '=== OPEN WATCH ITEMS ===' section "
+    "appears in the data below, each numbered item is something a prior run flagged as the one "
+    "thing to watch, and the script has been tracking it ever since. Every item comes with "
+    "then→now figures computed in Python from real market data — that is the record of what "
+    "actually happened, so never say the outcome is unknown, and never substitute your own "
+    "impression for those numbers. Open the analysis with a **SINCE LAST SESSION** block "
+    "containing exactly one line per open item, in the order given. Each line must (1) name "
+    "what was being watched, (2) cite the supplied then→now numbers for at least one of its "
+    "symbols, and (3) end with exactly one verdict in caps: RESOLVED, STILL OPEN, or ESCALATED. "
+    "RESOLVED means the question has an answer — say which way it went. ESCALATED means it is "
+    "now actionable, and requires a matching action line in TRIMS/EXITS or BUYS this session; "
+    "without that action line you may not call it escalated. STILL OPEN is only honest while "
+    "the data is genuinely ambiguous: if an item has been open for multiple sessions and the "
+    "tracked numbers have moved consistently in one direction over that span, that IS the "
+    "answer — mark it RESOLVED or ESCALATED and say what the data decided. Repeating 'too early "
+    "to tell' for days about numbers that have been trending the whole time is the specific "
+    "failure this rule exists to prevent. Never silently drop an item.\n"
+    "The verdicts are load-bearing: the script stops tracking an item you mark RESOLVED or "
+    "ESCALATED, and brings a STILL OPEN one back on the next run with updated numbers. So do "
+    "not mark something resolved to stop hearing about it — if the data is genuinely still "
+    "ambiguous, STILL OPEN is the honest answer and seeing it again tomorrow with another "
+    "session of movement attached is the point.\n\n"
+    "SESSION-OVER-SESSION CONTINUITY — HARD CONSTRAINT: The '=== MARKET BREADTH ===' section "
+    "below is computed in Python from the position list over the last several sessions, and the "
+    "PRIOR RUN ANALYSIS section is what was said last time. Read both before characterizing "
+    "today's market mood, and describe the mood relative to them rather than as if today were "
+    "the first day you had looked. If today continues a condition already running for several "
+    "sessions, say so and say which session of it this is — do not re-narrate a multi-day "
+    "pullback, rotation, or rally as though it started this morning. If the mood has genuinely "
+    "changed since the prior run, name the specific thing that changed (a breadth flip, a "
+    "sector breaking down, a new catalyst) rather than gesturing at a possible change. And if "
+    "your recommendations are materially the same as the prior run's, do not dress them up as a "
+    "fresh read: state plainly that nothing has changed enough to act on, and name the "
+    "condition that would change it.\n\n"
+    "Write the analysis in blocks, in this order: SINCE LAST SESSION (only when an OPEN WATCH "
+    "ITEMS section appears below), TRIMS/EXITS, BUYS, HOLDS. "
+    "Do not use --- as dividers between blocks. "
     "Avoid trading jargon — write plainly for someone who trades casually but is not an expert.\n\n"
     "TRIMS/EXITS: Only list positions actually being trimmed or exited — one bold action line "
     "per trim (e.g. **TRIM ARM — Sell $50**) followed by one sentence of reasoning. For a "
@@ -260,7 +304,15 @@ CLAUDE_SYSTEM_PROMPT = (
     "Do not group positions into categories.\n\n"
     "End the analysis with **ONE KEY THING TO WATCH TODAY:** followed by one sentence "
     "describing something not yet actionable. If it is actionable, put it in TRIMS or "
-    "BUYS instead.\n\n"
+    "BUYS instead. It MUST be trackable, because the script parses this line, records the "
+    "current readings for the symbols in it, and hands you the then→now movement on every "
+    "later run until it is resolved. So it must name at least one specific symbol from the "
+    "data above and a condition a later run can actually check against price, RSI, or moving "
+    "average data — 'watch whether the pullback continues' is untrackable and invalid; 'watch "
+    "whether MU holds its MA50 near $X, which would keep the dip-buy case alive' is valid. If "
+    "an item in OPEN WATCH ITEMS is still genuinely the most important thing to watch, restate "
+    "that same item deliberately rather than inventing a new one — restating keeps the original "
+    "baseline, so the trend keeps being measured from where it was first flagged.\n\n"
     "INTERNAL CONSISTENCY RULE: If you identify a compelling new entry opportunity but have no cash "
     "and recommend no trims, your output is self-contradicting unless you explicitly resolve it one "
     "of three ways: (1) the opportunity IS compelling — identify a trim to fund it and recommend "
@@ -279,8 +331,12 @@ CLAUDE_SYSTEM_PROMPT = (
     "the news flow are doing today at the macro and sector level: risk-on or risk-off, which "
     "sectors are leading or breaking down, how broad the move is, what the headlines are "
     "fixated on, and whether this looks like a one-day wobble or the start of something "
-    "sustained. Read this from the market news and from the breadth of moves across the whole "
-    "position list, not from any single ticker. SECOND, connect that mood to the decisions you "
+    "sustained. Read this from the market news, from the MARKET BREADTH series, and from the "
+    "breadth of moves across the whole position list — not from any single ticker. Place it "
+    "against the prior run's tl;dr: if this is a continuation, say so and say which session of "
+    "it this is; if it has changed, name what changed. Do not describe a condition that has "
+    "been running for days as if it were today's news, and do not recycle the prior tl;dr's "
+    "phrasing to make an unchanged read sound new. SECOND, connect that mood to the decisions you "
     "actually recommended: the mood is the 'why now' behind the advice, so state the link "
     "explicitly — a sector-wide selloff with intact theses is why almost everything is a hold; "
     "one genuine catalyst breaking today is why the single buy goes where it goes; a risk-off "
@@ -291,7 +347,12 @@ CLAUDE_SYSTEM_PROMPT = (
     "way from what you recommended — a tl;dr telling a different story than the advice beneath "
     "it is a failure, not a difference in altitude. If the market mood genuinely argues against "
     "your recommendations, the analysis is what is wrong: go back and fix the recommendations "
-    "rather than papering over the gap here. Do not simply restate the action lines. Write it "
+    "rather than papering over the gap here. This includes hinting at a shift you did not act "
+    "on: if you say the picture may be changing while recommending exactly what you recommended "
+    "last session, you must name the specific, checkable trigger that would turn it into an "
+    "action — and that trigger belongs in ONE KEY THING TO WATCH TODAY so the next run measures "
+    "it. A vague 'this could change the calculus' with nothing tracking it is a failure. "
+    "Do not simply restate the action lines. Write it "
     "plainly and humanistically, as the one paragraph someone would read if they read nothing "
     "else."
 )
@@ -1554,6 +1615,12 @@ def save_analysis(date: str, tldr: str, analysis: str, summary: dict | None = No
     payload: dict = {"date": date, "tldr": tldr, "analysis": analysis}
 
     if summary:
+        # Continuity state for the next run: the watch items still being tracked
+        # (today's, merged onto any still-open earlier ones) and the rolling
+        # breadth series. Both are read back by build_prompt via
+        # load_last_analysis() — see the Continuity section above.
+        payload["watch_items"] = summary.get("watch_items_next", summary.get("watch_items") or [])
+        payload["breadth_history"] = summary.get("breadth_history") or []
         payload["portfolio"] = {
             "total_value": summary.get("total_value"),
             "cash": summary.get("cash"),
@@ -1612,6 +1679,332 @@ def save_analysis(date: str, tldr: str, analysis: str, summary: dict | None = No
         raise OSError("analysis could not be persisted to any location")
 
 
+# ── Continuity: market breadth + watch-item tracking ─────────────────────────
+# Two more pieces of Python-tracked state, same pattern as trim warnings and
+# protected-symbol commitments: the model does not get to decide whether a
+# multi-day trend is still worth mentioning, and it cannot flag something as
+# "the one thing to watch" and then quietly never look at it again.
+#
+# The symptom that motivated this: several consecutive digests opened with a
+# near-identical tl;dr about the same chip-sector pullback, each written as if
+# it were that morning's discovery, and each ending with a "watch whether this
+# is a one-day wobble or something broader" line that the next run never
+# followed up on. Both halves are unfixable by prompt wording alone — with
+# thinking disabled the model sees one day's snapshot plus the prior run's prose
+# and has no measured record of what the thing it flagged actually did.
+#
+# Both ride on last_analysis.json rather than a new file: it is already
+# dual-written with a local mirror, already gitignored (real dollar figures,
+# public repo), and already loaded before the prompt is built.
+def compute_breadth(positions: list[dict], today: str) -> dict:
+    """Session-level breadth of the position list — advancers/decliners, median
+    move, and how many are above their MA50. Cheap, and it is the only factual
+    basis for calling today's mood a continuation or a change."""
+    moves = [
+        (p.get("indicators") or {}).get("pct_change_today") for p in positions
+    ]
+    moves = [m for m in moves if m is not None]
+    vs_ma50 = [
+        (p.get("indicators") or {}).get("price_vs_ma50_pct") for p in positions
+    ]
+    vs_ma50 = [v for v in vs_ma50 if v is not None]
+    return {
+        "date": today,
+        "total": len(moves),
+        "up": sum(1 for m in moves if m > 0),
+        "down": sum(1 for m in moves if m < 0),
+        "median_pct": round(float(statistics.median(moves)), 2) if moves else None,
+        "above_ma50": sum(1 for v in vs_ma50 if v > 0),
+        "with_ma50": len(vs_ma50),
+    }
+
+
+def build_breadth_history(prior_analysis: dict | None, breadth: dict) -> list[dict]:
+    """Prior sessions' breadth plus today's, oldest first, capped at
+    BREADTH_HISTORY_LEN. A same-day rerun replaces its own earlier entry rather
+    than stacking a second one for the same date."""
+    history = list((prior_analysis or {}).get("breadth_history") or [])
+    history = [h for h in history if h.get("date") != breadth["date"]]
+    history.append(breadth)
+    return history[-BREADTH_HISTORY_LEN:]
+
+
+def describe_breadth_streak(history: list[dict]) -> str:
+    """One line naming the current run of down- or up-breadth sessions, so a
+    multi-session condition is stated as a fact rather than left to be inferred
+    from the rows."""
+    if len(history) < 2:
+        return ""
+    def direction(h: dict) -> str:
+        if h.get("up") is None or h.get("down") is None:
+            return "flat"
+        if h["up"] > h["down"]:
+            return "up"
+        if h["down"] > h["up"]:
+            return "down"
+        return "flat"
+    latest = direction(history[-1])
+    if latest == "flat":
+        return ""
+    streak = 0
+    for h in reversed(history):
+        if direction(h) != latest:
+            break
+        streak += 1
+    if streak < 2:
+        return ""
+    word = "decliners than advancers" if latest == "down" else "advancers than decliners"
+    return (
+        f"Streak: {streak} consecutive sessions with more {word} "
+        f"(this is session {streak} of the current condition, not a new development)."
+    )
+
+
+_WATCH_MARKER_RE = re.compile(
+    r"ONE\s+KEY\s+THING\s+TO\s+WATCH(?:\s+TODAY)?\s*\**\s*:?\**\s*", re.IGNORECASE
+)
+_WATCH_READING_KEYS = ("current_price", "rsi", "price_vs_ma50_pct", "volume_ratio")
+
+
+def _watch_reading(data: dict | None) -> dict:
+    return {k: (data or {}).get(k) for k in _WATCH_READING_KEYS}
+
+
+def extract_watch_item(
+    analysis_text: str, universe: set[str], today: str, market_data: dict[str, dict]
+) -> dict | None:
+    """
+    Pull today's "ONE KEY THING TO WATCH TODAY" line out of the analysis and
+    snapshot the current readings for every symbol it names, so later runs can
+    report what those symbols actually did rather than re-reading the sentence.
+    Pure string work — no extra API call. Returns None if the marker is absent.
+    """
+    m = _WATCH_MARKER_RE.search(analysis_text or "")
+    if not m:
+        return None
+    tail = analysis_text[m.end():].strip()
+    # The marker is the last thing in the analysis, but stop at a blank line or a
+    # separator anyway in case anything follows it.
+    text = re.split(r"\n\s*\n|\n-{3,}", tail)[0].strip()
+    text = re.sub(r"\*\*|__", "", text).strip()
+    if not text:
+        return None
+    seen: list[str] = []
+    for token in re.findall(r"\b[A-Z][A-Z0-9.\-]{0,5}\b", text):
+        if token in universe and token not in seen:
+            seen.append(token)
+    symbols = seen[:WATCH_ITEM_MAX_SYMBOLS]
+    return {
+        "flagged_date": today,
+        "restated_date": today,
+        "text": text,
+        "symbols": symbols,
+        "baseline": {s: _watch_reading(market_data.get(s)) for s in symbols},
+    }
+
+
+def carry_forward_watch_items(prior_analysis: dict | None, today: str) -> list[dict]:
+    """
+    Prior runs' watch items that are still open: younger than
+    WATCH_ITEM_MAX_AGE_DAYS and not flagged today. An item flagged today has
+    nothing to report yet (this happens on a same-day rerun), and an item that
+    ages out is dropped rather than nagged about forever — if it still matters,
+    the model is told to restate it, which starts a fresh baseline.
+    """
+    items = []
+    for item in (prior_analysis or {}).get("watch_items") or []:
+        flagged = item.get("flagged_date")
+        if not flagged or not item.get("text"):
+            continue
+        try:
+            age = _days_between(flagged, today)
+        except ValueError:
+            continue
+        if age <= 0 or age > WATCH_ITEM_MAX_AGE_DAYS:
+            continue
+        items.append(item)
+    items.sort(key=lambda i: i["flagged_date"], reverse=True)
+    return items[:WATCH_ITEM_MAX_OPEN]
+
+
+_VERDICT_RE = re.compile(r"\b(RESOLVED|ESCALATED)\b")
+
+
+def apply_watch_verdicts(
+    analysis_text: str, open_items: list[dict]
+) -> tuple[list[dict], list[tuple[dict, str]]]:
+    """
+    Close out any watch item today's SINCE LAST SESSION block marked RESOLVED or
+    ESCALATED, so a question that has been answered stops being re-asked (and
+    the tracker doesn't silt up with zombie lines, which would be its own kind of
+    daily repetition). Returns (still_open, [(item, verdict), ...]).
+
+    Deliberately conservative: an item is only closed when a line naming one of
+    its own symbols carries the verdict word. Anything unmatched or ambiguous
+    stays open and comes back tomorrow with updated numbers — the failure mode
+    to avoid here is dropping a trend nobody looked at, not carrying one an
+    extra session.
+    """
+    if not open_items:
+        return [], []
+    m = re.search(r"SINCE\s+LAST\s+SESSION", analysis_text or "", re.IGNORECASE)
+    if not m:
+        return open_items, []
+    block = analysis_text[m.end():]
+    # The block ends at the next analysis header.
+    end = re.search(r"\n[\s#*]*(TRIMS|EXITS|BUYS|HOLDS)\b", block, re.IGNORECASE)
+    if end:
+        block = block[: end.start()]
+
+    kept, closed = [], []
+    for item in open_items:
+        symbols = item.get("symbols") or []
+        verdict = None
+        for line in block.splitlines():
+            if not line.strip():
+                continue
+            if symbols and not any(
+                re.search(rf"\b{re.escape(s)}\b", line) for s in symbols
+            ):
+                continue
+            found = _VERDICT_RE.search(line)
+            if found:
+                verdict = found.group(1)
+                break
+        if verdict:
+            closed.append((item, verdict))
+        else:
+            kept.append(item)
+    return kept, closed
+
+
+def merge_watch_item(open_items: list[dict], new_item: dict | None) -> list[dict]:
+    """
+    Fold today's watch item into the open list for persistence. A restatement of
+    an existing item (any symbol overlap) updates that item's text in place and
+    KEEPS its original flagged_date and baseline — that is what makes a trend
+    measurable across sessions instead of resetting to zero every morning.
+    """
+    items = [dict(i) for i in open_items]
+    if not new_item:
+        return items[:WATCH_ITEM_MAX_OPEN]
+    new_syms = set(new_item.get("symbols") or [])
+    for item in items:
+        if new_syms and new_syms & set(item.get("symbols") or []):
+            item["text"] = new_item["text"]
+            item["restated_date"] = new_item["restated_date"]
+            # Union the symbol sets so a widened watch keeps tracking the
+            # originals, and baseline any symbol that has no reading yet.
+            for sym in new_item["symbols"]:
+                if sym in (item.get("symbols") or []):
+                    continue
+                if len(item.get("symbols") or []) >= WATCH_ITEM_MAX_SYMBOLS:
+                    break
+                item.setdefault("symbols", []).append(sym)
+                item.setdefault("baseline", {})[sym] = new_item["baseline"][sym]
+            return items[:WATCH_ITEM_MAX_OPEN]
+    return ([new_item] + items)[:WATCH_ITEM_MAX_OPEN]
+
+
+def watch_item_deltas(item: dict, market_data: dict[str, dict]) -> list[dict]:
+    """Per-symbol then→now readings for one watch item. Shared by the prompt and
+    the email so both quote the same numbers."""
+    rows = []
+    for sym in item.get("symbols") or []:
+        then = (item.get("baseline") or {}).get(sym) or {}
+        now = _watch_reading(market_data.get(sym))
+        p0, p1 = then.get("current_price"), now.get("current_price")
+        rows.append({
+            "symbol": sym,
+            "then": then,
+            "now": now,
+            "price_change_pct": (
+                round((p1 - p0) / p0 * 100, 2) if p0 and p1 else None
+            ),
+            "has_data": p1 is not None,
+        })
+    return rows
+
+
+def watch_items_prompt_lines(
+    items: list[dict], today: str, market_data: dict[str, dict]
+) -> list[str]:
+    if not items:
+        return []
+    lines = [
+        "",
+        "=== OPEN WATCH ITEMS (flagged in prior runs — you MUST report on each) ===",
+        "Each item is what a prior run named as the one thing to watch. The then→now "
+        "figures are computed in Python from the same market data feeding this prompt, "
+        "so they are the record of what actually happened since it was flagged — not a "
+        "recollection. Resolve every item explicitly in the SINCE LAST SESSION block "
+        "(see WATCH ITEM FOLLOW-THROUGH).",
+    ]
+    for n, item in enumerate(items, 1):
+        age = _days_between(item["flagged_date"], today)
+        day_word = "day" if age == 1 else "days"
+        restated = item.get("restated_date")
+        restated_note = (
+            f", restated {restated}"
+            if restated and restated != item["flagged_date"] else ""
+        )
+        lines.append(
+            f"\n  [{n}] flagged {item['flagged_date']} ({age} {day_word} ago{restated_note}): "
+            f"{item['text']}"
+        )
+        rows = watch_item_deltas(item, market_data)
+        if not rows:
+            lines.append(
+                "      No symbol was named in this item, so there is nothing tracked for "
+                "it — answer it from the market news and MARKET BREADTH data, or say "
+                "plainly that it cannot be answered and replace it."
+            )
+            continue
+        for row in rows:
+            if not row["has_data"]:
+                lines.append(f"      {row['symbol']:<8} no market data today")
+                continue
+            then, now = row["then"], row["now"]
+            lines.append(
+                f"      {row['symbol']:<8} "
+                f"price ${_fmt(then.get('current_price'), '.2f')} → "
+                f"${_fmt(now.get('current_price'), '.2f')} "
+                f"({_fmt(row['price_change_pct'], '+.1f')}%) | "
+                f"RSI {_fmt(then.get('rsi'), '.1f')} → {_fmt(now.get('rsi'), '.1f')} | "
+                f"vs MA50 {_fmt(then.get('price_vs_ma50_pct'), '+.1f')}% → "
+                f"{_fmt(now.get('price_vs_ma50_pct'), '+.1f')}%"
+            )
+    return lines
+
+
+def breadth_prompt_lines(history: list[dict]) -> list[str]:
+    if not history:
+        return []
+    lines = [
+        "",
+        "=== MARKET BREADTH — THIS PORTFOLIO, SESSION OVER SESSION ===",
+        "Computed in Python from the position list, one row per run. Use this — not a "
+        "fresh impression of today's headlines — to decide whether today's mood is a "
+        "continuation of the last few sessions or a genuine change (see "
+        "SESSION-OVER-SESSION CONTINUITY).",
+    ]
+    for n, h in enumerate(history):
+        marker = "  ← today" if n == len(history) - 1 else ""
+        ma50 = (
+            f"above MA50 {h['above_ma50']}/{h['with_ma50']}"
+            if h.get("with_ma50") else "above MA50 n/a"
+        )
+        lines.append(
+            f"  {h.get('date', '?'):<12} up {h.get('up', 0)} / down {h.get('down', 0)} "
+            f"of {h.get('total', 0)}   median {_fmt(h.get('median_pct'), '+.2f')}%   "
+            f"{ma50}{marker}"
+        )
+    streak = describe_breadth_streak(history)
+    if streak:
+        lines.append(f"  {streak}")
+    return lines
+
+
 # ── Claude analysis ───────────────────────────────────────────────────────────
 def build_prompt(summary: dict) -> str:
     day_name, time_str, session, is_stale = get_market_session()
@@ -1654,6 +2047,8 @@ def build_prompt(summary: dict) -> str:
         for item in sherwood:
             lines.append(f"• {item['title'] if isinstance(item, dict) else item}")
 
+    lines += breadth_prompt_lines(summary.get("breadth_history") or [])
+
     prior = summary.get("prior_analysis")
     if prior:
         elapsed_note = ""
@@ -1695,6 +2090,12 @@ def build_prompt(summary: dict) -> str:
             f"TL;DR: {prior['tldr']}" if prior.get("tldr") else "",
             prior.get("analysis", ""),
         ]
+
+    lines += watch_items_prompt_lines(
+        summary.get("watch_items") or [],
+        summary["date"],
+        summary.get("market_data") or {},
+    )
 
     lines += [
         "",
@@ -2003,6 +2404,49 @@ def format_digest(summary: dict, analysis: str) -> str:
             tldr,
             "",
         ]
+
+    watch_items = summary.get("watch_items") or []
+    breadth_history = summary.get("breadth_history") or []
+    market_data = summary.get("market_data") or {}
+    if watch_items or len(breadth_history) > 1:
+        lines += ["", "TREND TRACKER", sep]
+        if breadth_history:
+            b = breadth_history[-1]
+            ma50 = (
+                f"above MA50 {b['above_ma50']}/{b['with_ma50']}"
+                if b.get("with_ma50") else "above MA50 n/a"
+            )
+            lines.append(
+                f"Breadth today: up {b.get('up', 0)} / down {b.get('down', 0)} of "
+                f"{b.get('total', 0)} | median {_fmt(b.get('median_pct'), '+.2f')}% | {ma50}"
+            )
+            for h in breadth_history[:-1]:
+                lines.append(
+                    f"  {h.get('date', '?')}: up {h.get('up', 0)} / down {h.get('down', 0)} "
+                    f"of {h.get('total', 0)}, median {_fmt(h.get('median_pct'), '+.2f')}%"
+                )
+            streak = describe_breadth_streak(breadth_history)
+            if streak:
+                lines.append(streak)
+        for item in watch_items:
+            age = _days_between(item["flagged_date"], summary["date"])
+            day_word = "day" if age == 1 else "days"
+            lines += ["", f"Watching since {item['flagged_date']} ({age} {day_word} ago):",
+                      f"  {item['text']}"]
+            for row in watch_item_deltas(item, market_data):
+                if not row["has_data"]:
+                    lines.append(f"  {row['symbol']:<8} no market data today")
+                    continue
+                then, now = row["then"], row["now"]
+                lines.append(
+                    f"  {row['symbol']:<8} "
+                    f"${_fmt(then.get('current_price'), '.2f')} → "
+                    f"${_fmt(now.get('current_price'), '.2f')} "
+                    f"({_fmt(row['price_change_pct'], '+.1f')}%) | "
+                    f"RSI {_fmt(then.get('rsi'), '.1f')} → {_fmt(now.get('rsi'), '.1f')} | "
+                    f"vs MA50 {_fmt(then.get('price_vs_ma50_pct'), '+.1f')}% → "
+                    f"{_fmt(now.get('price_vs_ma50_pct'), '+.1f')}%"
+                )
 
     lines += [
         "",
@@ -2460,9 +2904,109 @@ def format_digest_html(summary: dict, analysis: str) -> str:
     else:
         tldr_block = ""
 
+    # ── Trend tracker ────────────────────────────────────────────────────────
+    # What prior runs said they would watch, and what those symbols actually did
+    # since — so the follow-through is visible in the digest even if the analysis
+    # text is terse about it.
+    watch_items = summary.get("watch_items") or []
+    breadth_history = summary.get("breadth_history") or []
+    watch_market_data = summary.get("market_data") or {}
+    trend_content = ""
+    if breadth_history:
+        b = breadth_history[-1]
+        ma50 = (
+            f"{b['above_ma50']}/{b['with_ma50']} above MA50"
+            if b.get("with_ma50") else "MA50 n/a"
+        )
+        prior_rows = " &nbsp;·&nbsp; ".join(
+            f"{_h(h.get('date', '?'))}: {h.get('up', 0)}↑/{h.get('down', 0)}↓ "
+            f"({_fmt(h.get('median_pct'), '+.2f')}%)"
+            for h in breadth_history[:-1]
+        )
+        streak = describe_breadth_streak(breadth_history)
+        trend_content += (
+            '<p style="margin:0 0 4px;font-size:13px;color:#0f172a;">'
+            f'<strong>Breadth today:</strong> {b.get("up", 0)} up / {b.get("down", 0)} down '
+            f'of {b.get("total", 0)} &nbsp;·&nbsp; median '
+            f'{_fmt(b.get("median_pct"), "+.2f")}% &nbsp;·&nbsp; {_h(ma50)}</p>'
+        )
+        if prior_rows:
+            trend_content += (
+                f'<p style="margin:0 0 4px;font-size:11px;color:#6b7280;'
+                f'font-family:monospace;">{prior_rows}</p>'
+            )
+        if streak:
+            trend_content += (
+                f'<p style="margin:0 0 4px;font-size:12px;color:#b45309;">{_h(streak)}</p>'
+            )
+    for item in watch_items:
+        age = _days_between(item["flagged_date"], summary["date"])
+        day_word = "day" if age == 1 else "days"
+        trend_content += (
+            '<div style="margin:14px 0 0;padding:12px 14px;background:#f8fafc;'
+            'border-left:3px solid #f59e0b;border-radius:0 4px 4px 0;">'
+            f'<p style="margin:0 0 2px;font-size:10px;font-weight:700;color:#b45309;'
+            f'text-transform:uppercase;letter-spacing:0.08em;">Watching since '
+            f'{_h(item["flagged_date"])} — {age} {day_word} ago</p>'
+            f'<p style="margin:0 0 8px;font-size:13px;color:#334155;line-height:1.5;">'
+            f'{_h(item["text"])}</p>'
+        )
+        rows = watch_item_deltas(item, watch_market_data)
+        if not rows:
+            trend_content += (
+                '<p style="margin:0;font-size:12px;color:#6b7280;">'
+                "No symbol named — nothing tracked for this item.</p>"
+            )
+        else:
+            watch_header = "".join([
+                _th("Symbol", align="left"),
+                _th("Price then &rarr; now"),
+                _th("Change"),
+                _th("RSI then &rarr; now"),
+                _th("vs MA50 then &rarr; now"),
+            ])
+            watch_rows = ""
+            for row in rows:
+                then, now = row["then"], row["now"]
+                if not row["has_data"]:
+                    watch_rows += (
+                        "<tr>"
+                        + _td(_h(row["symbol"]), align="left", bold=True, color="#0f172a")
+                        + '<td colspan="4" style="padding:8px 12px;font-size:12px;'
+                          'color:#6b7280;border-bottom:1px solid #f1f5f9;">'
+                          "no market data today</td>"
+                        + "</tr>"
+                    )
+                    continue
+                chg = row["price_change_pct"]
+                watch_rows += (
+                    "<tr>"
+                    + _td(_h(row["symbol"]), align="left", bold=True, color="#0f172a")
+                    + _td(
+                        f"${_fmt(then.get('current_price'), '.2f')} &rarr; "
+                        f"${_fmt(now.get('current_price'), '.2f')}",
+                        mono=True,
+                    )
+                    + _td(f"{_fmt(chg, '+.1f')}%", color=_color_pct(chg), bold=True, mono=True)
+                    + _td(
+                        f"{_fmt(then.get('rsi'), '.1f')} &rarr; {_fmt(now.get('rsi'), '.1f')}",
+                        color=_color_rsi(now.get("rsi")), mono=True,
+                    )
+                    + _td(
+                        f"{_fmt(then.get('price_vs_ma50_pct'), '+.1f')}% &rarr; "
+                        f"{_fmt(now.get('price_vs_ma50_pct'), '+.1f')}%",
+                        color=_color_pct(now.get("price_vs_ma50_pct")), mono=True,
+                    )
+                    + "</tr>"
+                )
+            trend_content += _table(watch_header, watch_rows)
+        trend_content += "</div>"
+
     # ── Assemble ─────────────────────────────────────────────────────────────
     body_content = (
         tldr_block
+        + (_section("Trend Tracker", trend_content)
+           if (watch_items or len(breadth_history) > 1) else "")
         + (_section("Pending Orders", pending_content) if pending_orders else "")
         + _section("Current Positions", _table(pos_header, pos_rows))
         + _section("Technical Indicators", _table(ind_header, ind_rows))
@@ -2674,10 +3218,15 @@ def main():
     committed_symbols = portfolio_symbols | pending_buy_symbols
 
     # 4. Bulk fetch market data for portfolio + screener in two calls
+    # Every symbol's readings are also accumulated into one dict so watch-item
+    # tracking can look up today's numbers for whatever a prior run flagged,
+    # whether or not it is currently held.
+    market_data_by_symbol: dict[str, dict] = {}
     try:
         portfolio_data = fetch_bulk_market_data(sorted(portfolio_symbols))
         for pos in positions:
             pos["indicators"] = portfolio_data.get(pos["symbol"], {})
+        market_data_by_symbol.update(portfolio_data)
     except Exception as e:
         log.error(f"Portfolio market data failed: {e}")
         send_error_email("fetching portfolio market data", e)
@@ -2690,6 +3239,7 @@ def main():
     except Exception as e:
         log.error(f"Screener market data failed: {e}")
         screener_data = {}
+    market_data_by_symbol.update(screener_data)
 
     # Auto-remove screener tickers that returned no data (likely delisted/halted).
     # Bypass Claude for these — there's nothing to analyse. The MIN_SCREENER_TICKERS
@@ -2733,6 +3283,7 @@ def main():
                 f"({len(watchlist_syms['user'])} user, {len(watchlist_syms['robinhood'])} RH)"
             )
             watchlist_market_data = fetch_bulk_market_data(all_watchlist_syms)
+            market_data_by_symbol.update(watchlist_market_data)
             for priority, syms in [("user", watchlist_syms["user"]), ("robinhood", watchlist_syms["robinhood"])]:
                 for sym in syms:
                     data = watchlist_market_data.get(sym)
@@ -2791,6 +3342,29 @@ def main():
     total_value = round(total_equity + cash, 2)
     # load_last_analysis() already logs which copy it used and that copy's date.
     prior_analysis = load_last_analysis()
+
+    # Continuity state — measured, not remembered. Breadth gives the prompt a
+    # multi-session record of the tape so a days-old condition isn't re-narrated
+    # as today's discovery; the watch items are what prior runs said they would
+    # watch, which the prompt now forces to be reported on with real then→now
+    # numbers instead of quietly dropped.
+    breadth = compute_breadth(positions, today)
+    breadth_history = build_breadth_history(prior_analysis, breadth)
+    open_watch_items = carry_forward_watch_items(prior_analysis, today)
+    log.info(
+        f"Breadth: up {breadth['up']} / down {breadth['down']} of {breadth['total']}, "
+        f"median {_fmt(breadth['median_pct'], '+.2f')}% "
+        f"({len(breadth_history)} sessions tracked)"
+    )
+    if open_watch_items:
+        log.info(
+            "Open watch items: "
+            + "; ".join(
+                f"{i['flagged_date']} {i.get('symbols') or ['(no symbol)']}"
+                for i in open_watch_items
+            )
+        )
+
     summary = {
         "date": today,
         "hostname": hostname,
@@ -2805,6 +3379,10 @@ def main():
         "pending_orders": pending_orders,
         "prior_analysis": prior_analysis,
         "ethical_held": ethical_held,
+        "market_data": market_data_by_symbol,
+        "breadth": breadth,
+        "breadth_history": breadth_history,
+        "watch_items": open_watch_items,
     }
 
     # 7b. Resolve protected-symbol reinvestment commitments against real order history
@@ -2876,6 +3454,37 @@ def main():
         tldr, analysis = get_claude_analysis(summary)
         summary["tldr"] = tldr
         analysis_ok = True
+
+        # Snapshot today's "ONE KEY THING TO WATCH" before saving, so tomorrow's
+        # run gets both the sentence and the readings it was flagged against. A
+        # restatement of an already-open item keeps that item's original
+        # baseline (see merge_watch_item) — that is what makes a multi-session
+        # trend measurable instead of resetting to zero every morning.
+        try:
+            still_open, closed = apply_watch_verdicts(analysis, open_watch_items)
+            for item, verdict in closed:
+                log.info(
+                    f"Watch item from {item['flagged_date']} closed as {verdict}: "
+                    f"{item.get('symbols') or '(no symbol)'}"
+                )
+            new_watch = extract_watch_item(
+                analysis,
+                set(market_data_by_symbol) | committed_symbols,
+                today,
+                market_data_by_symbol,
+            )
+            summary["watch_items_next"] = merge_watch_item(still_open, new_watch)
+            if new_watch:
+                log.info(
+                    f"Watch item recorded: {new_watch['symbols'] or '(no symbol named)'} "
+                    f"— {new_watch['text'][:120]}"
+                )
+            else:
+                log.warning("No ONE KEY THING TO WATCH line found in analysis — nothing new to track")
+        except Exception as watch_err:
+            log.warning(f"Watch item extraction failed: {watch_err}")
+            summary["watch_items_next"] = open_watch_items
+
         try:
             save_analysis(today, tldr, analysis, summary)
             log.info(f"Analysis saved to {ANALYSIS_FILE}")
