@@ -237,11 +237,29 @@ CLAUDE_SYSTEM_PROMPT = (
     "at a loss, citing 'SMALL POSITION CLEANUP' instead of a broken-thesis reason, because the "
     "action is portfolio hygiene, not funding a new buy.\n\n"
     "TRIM SIGNALS — consider a partial trim (even without a broken thesis) when a position is "
-    "30%+ above its MA50, a single position exceeds 35% of portfolio, or a high-momentum "
-    "opportunity exists that the portfolio doesn't yet capture. "
+    "20%+ above its MA50 — the same threshold the momentum scanner itself stops treating as "
+    "healthy and starts treating as stretched (see momentum_score) — a single position exceeds "
+    "35% of portfolio, or a high-momentum opportunity exists that the portfolio doesn't yet "
+    "capture. "
     "A partial trim means taking a fraction of the position off the table, not exiting — size it "
     "per POSITION-SIZE-AWARE TRIM SIZING (at most ~50% of that position's equity), not as a fixed "
     "dollar figure. Riding a winner and taking partial profits are not mutually exclusive.\n\n"
+    "OPPORTUNITY COST CHECK — HARD CONSTRAINT: Before writing TRIMS/EXITS, explicitly answer "
+    "one question: is there a better use of capital right now than what is already held? Name "
+    "the single strongest candidate not already owned or pending — the top-scoring symbol from "
+    "the momentum scan or watchlist candidates below, whichever scores higher — with its score "
+    "and RSI. Then name the single strongest funding candidate among ELIGIBLE FUNDING SOURCES: "
+    "the position with the largest total_return_pct or the largest price_vs_ma50_pct extension. "
+    "State plainly whether the candidate clears the bar to justify trimming that funding source. "
+    "'Yes' must lead directly into a TRIMS/EXITS + BUYS pair naming both. 'No' requires a "
+    "specific, falsifiable reason — score too weak, momentum cooling versus the prior run, no "
+    "supportive catalyst, sector already represented in the portfolio — not 'nothing is broken,' "
+    "since this check is about opportunity, not damage control; TRIM SIGNALS, COST BASIS "
+    "DISCIPLINE, and the other trim rules already govern whether a specific trim is allowed, so "
+    "this check answers a different question and must not be skipped just because a candidate is "
+    "not compelling. If no momentum or watchlist candidate scores above roughly 15, say so "
+    "explicitly and treat that as this session's actual reason to ride it out — a weak field is "
+    "an answer, not a skipped check.\n\n"
     "WATCH ITEM FOLLOW-THROUGH — HARD CONSTRAINT: If an '=== OPEN WATCH ITEMS ===' section "
     "appears in the data below, each numbered item is something a prior run flagged as the one "
     "thing to watch, and the script has been tracking it ever since. Every item comes with "
@@ -277,7 +295,7 @@ CLAUDE_SYSTEM_PROMPT = (
     "fresh read: state plainly that nothing has changed enough to act on, and name the "
     "condition that would change it.\n\n"
     "Write the analysis in blocks, in this order: SINCE LAST SESSION (only when an OPEN WATCH "
-    "ITEMS section appears below), TRIMS/EXITS, BUYS, HOLDS. "
+    "ITEMS section appears below), OPPORTUNITY COST CHECK, TRIMS/EXITS, BUYS, HOLDS. "
     "Do not use --- as dividers between blocks. "
     "Avoid trading jargon — write plainly for someone who trades casually but is not an expert.\n\n"
     "TRIMS/EXITS: Only list positions actually being trimmed or exited — one bold action line "
@@ -1852,7 +1870,7 @@ def apply_watch_verdicts(
         return open_items, []
     block = analysis_text[m.end():]
     # The block ends at the next analysis header.
-    end = re.search(r"\n[\s#*]*(TRIMS|EXITS|BUYS|HOLDS)\b", block, re.IGNORECASE)
+    end = re.search(r"\n[\s#*]*(OPPORTUNITY COST|TRIMS|EXITS|BUYS|HOLDS)\b", block, re.IGNORECASE)
     if end:
         block = block[: end.start()]
 

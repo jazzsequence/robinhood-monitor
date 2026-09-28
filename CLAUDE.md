@@ -274,6 +274,34 @@ Scores 0–100 across four signals:
 - Today's % price move: up to 20 pts
 - Price above MA50 but <20% extended: 10 pts
 
+`TRIM SIGNALS` in `CLAUDE_SYSTEM_PROMPT` uses this same 20% figure as its overextension trim
+trigger (see Opportunity Cost Check below) — it used to say 30%, which was inconsistent with
+the scanner's own definition of "stretched" and, empirically, was never reached: on a live
+snapshot of this portfolio the most-extended holding sat at 18.2% above its MA50. A threshold
+the account's own biggest winners can't reach isn't a signal, it's dead code.
+
+## Opportunity Cost Check
+
+Every other trim rule in `CLAUDE_SYSTEM_PROMPT` (`REACTIVE SELLING RULE`, `COST BASIS
+DISCIPLINE`, `REPEATED SELL PATTERN`, `PROTECTED SYMBOL RULE`) is a brake — each one exists to
+stop a specific bad sell, and none of them exist to build a case *for* acting. That meant "no
+rule was triggered" defaulted to HOLDS by construction, regardless of whether the week was good
+or bad: a bad week has no broken thesis, a good week has no overextension either (see above), so
+both land on the same output. The model was never actually asked to arbitrate "is there something
+better to do with this capital right now" — only "did anything go wrong."
+
+`OPPORTUNITY COST CHECK` is a mandatory block (ordered after `SINCE LAST SESSION`, before
+`TRIMS/EXITS` — see `apply_watch_verdicts()`'s block-boundary regex, which had to learn this
+header too, or it would swallow the block into the watch-item parse) that forces an explicit
+comparison every run: name the single best-scoring candidate not already held, name the single
+strongest funding candidate among `ELIGIBLE FUNDING SOURCES`, and state plainly whether the
+former clears the bar to trim the latter. A "no" requires a specific, falsifiable reason (weak
+score, cooling momentum, no catalyst, sector already represented) — "nothing is broken" is
+explicitly disallowed as a reason here, since this check is about opportunity cost, not damage
+control; those are separate questions and the other trim rules already own the damage-control
+side. A field with nothing scoring above ~15 is a legitimate "ride it out," but it has to be
+stated as that finding, not skipped.
+
 ## Robinhood Watchlist Integration
 
 Reads all Robinhood watchlists each run. Tickers not already in `tickers.json` or the portfolio are scored. Those scoring ≥ `WATCHLIST_MIN_SCORE` are passed to Claude as preferred add candidates, split by priority:
