@@ -302,6 +302,21 @@ control; those are separate questions and the other trim rules already own the d
 side. A field with nothing scoring above ~15 is a legitimate "ride it out," but it has to be
 stated as that finding, not skipped.
 
+## Exits Belong in TRIMS/EXITS (block-order hazard)
+
+The analysis blocks are written in order (`TRIMS/EXITS` → `BUYS` → `HOLDS`), and with thinking
+disabled the model only walks the per-position list while writing `HOLDS`. On 2026-09-30 a
+`SMALL POSITION CLEANUP` exit for SOLV was decided there: `TRIMS/EXITS` had already said "Nothing to
+trim today", and the exit landed in `HOLDS` plus a stray `SMALL POSITION EXIT:` line. The cleanup
+rule never said where an exit goes, and `TRIMS/EXITS` said "only list positions … exited" without
+saying that overrides anything.
+
+Prompt-only fix: the cleanup rule now requires checking every `[SMALL POSITION]` tag *before*
+writing `TRIMS/EXITS` and puts the exit there as a normal bold line; `TRIMS/EXITS` may only say
+"nothing to trim" after that check; `HOLDS` may never introduce a sell/exit/trim. Not
+mechanically enforced — if it recurs, add a post-parse check for exit language outside
+`TRIMS/EXITS` (same pattern as `apply_watch_verdicts()`).
+
 ## Robinhood Watchlist Integration
 
 Reads all Robinhood watchlists each run. Tickers not already in `tickers.json` or the portfolio are scored. Those scoring ≥ `WATCHLIST_MIN_SCORE` are passed to Claude as preferred add candidates, split by priority:
