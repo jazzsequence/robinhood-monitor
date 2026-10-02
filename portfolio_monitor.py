@@ -78,6 +78,7 @@ ETHICAL_EXCLUSIONS_FILE = "ethical_exclusions.json"
 # "ONE KEY THING TO WATCH" item is carried forward and forcibly re-reported, how
 # many can be open at once, and how many sessions of breadth history are kept.
 WATCH_ITEM_MAX_AGE_DAYS = 5
+WATCH_ITEM_MIN_RESOLVE_AGE_DAYS = 3  # a RESOLVED verdict on a younger item is ignored (one bounce isn't an answer)
 WATCH_ITEM_MAX_OPEN = 3
 WATCH_ITEM_MAX_SYMBOLS = 8  # a sector-wide watch legitimately names most of a sector
 BREADTH_HISTORY_LEN = 5
@@ -289,7 +290,11 @@ CLAUDE_SYSTEM_PROMPT = (
     "ESCALATED, and brings a STILL OPEN one back on the next run with updated numbers. So do "
     "not mark something resolved to stop hearing about it — if the data is genuinely still "
     "ambiguous, STILL OPEN is the honest answer and seeing it again tomorrow with another "
-    "session of movement attached is the point.\n\n"
+    "session of movement attached is the point. One session's reversal does not answer a "
+    "multi-session trend: a single bounce after days of slippage is noise until it holds. The "
+    "script enforces this — a RESOLVED verdict on an item younger than "
+    f"{WATCH_ITEM_MIN_RESOLVE_AGE_DAYS} days is ignored and the item stays open — so for a young "
+    "item use STILL OPEN and say what the new session did.\n\n"
     "SESSION-OVER-SESSION CONTINUITY — HARD CONSTRAINT: The '=== MARKET BREADTH ===' section "
     "below is computed in Python from the position list over the last several sessions, and the "
     "PRIOR RUN ANALYSIS section is what was said last time. Read both before characterizing "
@@ -327,7 +332,18 @@ CLAUDE_SYSTEM_PROMPT = (
     "opportunity this session. Holding cash is an exception that needs a specific, named reason "
     "(e.g. every candidate is overbought or news-damaged, or a pending order already "
     "earmarks it) — 'it's only $7' and 'nothing is broken' are not reasons. If you hold cash, "
-    "say which exception applies. Never comment on whether the dollar figure itself is big enough. "
+    "say which exception applies. Deploying is not a license to chase: the target of a small "
+    "deployment must pass the SAME entry standard as any other buy. A one-session bounce, a "
+    "green day, or an analyst price-target headline is NOT a reason to buy a name — if you "
+    "rejected a candidate as overbought or stretched in the OPPORTUNITY COST CHECK, you may not "
+    "then buy a holding that is in the same condition (up sharply today or over the last "
+    "session or two, RSI elevated, price extended above its MA50) for the same reason. Prefer, "
+    "in order: (1) the best unowned candidate if it is a clean entry, (2) a funding-eligible or "
+    "underweight holding that is pulling back toward its MA50 with RSI not stretched, "
+    "(3) the position with the strongest thesis that is NOT up on the day. Never put new "
+    "money into a name solely because it just bounced, and do not treat a single up session as "
+    "resolving a multi-session weakness watch item. "
+    "Never comment on whether the dollar figure itself is big enough. "
     "If a move is genuinely compelling but there is no internal funding source (no cash, no "
     "reasonable trim, everything else restricted or a loser), do not just say 'no buys today' — "
     "say explicitly that the opportunity is worth funding with outside cash (a deposit) even "
@@ -1865,7 +1881,7 @@ _VERDICT_RE = re.compile(r"\b(RESOLVED|ESCALATED)\b")
 
 
 def apply_watch_verdicts(
-    analysis_text: str, open_items: list[dict]
+    analysis_text: str, open_items: list[dict], today: str | None = None
 ) -> tuple[list[dict], list[tuple[dict, str]]]:
     """
     Close out any watch item today's SINCE LAST SESSION block marked RESOLVED or
@@ -1878,6 +1894,13 @@ def apply_watch_verdicts(
     stays open and comes back tomorrow with updated numbers — the failure mode
     to avoid here is dropping a trend nobody looked at, not carrying one an
     extra session.
+
+    RESOLVED is additionally age-gated when `today` is given: an item younger
+    than WATCH_ITEM_MIN_RESOLVE_AGE_DAYS stays open even if the model says
+    RESOLVED. A MU "cushion compressing for 5 sessions" watch was closed as
+    "resolved bullish" the morning after it was flagged, off a single up day,
+    and the cash was then deployed into that same bounce. ESCALATED is not
+    gated — it already requires a matching action line in the analysis.
     """
     if not open_items:
         return [], []
@@ -1905,6 +1928,18 @@ def apply_watch_verdicts(
             if found:
                 verdict = found.group(1)
                 break
+        if verdict == "RESOLVED" and today and item.get("flagged_date"):
+            try:
+                age = _days_between(item["flagged_date"], today)
+            except ValueError:
+                age = WATCH_ITEM_MIN_RESOLVE_AGE_DAYS
+            if age < WATCH_ITEM_MIN_RESOLVE_AGE_DAYS:
+                log.info(
+                    f"Watch item from {item['flagged_date']} marked RESOLVED at {age}d old "
+                    f"(< {WATCH_ITEM_MIN_RESOLVE_AGE_DAYS}d) — keeping it open: "
+                    f"{item.get('symbols') or '(no symbol)'}"
+                )
+                verdict = None
         if verdict:
             closed.append((item, verdict))
         else:
@@ -3495,7 +3530,7 @@ def main():
         # baseline (see merge_watch_item) — that is what makes a multi-session
         # trend measurable instead of resetting to zero every morning.
         try:
-            still_open, closed = apply_watch_verdicts(analysis, open_watch_items)
+            still_open, closed = apply_watch_verdicts(analysis, open_watch_items, today)
             for item, verdict in closed:
                 log.info(
                     f"Watch item from {item['flagged_date']} closed as {verdict}: "

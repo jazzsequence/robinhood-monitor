@@ -72,6 +72,7 @@ Python 3.11+ required (uses `float | None` union type syntax).
 | `PROTECTED_TRIM_MAX_PCT` | `0.10` | Max fraction of a protected symbol's own equity trimmable per action |
 | `SMALL_POSITION_THRESHOLD` | `10` | Equity ($) at/under which a position is a stale-cleanup candidate |
 | `WATCH_ITEM_MAX_AGE_DAYS` | `5` | Days a "one key thing to watch" item is carried forward and re-reported |
+| `WATCH_ITEM_MIN_RESOLVE_AGE_DAYS` | `3` | A RESOLVED verdict on a watch item younger than this is ignored (item stays open) |
 | `WATCH_ITEM_MAX_OPEN` | `3` | Max watch items open at once |
 | `WATCH_ITEM_MAX_SYMBOLS` | `8` | Max symbols tracked per watch item |
 | `BREADTH_HISTORY_LEN` | `5` | Sessions of portfolio breadth kept for the continuity section |
@@ -219,6 +220,10 @@ recommendations are unchanged plus the condition that would change them.
   silting up with zombie lines would be its own kind of daily repetition. It is deliberately
   conservative: an item closes only when a line naming one of *its own* symbols carries the
   verdict word, and anything unmatched stays open.
+  RESOLVED is **age-gated** (`WATCH_ITEM_MIN_RESOLVE_AGE_DAYS`): on 2026-10-02 a multi-session MU
+  cushion-compression watch was closed as "resolved bullish" the morning after it was flagged, off one
+  up day, and the idle cash was then deployed into that same bounce. Younger items now stay open
+  regardless of the verdict; ESCALATED is not gated (it already requires a real action line).
 - `merge_watch_item()` folds today's item into the open list. A restatement (any symbol overlap)
   updates the text in place but **keeps the original `flagged_date` and baseline** — that is what
   makes a multi-session trend measurable instead of resetting to zero every morning. The prompt
@@ -301,6 +306,16 @@ explicitly disallowed as a reason here, since this check is about opportunity co
 control; those are separate questions and the other trim rules already own the damage-control
 side. A field with nothing scoring above ~15 is a legitimate "ride it out," but it has to be
 stated as that finding, not skipped.
+
+## Idle Cash Is Deployed — Without Chasing
+
+`POSITION-SIZE-AWARE TRIM SIZING` no longer has a sub-$50 "too small to trim" floor (this is a ~$1k
+fractional-share account; $50 is a real holding). `BUYS` defaults to deploying all Available Cash each
+session — holding it needs a named exception, "it's only $7" is not one. Because "deploy by default"
+made the model grab the easiest target (MU, after a one-day bounce, in the same run that rejected SNPS
+as a chase), the same block requires the target to pass the *same* entry standard as any buy: a green
+day or price-target headline isn't a reason, and a name rejected as stretched can't be bought in the
+same condition. Prompt-only; COST BASIS DISCIPLINE still blocks trimming underwater positions.
 
 ## Exits Belong in TRIMS/EXITS (block-order hazard)
 
