@@ -15,6 +15,10 @@
     "AXON": {
       "reason": "Axon Enterprise manufactures and sells mass-surveillance and policing technology, including body cameras, cloud storage platforms, and weapons such as Tasers, meeting criteria (2) and (1).",
       "added": "2026-08-21"
+    },
+    "RTX": {
+      "reason": "RTX (Raytheon Technologies) is a major defense contractor that manufactures weapons systems and defense equipment, meeting criterion (1).",
+      "added": "2026-10-09"
     }
   },
   "screened": [
@@ -32,6 +36,7 @@
     "COST",
     "CRWD",
     "DELL",
+    "GE",
     "GOOGL",
     "ICHR",
     "INTC",
@@ -52,6 +57,7 @@
     "PLTR",
     "QCOM",
     "RKLB",
+    "RTX",
     "SCHW",
     "SMCI",
     "SNPS",
