@@ -628,12 +628,30 @@ def robinhood_login():
     instructions to run reauth.py.
     """
     def _do_login():
-        r.login(
-            username=os.getenv("ROBINHOOD_USERNAME"),
-            password=os.getenv("ROBINHOOD_PASSWORD"),
-            store_session=True,
-            pickle_name=ROBIN_TOKEN_NAME,
-        )
+        # robin_stocks opens the pickle with 'wb' *before* reading the login response, so a
+        # failed password login (no access_token) leaves a 0-byte file and destroys whatever
+        # reauth.py just wrote. Snapshot it and put it back if it comes out empty.
+        backup = None
+        try:
+            with open(ROBIN_TOKEN_PATH, "rb") as f:
+                backup = f.read() or None
+        except OSError:
+            pass
+        try:
+            r.login(
+                username=os.getenv("ROBINHOOD_USERNAME"),
+                password=os.getenv("ROBINHOOD_PASSWORD"),
+                store_session=True,
+                pickle_name=ROBIN_TOKEN_NAME,
+            )
+        finally:
+            try:
+                if backup and os.path.getsize(ROBIN_TOKEN_PATH) == 0:
+                    with open(ROBIN_TOKEN_PATH, "wb") as f:
+                        f.write(backup)
+                    log.warning("Fresh login left an empty session file — restored the previous pickle")
+            except OSError:
+                pass
 
     # Load the pickle ourselves so we can handle 429 on validation without
     # misreading it as an expired token and triggering unnecessary re-auth.
