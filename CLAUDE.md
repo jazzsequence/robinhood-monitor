@@ -31,6 +31,24 @@ Logs to stdout and `monitor.log`. Sends an HTML digest email on success, an erro
 
 **First run:** Robinhood will prompt for MFA/device approval. Complete it interactively. The session is cached in `.robin_token` for subsequent silent runs.
 
+## Auth Failures: Stale Token and Pickle Truncation
+
+When the session expires, `reauth.py` copies the web app's token from the browser's
+`localStorage` into `~/.tokens/robinhood.robin_token.pickle`. Two non-obvious failure modes:
+
+- **Stale browser token.** If the robinhood.com tab sat idle, `web:auth_state` still holds an
+  already-expired access token. Saving it gives a 401 `JWT verification failed` on every endpoint
+  and the 6am run fails exactly as if reauth never happened (2026-10-09: token `exp` was 3 days old).
+  `reauth.py` now decodes the JWT `exp` and refuses to save an expired token. Fix: hard-reload
+  robinhood.com and click around so it refreshes, then rerun.
+- **Pickle truncation.** `robin_stocks.login()` opens the pickle with `'wb'` *before* checking the
+  login response, so a failed password login leaves a 0-byte file and destroys the session reauth
+  just wrote. `robinhood_login()` snapshots the pickle before `r.login()` and restores it if it comes
+  back empty (logged as `Fresh login left an empty session file`).
+
+Diagnosing: `ls -la ~/.tokens/` (0 bytes = truncated), then decode the access token's `exp` claim.
+Never print the token itself.
+
 ## Environment Variables
 
 ```

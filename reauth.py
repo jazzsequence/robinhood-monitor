@@ -5,12 +5,14 @@ Recreate the Robinhood session pickle from a browser token.
 Run this when the session expires and automatic re-authentication fails:
     .venv/bin/python reauth.py
 """
+import base64
 import json
 import os
 import pickle
 import secrets
 import subprocess
 import sys
+import time
 
 PICKLE_PATH = os.path.expanduser("~/.tokens/robinhood.robin_token.pickle")
 
@@ -32,6 +34,16 @@ def generate_device_token():
         if i in [3, 5, 7, 9]:
             token += "-"
     return token
+
+
+def jwt_expiry(token):
+    """Return the JWT's `exp` as a unix timestamp, or None if it can't be decoded."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+    except Exception:
+        return None
 
 
 def main():
@@ -65,6 +77,15 @@ def main():
         if key not in data:
             print(f"Missing field: {key}")
             sys.exit(1)
+
+    # The browser's localStorage token goes stale if the robinhood.com tab sat idle; saving it
+    # just produces a 401 "JWT verification failed" at the next 6am run.
+    exp = jwt_expiry(data["access_token"])
+    if exp is not None and exp <= time.time():
+        print(f"Token expired {time.strftime('%Y-%m-%d %H:%M', time.localtime(exp))} — the browser tab is stale.")
+        print("Hard-reload robinhood.com, click around so it refreshes its session, then rerun.")
+        print("Nothing was saved.")
+        sys.exit(1)
 
     os.makedirs(os.path.dirname(PICKLE_PATH), exist_ok=True)
     with open(PICKLE_PATH, "wb") as f:
