@@ -29,6 +29,8 @@ import robin_stocks.robinhood as r
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+import portfolio_risk
+
 # Set a recognizable User-Agent for device-approval prompts in the Robinhood app.
 r.helper.update_session("User-Agent", "Robinhood Monitor/1.0")
 
@@ -253,11 +255,57 @@ CLAUDE_SYSTEM_PROMPT = (
     "A partial trim means taking a fraction of the position off the table, not exiting — size it "
     "per POSITION-SIZE-AWARE TRIM SIZING (at most ~50% of that position's equity), not as a fixed "
     "dollar figure. Riding a winner and taking partial profits are not mutually exclusive.\n\n"
+    "GAIN GIVEBACK — HARD CONSTRAINT: If a '=== GAIN GIVEBACK ALERTS ===' section appears, "
+    "each position listed peaked well above its cost and has since surrendered a third or "
+    "more of that open gain while still showing a profit — the specific way a good position "
+    "becomes a round trip. The figures are computed in Python from price history since the "
+    "position was opened; they are measurements, not an impression. In a 1-year backtest of "
+    "this portfolio, exiting at this threshold modestly beat holding and cut the worst "
+    "drawdown by about a third, and the price was lower 40 sessions after the exit in roughly "
+    "four cases out of five. So the default for an alerted position is to SELL, and a "
+    "decision to hold has to beat that base rate. In TRIMS/EXITS, for every alerted position, "
+    "either (1) recommend a full exit (the backtested rule) or a trim sized per "
+    "POSITION-SIZE-AWARE TRIM SIZING, or (2) name a specific, checkable reason to hold: a "
+    "dated catalyst within days, or a named support level, with its price, that has been "
+    "holding. 'Thesis intact', 'sector-wide pullback', 'no negative news' and 'down with "
+    "everything else' are NOT reasons — they explain why the price is falling, not why it "
+    "will stop, and a giveback inside a sector-wide pullback is still a giveback. State any "
+    "hold-despite-alert inside TRIMS/EXITS, even when no trim is recommended, never only in "
+    "HOLDS. The other rules still bind: positions bought < 7 days ago, protected symbols (10% "
+    "cap plus reinvestment condition), and TRIM COUNT WARNINGS. A position whose 'Gain "
+    "protection' line says the entire open gain has been given back is informational only — "
+    "the alert does not apply below cost, and COST BASIS DISCIPLINE governs it.\n\n"
+    "EXITS FUND BUYS: The proceeds of a giveback exit or trim are not meant to sit in cash. "
+    "Redeploy them this same session: put the buy they fund in BUYS and state the pairing. "
+    "The target must pass the same entry standard as any other buy (no chasing — see BUYS). "
+    "The default destination is outside any cluster flagged CONCENTRATED in PORTFOLIO RISK "
+    "CONTEXT: selling one holding in a cluster to buy another in the same cluster swaps an "
+    "exposure for the same exposure, and it does nothing about the thing the exit was meant to "
+    "protect against. Buying inside a flagged cluster needs a specific, named reason stronger "
+    "than 'it is at support'. Cash may be held only when no candidate clears the entry standard; then "
+    "say so plainly and name the candidate you rejected and why. That exception is for a thin "
+    "field of candidates, not a way to avoid the decision.\n\n"
+    "PORTFOLIO RISK CONTEXT: If a '=== PORTFOLIO RISK CONTEXT ===' section appears, reason "
+    "from it instead of from impressions. (1) Before attributing a drop to a 'sector-wide "
+    "pullback' or a 'broad risk-off day', check the benchmark figures: if the portfolio fell "
+    "more than the benchmark it is most exposed to, say the holdings underperformed it and do "
+    "not file that under sector drag. Quote the 'Portfolio minus ...' and 'moves most like ...' "
+    "lines as given — the differences and their direction are already computed, so do not "
+    "re-derive or re-sign them. (2) If a cluster is flagged CONCENTRATED, state it once "
+    "in the analysis with its share of equity and say plainly whether it changes any "
+    "recommendation — a cluster below its recent high while the benchmark that tracks it is "
+    "weak is one exposure falling, not several independent holds. If nothing about it changed "
+    "since the PRIOR RUN ANALYSIS, say so in a clause rather than re-describing it. (3) These "
+    "figures describe exposure; concentration alone is not a sell trigger. GAIN GIVEBACK is "
+    "the sell trigger.\n\n"
     "OPPORTUNITY COST CHECK — HARD CONSTRAINT: Before writing TRIMS/EXITS, explicitly answer "
     "one question: is there a better use of capital right now than what is already held? Name "
     "the single strongest candidate not already owned or pending — the top-scoring symbol from "
     "the momentum scan or watchlist candidates below, whichever scores higher — with its score "
-    "and RSI. Then name the single strongest funding candidate among ELIGIBLE FUNDING SOURCES: "
+    "and RSI. Then name the funding candidate: if any GAIN GIVEBACK ALERT is open, it is the alerted "
+    "position with the largest giveback — that sale is already warranted on its own, so the only "
+    "question is what its proceeds buy. Otherwise name the single strongest funding candidate among "
+    "ELIGIBLE FUNDING SOURCES: "
     "the position with the largest total_return_pct or the largest price_vs_ma50_pct extension. "
     "State plainly whether the candidate clears the bar to justify trimming that funding source. "
     "'Yes' must lead directly into a TRIMS/EXITS + BUYS pair naming both. 'No' requires a "
@@ -317,7 +365,9 @@ CLAUDE_SYSTEM_PROMPT = (
     "required for the commitment to be tracked. "
     "Do not mention positions that are merely being held; those go in HOLDS. "
     "If nothing to trim, say so in one sentence — but only after checking that no position is "
-    "being exited for any reason, including SMALL POSITION CLEANUP. \"Nothing to trim\" next to "
+    "being exited for any reason, including SMALL POSITION CLEANUP, and that every GAIN GIVEBACK "
+    "alert has been either acted on or named here with its specific reason for holding. "
+    "\"Nothing to trim\" next to "
     "an exit recommended elsewhere in the analysis is a contradiction.\n\n"
     "BUYS: State total capital available (cash + trim proceeds) in one line. Then one bold action "
     "line per buy (e.g. **BUY MRVL — $35**) with one sentence of reasoning. "
@@ -739,6 +789,10 @@ def get_positions() -> list[dict]:
                     "current_price": round(current_price, 4),
                     "equity": equity,
                     "total_return_pct": total_return_pct,
+                    # When Robinhood opened this position record — the earliest the
+                    # holder could have had a gain, so the gain-giveback peak is
+                    # measured from here and not from a pre-purchase price spike.
+                    "opened_at": pos.get("created_at"),
                 }
             )
         except Exception as e:
@@ -1261,6 +1315,13 @@ def get_watchlist_tickers(exclude: set[str]) -> dict[str, list[str]]:
 
 
 # ── Market data ───────────────────────────────────────────────────────────────
+# Daily closes per symbol, filled as a side effect of fetch_bulk_market_data. Kept
+# out of the returned indicator dicts on purpose: those are serialised into the
+# summary/last_analysis.json, and a pandas Series does not belong there. The risk
+# context (gain giveback, correlation clusters, benchmarks) reads from here.
+PRICE_HISTORY: dict[str, pd.Series] = {}
+
+
 def fetch_bulk_market_data(symbols: list[str]) -> dict[str, dict]:
     """
     Download 1y of daily OHLCV for all symbols in one yfinance call.
@@ -1292,6 +1353,7 @@ def fetch_bulk_market_data(symbols: list[str]) -> dict[str, dict]:
 
             closes = hist["Close"]
             volumes = hist["Volume"]
+            PRICE_HISTORY[symbol] = closes
 
             current_price = round(float(closes.iloc[-1]), 4)
             prev_close = round(float(closes.iloc[-2]), 4)
@@ -1715,6 +1777,13 @@ def save_analysis(date: str, tldr: str, analysis: str, summary: dict | None = No
                 }
                 for pos in summary.get("positions", [])
             ],
+        }
+        # Compact copy of the risk context for MCP sessions reading this file.
+        risk = summary.get("risk_context") or {}
+        payload["risk_context"] = {
+            "giveback": risk.get("giveback") or {},
+            "concentration": risk.get("concentration") or [],
+            "benchmarks": risk.get("benchmarks"),
         }
         payload["momentum"] = [
             {
@@ -2246,10 +2315,15 @@ def build_prompt(summary: dict) -> str:
             f"  [ETHICAL SCREEN: {ethical_reason_by_symbol[symbol]}]"
             if symbol in ethical_reason_by_symbol else ""
         )
+        giveback = ((summary.get("risk_context") or {}).get("giveback") or {}).get(symbol)
+        giveback_tag = (
+            f"  [GAIN GIVEBACK ALERT — {giveback['given_back_pct']:.0f}% of the open gain given back]"
+            if giveback and giveback["status"] == "alert" else ""
+        )
         lines += [
             f"\n{symbol}: {pos['shares']} shares @ ${pos['current_price']} "
             f"(avg cost ${pos['avg_cost']}, return {pos['total_return_pct']:+.1f}%, "
-            f"equity ${pos['equity']}, {alloc_pct:.1f}% of portfolio)  [{funding_tag}]{small_tag}{ethical_tag}",
+            f"equity ${pos['equity']}, {alloc_pct:.1f}% of portfolio)  [{funding_tag}]{small_tag}{ethical_tag}{giveback_tag}",
             f"  RSI: {_fmt(ind.get('rsi'), '.1f')} | "
             f"MA50: ${_fmt(ind.get('ma50'), '.2f')} "
             f"({_fmt(ind.get('price_vs_ma50_pct'), '+.1f')}%) | "
@@ -2258,6 +2332,11 @@ def build_prompt(summary: dict) -> str:
             f"  {change_label}: {_fmt(ind.get('pct_change_today'), '+.2f')}% | "
             f"Volume ratio: {_fmt(ind.get('volume_ratio'), '.2f')}x",
         ]
+        if giveback and giveback["status"] in ("alert", "gone"):
+            lines.append(
+                "  Gain protection: "
+                + portfolio_risk.giveback_summary(symbol, giveback, pos["total_return_pct"])
+            )
         sym_news = ticker_news.get(symbol, [])
         if sym_news:
             for item in sym_news:
@@ -2319,6 +2398,23 @@ def build_prompt(summary: dict) -> str:
                 f"reinvest at/below ${c['reinvest_price']:.2f} "
                 f"(current ${_fmt(current_price, '.2f')}) — {met}"
             )
+
+    risk_context = summary.get("risk_context")
+    risk_alerts = portfolio_risk.giveback_alerts(risk_context)
+    if risk_alerts:
+        lines += ["", "=== GAIN GIVEBACK ALERTS ==="]
+        position_by_symbol = {p["symbol"]: p for p in summary["positions"]}
+        for sym, g in sorted(risk_alerts.items(), key=lambda kv: -kv[1]["given_back_pct"]):
+            pos = position_by_symbol.get(sym)
+            if pos:
+                lines.append(
+                    f"⚠ {sym}: "
+                    + portfolio_risk.giveback_summary(sym, g, pos["total_return_pct"])
+                    + f"; equity ${pos['equity']:.2f}"
+                )
+    risk_lines = portfolio_risk.risk_text_lines(risk_context, summary["positions"])
+    if risk_lines:
+        lines += ["", "=== PORTFOLIO RISK CONTEXT (computed in Python) ==="] + risk_lines
 
     if pending_orders:
         lines += [
@@ -2534,6 +2630,10 @@ def format_digest(summary: dict, analysis: str) -> str:
                     f"vs MA50 {_fmt(then.get('price_vs_ma50_pct'), '+.1f')}% → "
                     f"{_fmt(now.get('price_vs_ma50_pct'), '+.1f')}%"
                 )
+
+    risk_lines = portfolio_risk.risk_text_lines(summary.get("risk_context"), summary["positions"])
+    if risk_lines:
+        lines += ["", "PORTFOLIO RISK", sep] + risk_lines
 
     lines += [
         "",
@@ -2974,6 +3074,16 @@ def format_digest_html(summary: dict, analysis: str) -> str:
     else:
         ticker_news_content = '<p style="color:#6b7280;font-size:13px;margin:0;">No ticker news fetched.</p>'
 
+    # ── Portfolio risk ───────────────────────────────────────────────────────
+    # The same lines the analysis was shown, so the reader sees what it saw.
+    risk_text = portfolio_risk.risk_text_lines(summary.get("risk_context"), summary["positions"])
+    risk_content = (
+        '<pre style="margin:0;font-size:12px;line-height:1.5;color:#334155;'
+        'font-family:Menlo,Consolas,monospace;white-space:pre-wrap;">'
+        + _h("\n".join(risk_text))
+        + "</pre>"
+    ) if risk_text else ""
+
     # ── Analysis block ───────────────────────────────────────────────────────
     analysis_html = _md_to_html(analysis)
 
@@ -3095,6 +3205,7 @@ def format_digest_html(summary: dict, analysis: str) -> str:
         + (_section("Trend Tracker", trend_content)
            if (watch_items or len(breadth_history) > 1) else "")
         + (_section("Pending Orders", pending_content) if pending_orders else "")
+        + (_section("Portfolio Risk", risk_content) if risk_content else "")
         + _section("Current Positions", _table(pos_header, pos_rows))
         + _section("Technical Indicators", _table(ind_header, ind_rows))
         + _section("Top Momentum Movers", _table(mom_header, mom_rows))
@@ -3424,6 +3535,24 @@ def main():
         log.error(f"Momentum scan failed: {e}")
         momentum = []
 
+    # 6b. Portfolio-level risk context — gain giveback per position, correlation
+    # clusters (concentration), and performance vs QQQ/SOXX/SPY. Non-critical: on
+    # failure the prompt and digest simply omit it. See portfolio_risk.py.
+    try:
+        risk_context = portfolio_risk.build_risk_context(positions, PRICE_HISTORY)
+        alerts = portfolio_risk.giveback_alerts(risk_context)
+        if alerts:
+            log.info(f"Gain giveback alerts: {sorted(alerts)}")
+        concentrated = [c for c in risk_context["concentration"] if c["concentrated"]]
+        if concentrated:
+            log.info(
+                "Concentrated clusters: "
+                + "; ".join(f"{c['pct_of_equity']:.0f}% {c['symbols']}" for c in concentrated)
+            )
+    except Exception as e:
+        log.warning(f"Risk context failed: {e}")
+        risk_context = None
+
     # 7. Build summary
     total_equity = sum(p["equity"] for p in positions)
     total_value = round(total_equity + cash, 2)
@@ -3470,6 +3599,7 @@ def main():
         "breadth": breadth,
         "breadth_history": breadth_history,
         "watch_items": open_watch_items,
+        "risk_context": risk_context,
     }
 
     # 7b. Resolve protected-symbol reinvestment commitments against real order history

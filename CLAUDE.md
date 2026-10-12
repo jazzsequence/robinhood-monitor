@@ -8,7 +8,8 @@ Daily Robinhood portfolio digest: pulls live positions, enriches with technical 
 
 | File | Purpose |
 |------|---------|
-| `portfolio_monitor.py` | Single-file main script — all logic lives here |
+| `portfolio_monitor.py` | Main script — orchestration, prompt, digest, state |
+| `portfolio_risk.py` | Pure risk calculations (gain giveback, correlation clusters, benchmarks) + their text rendering. Split out because `portfolio_monitor.py` is already 3.6k lines; importable for tests |
 | `tickers.json` | Screener watchlist — read at startup, rewritten by Claude each run |
 | `news.json` | Latest run's fetched news with URLs (overwritten each run, gitignored) |
 | `last_analysis.json` | Full daily technical snapshot + analysis. Lives in `~/Dropbox/robinhood-monitor/` (gitignored — repo is public and this carries real dollar figures), synced across machines via Dropbox instead |
@@ -94,6 +95,9 @@ Python 3.11+ required (uses `float | None` union type syntax).
 | `WATCH_ITEM_MAX_OPEN` | `3` | Max watch items open at once |
 | `WATCH_ITEM_MAX_SYMBOLS` | `8` | Max symbols tracked per watch item |
 | `BREADTH_HISTORY_LEN` | `5` | Sessions of portfolio breadth kept for the continuity section |
+| `GIVEBACK_MIN_PEAK_GAIN_PCT` / `GIVEBACK_ALERT_PCT` | `20` / `33` | (`portfolio_risk.py`) peak gain over cost needed to be protectable / share of it surrendered to alert |
+| `CONCENTRATION_ALERT_PCT` | `25` | (`portfolio_risk.py`) cluster share of equity flagged CONCENTRATED |
+| `CLUSTER_CORR_THRESHOLD` | `0.45` | (`portfolio_risk.py`) average-linkage cutoff for "moves together" |
 | `ETHICAL_SCREEN_CRITERIA` | (see below) | Exclusion rubric applied by the ethical screen — not a user-curated symbol list |
 
 ## Script Flow
@@ -109,6 +113,7 @@ Python 3.11+ required (uses `float | None` union type syntax).
 9. Build summary dict
 10. Fetch Sherwood news (RSS) + per-ticker Yahoo Finance news (parallel); save to `news.json`
 11. Call Claude Haiku for ticker recommendations (JSON: adds + removes with reasons, informed by news + watchlist candidates) → rewrite `tickers.json`
+11b. Build the risk context (`portfolio_risk.build_risk_context`) from the price history `fetch_bulk_market_data` stashed in `PRICE_HISTORY` — non-critical, omitted on failure
 12. Compute session breadth, roll the breadth history forward, and load any still-open watch items — see Session-Over-Session Continuity
 13. Call Claude Sonnet for portfolio analysis
 14. Parse the analysis's `SINCE LAST SESSION` verdicts (closing resolved/escalated watch items) and its new `ONE KEY THING TO WATCH` line (snapshotting baselines for next run)
@@ -335,6 +340,71 @@ as a chase), the same block requires the target to pass the *same* entry standar
 day or price-target headline isn't a reason, and a name rejected as stretched can't be bought in the
 same condition. Prompt-only; COST BASIS DISCIPLINE still blocks trimming underwater positions.
 
+## Portfolio Risk Context (gain giveback, concentration, benchmarks)
+
+Added 2026-10-12 after a day when 16/20 positions fell, every one was "held — thesis intact", and
+the portfolio had already given back ~4% from its 10-06 peak. The question raised: can the agent
+tell when to *bail* on a position before a winner round-trips? The existing rules only authorised a
+sell to fund a better buy, for a broken thesis, or for overextension — "sell because the gain is
+evaporating" was not a recognised reason. Everything below is computed in Python
+(`portfolio_risk.py`), same Python-tracked-state pattern as trim warnings; nothing is auto-sold.
+
+**Gain giveback (the sell trigger).** Per position: peak close since `opened_at` (Robinhood's
+position `created_at`, so a pre-purchase spike can't count), `peak_gain` vs `avg_cost`, and what share
+of that open gain (`peak - cost`) has been surrendered. `status == "alert"` when peak gain
+>= `GIVEBACK_MIN_PEAK_GAIN_PCT` (20), giveback >= `GIVEBACK_ALERT_PCT` (33) **and the position is still
+above cost**. Below cost it is `"gone"` (informational) — alerting there would just demand a sale at a
+loss, which `COST BASIS DISCIPLINE` separately restrains. Alerts get a tag on the position line, a
+`=== GAIN GIVEBACK ALERTS ===` section, and the `GAIN GIVEBACK` hard constraint: for each alert,
+TRIMS/EXITS must recommend an exit/trim or name a specific checkable reason to hold ("thesis intact" /
+"sector-wide pullback" are explicitly not reasons). A hold-despite-alert must be stated in
+TRIMS/EXITS, not only HOLDS (same block-order hazard as below). `OPPORTUNITY COST CHECK` makes the
+alerted position the funding candidate by default.
+
+**Exits fund buys, not cash.** `EXITS FUND BUYS` requires giveback proceeds to be redeployed the same
+session through the normal no-chasing entry standard, defaulting to a destination *outside* any
+CONCENTRATED cluster (selling AMD to buy MU swaps semis for semis). Cash is allowed only when no
+candidate clears the standard, and the rejected candidate must be named. Protected symbols keep their
+10% cap + reinvestment condition even when alerted (COST alerted on the first live run).
+
+**Why per-position and why flag-only — the backtests (1y, current holdings back-cast, so survivorship
+flatters everything; read the comparisons, not the absolutes):**
+
+| Rule | Return | Worst DD |
+|---|---|---|
+| Buy and hold, 20 positions equal-weight | +89% | -28% |
+| Per-position exit at 33% giveback of a >=20% peak gain, final | +94% | -19% |
+| Same, re-enter above 50d avg | +91% | -25% (27 exits — churn erodes it) |
+| Semis sleeve buy and hold | +114% | -34% |
+| Semis sleeve trailing stop 8/10/15% from high-water mark | +38/+46/+77% | -34/-33/-37% |
+
+A portfolio- or sector-level trailing stop gave up half or more of the return and did *not* reduce
+the worst drawdown (the sleeve fell 34% Jun 22 – Jul 29 and recovered; stops sold into it and
+re-entered late). A per-position giveback exit did better: price was lower 40 sessions after the exit
+~80% of the time. So the sell trigger is per position, and concentration is context only.
+
+**Concentration — no hard-coded sector lists.** `correlation_clusters()` does average-linkage
+clustering (threshold 0.45) on ~6 months of daily returns. On this portfolio it recovered the real
+10-name semis group (47% of equity) plus GOOGL/AMZN, IONQ/RKLB, CRWD/PANW with no labels, so it
+adapts to whatever the portfolio becomes. yfinance sector/industry labels were rejected: they split
+semis into "Semiconductors" and "Semiconductor Equipment" and lump everything else into
+"Technology". Clusters >= `CONCENTRATION_ALERT_PCT` (25) of equity are flagged CONCENTRATED. Each
+cluster is compared with the benchmark it *tracks* (highest correlation of QQQ/SOXX/SPY), not a fixed
+pairing.
+
+**Benchmarks.** Back-cast of current holdings vs QQQ (Nasdaq-100), SOXX (semiconductors) and SPY
+(S&P 500) over 5d/1m/3m, plus 60-day beta/correlation to QQQ and SOXX. The "Portfolio minus X" and
+"moves most like X" differences are computed in Python on purpose: the first live run had the model
+call a cluster at -6.3% "underperforming" a benchmark at -7.6%. The rule tells it to quote those
+lines, not re-derive them.
+
+`PRICE_HISTORY` (module-level dict in `portfolio_monitor.py`) is the side-channel for daily closes —
+kept out of `market_data` so no pandas Series reaches the JSON the summary is serialised into. The
+risk context is also saved to `last_analysis.json` under `risk_context` and rendered in both digests
+as **Portfolio Risk**. Not yet seen on a scheduled cron run — first validated by a live dry run
+(real Robinhood + yfinance + Claude, email/git/state writes skipped): AMD (50% given back) and COST
+(34%) alerted, both were trimmed, and proceeds went to GOOGL/META outside the semis cluster.
+
 ## Exits Belong in TRIMS/EXITS (block-order hazard)
 
 The analysis blocks are written in order (`TRIMS/EXITS` → `BUYS` → `HOLDS`), and with thinking
@@ -387,6 +457,7 @@ A second Claude call (Haiku model, 500 tokens) runs after the momentum scan and 
 ## Email Sections
 
 0. Trend Tracker (breadth history + open watch items with then→now deltas — only when there is something to track)
+0b. Portfolio Risk (benchmarks, correlated clusters, gain-protection alerts — same lines the analysis was shown)
 1. Pending Orders (table — only rendered when unfilled orders exist)
 2. Current Positions (table, colour-coded returns)
 3. Technical Indicators (table, colour-coded RSI/MA/vol)
@@ -427,7 +498,7 @@ claude mcp add robinhood-trading --transport http https://agent.robinhood.com/mc
 4. Discuss the recommendation before acting — the pre-trade conversation is the human-in-the-loop filter
 5. If a trade is warranted: fund the agentic account manually in the Robinhood app, then use `review_equity_order` + `place_equity_order` MCP tools
 
-**`last_analysis.json` schema** (as of 2026-09-10):
+**`last_analysis.json` schema** (as of 2026-10-12):
 ```json
 {
   "date": "...", "tldr": "...", "analysis": "...",
@@ -437,6 +508,13 @@ claude mcp add robinhood-trading --transport http https://agent.robinhood.com/mc
                                            "price_vs_ma50_pct": 0, "volume_ratio": 0 } } }],
   "breadth_history": [{ "date": "...", "total": 0, "up": 0, "down": 0,
                         "median_pct": 0, "above_ma50": 0, "with_ma50": 0 }],
+  "risk_context": { "giveback": { "SYM": { "peak_price": 0, "peak_date": "...", "peak_gain_pct": 0,
+                                           "given_back_pct": 0, "status": "ok|alert|gone" } },
+                    "concentration": [{ "symbols": ["..."], "pct_of_equity": 0, "ret_5d": 0, "ret_1m": 0,
+                                        "below_high_pct": 0, "concentrated": true,
+                                        "tracks": "SOXX", "tracks_corr": 0, "tracks_5d": 0 }],
+                    "benchmarks": { "returns": { "Portfolio": { "5d": 0, "1m": 0, "3m": 0 } },
+                                    "betas": { "QQQ": { "beta": 0, "corr": 0 } }, "coverage_pct": 100 } },
   "portfolio": {
     "total_value": 0.0, "cash": 0.0,
     "committed_cash": 0.0, "uncommitted_cash": 0.0,
