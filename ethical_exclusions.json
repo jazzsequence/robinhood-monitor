@@ -19,6 +19,10 @@
     "RTX": {
       "reason": "RTX (Raytheon Technologies) is a major defense contractor that manufactures weapons systems and defense equipment, meeting criterion (1).",
       "added": "2026-10-09"
+    },
+    "GEO": {
+      "reason": "Operates private prisons and immigration detention facilities, violating criterion (5).",
+      "added": "2026-10-13"
     }
   },
   "screened": [
@@ -37,6 +41,7 @@
     "CRWD",
     "DELL",
     "GE",
+    "GEO",
     "GOOGL",
     "ICHR",
     "INTC",
@@ -61,6 +66,7 @@
     "SCHW",
     "SMCI",
     "SNPS",
+    "SOFI",
     "SOLN",
     "SOLV",
     "SPY",
