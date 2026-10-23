@@ -2,7 +2,7 @@
 
 > **At the start of every session, read `session_notes.md`** for current project state, recent changes, and known issues. Update it at the end of the session before closing.
 
-Daily Robinhood portfolio digest: pulls live positions, enriches with technical indicators (RSI, MAs, volume), scans a self-updating watchlist for momentum opportunities, fetches market news from Sherwood and Yahoo Finance, generates a Claude AI analysis, and emails a formatted HTML digest.
+Daily Robinhood portfolio digest: pulls live positions, enriches with technical indicators (RSI, MAs, volume), scans a self-updating watchlist for momentum opportunities, fetches market news from the first live feed in `MARKET_NEWS_FEEDS` plus per-ticker Yahoo Finance news, generates a Claude AI analysis, and emails a formatted HTML digest.
 
 ## Project Structure
 
@@ -111,7 +111,7 @@ Python 3.11+ required (uses `float | None` union type syntax).
 7. Compute indicators per symbol: RSI, MA50, MA200, volume ratio, daily % change
 8. Run momentum scan — score each screener ticker (0–100), return top N
 9. Build summary dict
-10. Fetch Sherwood news (RSS) + per-ticker Yahoo Finance news (parallel); save to `news.json`
+10. Fetch market news (first feed with fresh articles — see News Freshness) + per-ticker Yahoo Finance news (parallel); save to `news.json`
 11. Call Claude Haiku for ticker recommendations (JSON: adds + removes with reasons, informed by news + watchlist candidates) → rewrite `tickers.json`
 11b. Build the risk context (`portfolio_risk.build_risk_context`) from the price history `fetch_bulk_market_data` stashed in `PRICE_HISTORY` — non-critical, omitted on failure
 12. Compute session breadth, roll the breadth history forward, and load any still-open watch items — see Session-Over-Session Continuity
@@ -290,6 +290,39 @@ then each machine effectively uses its own local mirror.
 error naming any location that fails, and raises only if *no* location persisted.
 `load_last_analysis()` treats a 0-byte file as absent (with a warning) rather than as a parse error.
 
+## News Freshness
+
+**A feed can die while still serving.** Robinhood wound down the Sherwood News website around
+mid-2026 and moved the reporting into newsletters (Snacks, Chartr) and the Robinhood app, but
+`sherwood.news/rss.xml` kept returning its final pre-shutdown articles. Nothing 404'd and nothing
+raised, so for months the digest fed summer headlines to the analysis under the heading
+"TODAY'S MARKET NEWS" — and since the prompt rendered only `title`, never the captured
+`published` date, neither the model nor the reader could see the age. The 2026-10-23 digest's
+newest market headline was from August.
+
+Freshness is now validated rather than assumed:
+
+- `MARKET_NEWS_FEEDS` is an ordered list of `(name, url)` pairs. Each is tried until one yields
+  articles inside the window; a feed that errors, returns nothing, or has simply **stopped being
+  updated** falls through to the next. To change sources, edit this list — no other code changes.
+- `NEWS_MAX_AGE_DAYS` (4) is the cutoff. Four days so a Monday pre-market run still sees Friday's
+  close and the weekend's reporting.
+- `_fresh_entries()` **sorts newest-first before filtering** — feed order is not publication order,
+  so the old `entries[:n]` slice could return old items even from a healthy feed. Undated entries
+  are dropped, not trusted: an item whose age can't be established is the exact case this guard
+  exists to catch.
+- `fetch_market_news()` returns `(items, source_name, problems)`. Every item carries `published`
+  and `age_days`, and the prompt renders each headline as `• [today] …` / `• [2d ago] …` with the
+  source named, so the model can discount a stale story instead of being told it's current.
+- **When no feed has fresh news the prompt says so explicitly** rather than omitting the section,
+  and instructs the analysis not to infer a macro narrative or cite headlines it doesn't have — a
+  silently absent macro frame is one the model will invent. Both digests show the failure (a red
+  block in HTML, a `!! MARKET NEWS UNAVAILABLE` block in plain text) listing each feed's reason,
+  so the next dead feed is visible in the email on day one.
+- `fetch_ticker_news()` applies the same filter, since stale per-position headlines feed individual
+  hold/trim decisions. It previously captured no date at all.
+- `news.json` records the winning `source` and the `problems` list for post-hoc debugging.
+
 ## Same-Day Rerun Detection
 
 `build_prompt()` compares `prior_analysis['date']` to the current run's date and injects an explicit note: if 0 days have elapsed, the analysis is told this is a same-day rerun (e.g. manual testing) and not to describe any position's price action as new movement since the prior run; if 1+ days have elapsed, it's told a new trading session has genuinely occurred.
@@ -464,8 +497,8 @@ A second Claude call (Haiku model, 500 tokens) runs after the momentum scan and 
 4. Top Momentum Movers (table)
 5. Watchlist Updates (add/remove with reasons + linked source articles)
 6. Claude Analysis (markdown-rendered)
-7. Market News — Sherwood (linked headlines)
-8. Ticker News — Yahoo Finance per holding (linked headlines)
+7. Market News — name of the live source, dated headlines; a red warning block if no feed had fresh news
+8. Ticker News — Yahoo Finance per holding (linked, dated headlines)
 9. Abbreviations glossary (footer)
 
 ## Cron Schedule (weekdays 6am)
