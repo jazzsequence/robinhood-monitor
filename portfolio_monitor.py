@@ -5,6 +5,9 @@ Usage:
     python portfolio_monitor.py
 """
 
+import base64
+import email
+import imaplib
 import json
 import os
 import re
@@ -17,10 +20,13 @@ import smtplib
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
+from email.header import decode_header, make_header
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 import feedparser
+from html.parser import HTMLParser
+
 import pandas as pd
 import pytz
 import requests
@@ -137,7 +143,21 @@ CLAUDE_SYSTEM_PROMPT = (
     "Selling at a gain to redeploy into a better opportunity is the core mechanic. "
     "Selling at a loss requires clear justification: broken thesis, significant adverse news, "
     "or a technical breakdown with no credible recovery signal.\n\n"
-    "NEWS INTEGRATION: The market news section (Sherwood/Robinhood) appears at the top of the "
+    "NEWS SOURCE TRUST — the market news section at the top of the prompt is one of two kinds, "
+    "and it says which:\n"
+    "  (1) SNACKS (Robinhood/Sherwood's own daily newsletter) — the PREFERRED source. This is "
+    "editorial analysis from the brokerage this portfolio is held at, not a wire summary: it "
+    "carries a written takeaway, a chart of the day, and a next-session earnings calendar. Treat "
+    "its interpretation as the primary macro read and lean on it over your own framing. When it "
+    "names a reason the market moved, cite that reason. Quote or paraphrase its takeaway where it "
+    "bears on a position.\n"
+    "  (2) A FALLBACK WIRE FEED (CNBC, Yahoo Finance, MarketWatch) — used only when no recent "
+    "Snacks issue was available. These are raw headlines with no analysis attached, from outlets "
+    "this portfolio's owner explicitly trusts LESS. Use them for facts (what happened, to whom, "
+    "when) and do NOT treat a headline's framing or implied conclusion as analysis. Do not build "
+    "a confident macro thesis on them; say the macro read is thin when that is all you have.\n"
+    "Either way, do not invent a macro narrative that the section does not support.\n\n"
+    "NEWS INTEGRATION: The market news section appears at the top of the "
     "prompt — read it first and let it set the macro frame before evaluating individual positions. "
     "Ask: what sectors or themes are these headlines pointing to? Are any of those themes "
     "underrepresented in the current portfolio? That gap is a rotation candidate. "
@@ -1475,8 +1495,22 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
 
     sherwood = summary.get("sherwood_news", [])
     sherwood_lines = "\n".join(
-        f"  • {item['title'] if isinstance(item, dict) else item}" for item in sherwood
-    ) or "  (none)"
+        f"  • [{item.get('published', 'undated')}] {item['title']}"
+        if isinstance(item, dict) else f"  • {item}"
+        for item in sherwood
+    ) or (
+        f"  (no market news available within the last {NEWS_MAX_AGE_DAYS} days "
+        f"— judge on momentum data alone)"
+    )
+
+    newsletters = summary.get("newsletters") or []
+    nl_tickers = sorted({t for n in newsletters for t in n.get("tickers", [])})
+    if nl_tickers:
+        sherwood_lines += (
+            "\n  Tickers named in today's Sherwood newsletters ("
+            + ", ".join(n["name"] for n in newsletters)
+            + "): " + ", ".join(nl_tickers)
+        )
 
     ticker_news = summary.get("ticker_news", {})
     ticker_news_lines = ""
@@ -1541,7 +1575,7 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
         f"Tickers from Robinhood-provided watchlists (Cannabis, Software) with momentum "
         f"signals — add only if signals are strong and slots are available:\n"
         f"{_wl_lines(rh_wl)}\n\n"
-        f"Today's market news (Sherwood / Robinhood):\n"
+        f"Recent market news (published within {NEWS_MAX_AGE_DAYS} days):\n"
         f"{sherwood_lines}\n\n"
         f"Recent news for held positions (Yahoo Finance):\n"
         f"{ticker_news_lines}\n\n"
@@ -1636,9 +1670,388 @@ def apply_ticker_changes(
     return updated, added, removed
 
 
+# ── Snacks newsletter (Robinhood's own analysis) ──────────────────────────────
+# Preferred market-news source. Sherwood's website is gone, but the Snacks
+# newsletter it was folded into still arrives daily by email, and it carries
+# Robinhood's own written analysis ("THE TAKEAWAY") rather than a bare wire
+# headline — which is the whole reason to prefer it over a generic feed.
+# Sherwood newsletters to ingest, in priority order. Each is (name, sender).
+# Snacks is the daily market wrap; EntryPoint covers market insights and
+# technical signals. Note the differing domains — these are not interchangeable
+# and neither is guessable from the other.
+SHERWOOD_NEWSLETTERS = [
+    ("Snacks", "hello@snacks.robinhood.com"),
+    ("EntryPoint", "entrypoint@sherwoodmedia.com"),
+]
+NEWSLETTER_IMAP_HOST = "imap.gmail.com"
+# Searched in this order. "[Gmail]/All Mail" holds everything kept, including
+# ARCHIVED mail, which is why archiving is the recommended habit. Trash is
+# searched last as a safety net: a read-and-deleted issue is still the day's
+# analysis, but Gmail purges Trash after ~30 days so it is not a place to rely
+# on.
+NEWSLETTER_MAILBOXES = ('"[Gmail]/All Mail"', "INBOX", '"[Gmail]/Trash"')
+# Per-issue cap on what reaches the prompt.
+NEWSLETTER_MAX_CHARS = 5000
+# A real issue cleans to ~2KB; a welcome or confirmation email to a few hundred
+# characters. Below this it is not an issue.
+NEWSLETTER_MIN_CHARS = 400
+# Subscription-lifecycle mail arrives from the same address as the issues and
+# is often the NEWEST message from that sender, so picking "latest" alone
+# would hand the analysis a welcome email as the day's market news.
+NEWSLETTER_SKIP_SUBJECT = re.compile(
+    r"\b(welcome|thank(s| you) for subscribing|confirm|verify|"
+    r"subscription|unsubscrib|you'?re in|get started)\b",
+    re.IGNORECASE,
+)
+
+
+class _TextExtractor(HTMLParser):
+    """
+    Minimal HTML-to-text for newsletter bodies, stdlib only (no bs4 dependency).
+
+    Collects visible text with block-level breaks preserved, and records every
+    href separately so tickers can be recovered from link targets.
+    """
+
+    _BLOCK = {
+        "p", "div", "br", "tr", "td", "li", "ul", "ol", "table",
+        "h1", "h2", "h3", "h4", "h5", "h6", "section", "header", "footer",
+    }
+    _SKIP = {"script", "style", "head", "title"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.links: list[str] = []
+        self._skipping = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP:
+            self._skipping += 1
+        if tag == "a":
+            for key, value in attrs:
+                if key == "href" and value:
+                    self.links.append(value)
+        if tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP and self._skipping:
+            self._skipping -= 1
+        if tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skipping and data.strip():
+            self.parts.append(data)
+
+    def text(self) -> str:
+        return "".join(self.parts)
+
+
+def _html_to_text(html: str) -> tuple[str, list[str]]:
+    """Return (visible_text, hrefs) for an HTML body."""
+    parser = _TextExtractor()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception as e:
+        log.warning(f"HTML parse failed, falling back to tag stripping: {e}")
+        return re.sub(r"<[^>]+>", " ", html), []
+    return parser.text(), parser.links
+
+
+def _decode_tracking_url(url: str) -> str:
+    """
+    Recover the destination from a link.sherwood.news tracking URL.
+
+    These wrap the real target as a base64 path segment, so the ticker in
+    robinhood.com/stocks/<T> is invisible until decoded. Returns the input
+    unchanged when no segment decodes.
+    """
+    for segment in url.split("/"):
+        if len(segment) < 16 or not re.fullmatch(r"[A-Za-z0-9_\-]+", segment):
+            continue
+        try:
+            decoded = base64.urlsafe_b64decode(
+                segment + "=" * (-len(segment) % 4)
+            ).decode("utf-8")
+        except Exception:
+            continue
+        if decoded.startswith("http"):
+            return decoded
+    return url
+
+
+def _extract_tickers(links: list[str]) -> list[str]:
+    """
+    Tickers named in the issue, taken from its robinhood.com/stocks/<T> links.
+
+    Mechanical rather than linguistic: the newsletter links every company it
+    mentions to its Robinhood quote page, so this needs no entity extraction
+    and cannot hallucinate a symbol.
+    """
+    found = set()
+    for raw in links:
+        url = _decode_tracking_url(raw)
+        m = re.search(r"robinhood\.com/stocks/([A-Z][A-Z.\-]{0,9})(?:[/?#]|$)", url)
+        if m:
+            found.add(m.group(1))
+    return sorted(found)
+
+
+# Everything from here on is legal boilerplate, not market content.
+_SNACKS_CUTOFFS = (
+    "Sherwood Media, LLC produces",
+    "Sherwood Terms and Conditions",
+    "Craving more insights in your inbox?",
+)
+
+
+def _clean_newsletter_text(text: str) -> str:
+    """
+    Reduce a newsletter body to readable prose for the prompt.
+
+    Strips the empty table-cell scaffolding these emails are built from, drops
+    the legal footer, and collapses whitespace. The section structure (THE
+    TAKEAWAY, CHART OF THE DAY, the next-session calendar) is left intact and
+    deliberately NOT parsed into fields: Claude reads the issue directly, so
+    there are no brittle per-section regexes to break when the layout changes.
+    """
+    # Markdown-ish link remnants: "Microsoft[](http...)" -> "Microsoft"
+    text = re.sub(r"\[\]\((?:https?|mailto)[^)]*\)", "", text)
+    text = re.sub(r"<[^>]*>", "", text)
+
+    lines = []
+    seen = set()
+    for raw in text.splitlines():
+        line = raw.strip().strip("|").strip()
+        line = re.sub(r"[ \t]+", " ", line)
+        if not line or set(line) <= {"|", " ", "#", "-", "*", "\u00a0"}:
+            continue
+        # Photo credits ride along as their own block, e.g. "# (Kent
+        # Nishimura/Getty Images)" — pure noise in a text prompt.
+        if re.fullmatch(r"#*\s*\([^()]{0,80}\)", line):
+            continue
+        # The preheader repeats the lede verbatim one block later.
+        key = line.lstrip("#* ").strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(line)
+
+    cleaned = []
+    for line in lines:
+        if any(line.startswith(c) or line == c for c in _SNACKS_CUTOFFS):
+            break
+        cleaned.append(line)
+
+    out = "\n".join(cleaned)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    if len(out) > NEWSLETTER_MAX_CHARS:
+        out = out[:NEWSLETTER_MAX_CHARS].rsplit("\n", 1)[0] + "\n[... issue truncated]"
+    return out
+
+
+def _message_body(msg) -> str:
+    """Prefer a real text/plain part; fall back to converting text/html."""
+    plain, html = "", ""
+    for part in msg.walk() if msg.is_multipart() else [msg]:
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                continue
+            body = payload.decode(part.get_content_charset() or "utf-8", "replace")
+        except Exception:
+            continue
+        if ctype == "text/plain" and not plain:
+            plain = body
+        elif ctype == "text/html" and not html:
+            html = body
+
+    # A newsletter's text/plain part is often a stub ("view in browser"), so
+    # only trust it when it is substantial enough to be the real issue.
+    if len(plain.strip()) > 500:
+        return plain
+    if html:
+        text, links = _html_to_text(html)
+        _message_body.last_links = links  # type: ignore[attr-defined]
+        return text
+    return plain
+
+
+def _is_newsletter_issue(subject: str, text: str) -> tuple[bool, str]:
+    """
+    Whether a message is an actual issue rather than subscription-lifecycle mail.
+
+    Returns (is_issue, reason_if_not). Both checks matter: the subject pattern
+    catches welcome/confirmation mail by name, and the length floor catches
+    anything transactional that the pattern misses, since a real issue is an
+    order of magnitude longer than a signup receipt.
+    """
+    if NEWSLETTER_SKIP_SUBJECT.search(subject or ""):
+        return False, f"subscription email, not an issue ({subject!r})"
+    if len(text) < NEWSLETTER_MIN_CHARS:
+        return False, f"body too short to be an issue ({len(text)} chars)"
+    return True, ""
+
+
+def _decode_subject(msg) -> str:
+    try:
+        return str(make_header(decode_header(msg.get("Subject", "")))).strip()
+    except Exception:
+        return (msg.get("Subject") or "").strip()
+
+
+def _message_sent_at(msg) -> datetime | None:
+    try:
+        sent = email.utils.parsedate_to_datetime(msg.get("Date", ""))
+    except (TypeError, ValueError):
+        return None
+    if sent is None:
+        return None
+    return sent.replace(tzinfo=timezone.utc) if sent.tzinfo is None else sent
+
+
+def _newsletter_from_message(name: str, raw: bytes, sent: datetime,
+                             max_age_days: int) -> tuple[dict | None, str]:
+    """Parse one fetched message into an issue dict, or explain why not."""
+    msg = email.message_from_bytes(raw)
+    _message_body.last_links = []  # type: ignore[attr-defined]
+    body = _message_body(msg)
+    links = list(getattr(_message_body, "last_links", []) or [])
+    links += re.findall(r"https?://[^\s)\]<>\"]+", body)
+
+    text = _clean_newsletter_text(body)
+    subject = _decode_subject(msg)
+    is_issue, reason = _is_newsletter_issue(subject, text)
+    if not is_issue:
+        return None, reason
+
+    age_days = (datetime.now(timezone.utc) - sent).days
+    if age_days > max_age_days:
+        return None, (
+            f"newest issue is {age_days}d old ({sent.date().isoformat()}), "
+            f"outside the {max_age_days}d window"
+        )
+
+    return {
+        "name": name,
+        "date": sent.date().isoformat(),
+        "subject": subject,
+        "text": text,
+        "tickers": _extract_tickers(links),
+        "age_days": age_days,
+    }, ""
+
+
+def fetch_sherwood_newsletters(max_age_days: int | None = None) -> tuple[list[dict], list[str]]:
+    """
+    Return (issues, problems) for the configured Sherwood newsletters.
+
+    One issue per newsletter at most — the newest real issue inside the
+    freshness window — newest first. Uses the Gmail app password already
+    configured for sending, over IMAP, so no new credential is required.
+    Never raises: an unreachable mailbox or a newsletter with no recent issue
+    is reported in `problems` and the caller falls back to the wire feeds.
+    """
+    max_age_days = NEWS_MAX_AGE_DAYS if max_age_days is None else max_age_days
+    address = os.getenv("GMAIL_ADDRESS")
+    password = os.getenv("GMAIL_APP_PASSWORD")
+    if not address or not password:
+        return [], ["GMAIL_ADDRESS/GMAIL_APP_PASSWORD not set"]
+
+    since = (datetime.now(timezone.utc) - timedelta(days=max_age_days + 1)).strftime("%d-%b-%Y")
+    issues: list[dict] = []
+    problems: list[str] = []
+
+    try:
+        with imaplib.IMAP4_SSL(NEWSLETTER_IMAP_HOST) as imap:
+            imap.login(address, password)
+            for name, sender in SHERWOOD_NEWSLETTERS:
+                # Candidates are gathered across mailboxes first, then tried
+                # newest-first, so a welcome email sitting on top of a real
+                # issue is skipped rather than ending the search.
+                candidates: list[tuple[datetime, bytes]] = []
+                for mailbox in NEWSLETTER_MAILBOXES:
+                    try:
+                        status, _ = imap.select(mailbox, readonly=True)
+                        if status != "OK":
+                            continue
+                        status, data = imap.search(None, "FROM", f'"{sender}"', "SINCE", since)
+                        if status != "OK" or not data or not data[0]:
+                            continue
+                        for num in data[0].split()[-8:]:
+                            status, fetched = imap.fetch(num, "(RFC822)")
+                            if status != "OK" or not fetched or not fetched[0]:
+                                continue
+                            raw = fetched[0][1]
+                            if not isinstance(raw, bytes):
+                                continue
+                            sent = _message_sent_at(email.message_from_bytes(raw))
+                            if sent is not None:
+                                candidates.append((sent, raw))
+                    except Exception as e:
+                        log.warning(f"{name}: mailbox {mailbox} unusable: {e}")
+                        continue
+
+                if not candidates:
+                    problems.append(f"{name}: no email from {sender} since {since}")
+                    log.warning(f"{name}: no email from {sender} since {since}")
+                    continue
+
+                candidates.sort(key=lambda pair: pair[0], reverse=True)
+                seen_reasons = []
+                for sent, raw in candidates:
+                    issue, reason = _newsletter_from_message(name, raw, sent, max_age_days)
+                    if issue:
+                        issues.append(issue)
+                        log.info(
+                            f"{name}: using issue {issue['date']} ({issue['age_days']}d old) "
+                            f"\"{issue['subject']}\" — {len(issue['text'])} chars, "
+                            f"tickers: {issue['tickers'] or 'none'}"
+                        )
+                        break
+                    if reason and reason not in seen_reasons:
+                        seen_reasons.append(reason)
+                        log.info(f"{name}: skipped a message — {reason}")
+                else:
+                    detail = seen_reasons[0] if seen_reasons else "no usable issue"
+                    problems.append(f"{name}: {detail}")
+                    log.warning(f"{name}: no usable issue — {detail}")
+    except Exception as e:
+        log.warning(f"Newsletter IMAP fetch failed ({type(e).__name__}): {e}")
+        return [], [f"IMAP fetch failed ({type(e).__name__})"]
+
+    issues.sort(key=lambda i: i["date"], reverse=True)
+    return issues, problems
+
+
 # ── News ──────────────────────────────────────────────────────────────────────
 _RSS_HEADERS = {"User-Agent": "portfolio-monitor/1.0"}
 _RSS_TIMEOUT = 10  # seconds
+
+# Market-news feeds, tried in order until one yields articles inside the freshness
+# window. A feed that 404s, errors, OR has simply stopped being updated falls
+# through to the next. The fallthrough exists because a publication can die while
+# its feed keeps serving: Robinhood wound down the Sherwood News website around
+# mid-2026 and moved the reporting into newsletters and the Robinhood app, but
+# sherwood.news/rss.xml kept returning its final pre-shutdown articles. Nothing
+# errored, so the digest went on presenting summer headlines as "TODAY'S MARKET
+# NEWS" for months. Freshness is therefore validated, never assumed.
+MARKET_NEWS_FEEDS = [
+    ("Sherwood", "https://sherwood.news/rss.xml"),
+    ("CNBC Markets", "https://www.cnbc.com/id/20910258/device/rss/rss.html"),
+    ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
+    ("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
+]
+
+# Max age for a headline to count as current. 4 days so a Monday pre-market run
+# still sees Friday's close and the weekend's reporting.
+NEWS_MAX_AGE_DAYS = 4
 
 
 def _parse_feed(url: str) -> list:
@@ -1648,20 +2061,111 @@ def _parse_feed(url: str) -> list:
     return feedparser.parse(resp.text).entries
 
 
-def fetch_sherwood_news(n: int = 8) -> list[dict]:
-    """Return up to n recent articles from Sherwood Media with title, url, and published date."""
-    entries = _parse_feed("https://sherwood.news/rss.xml")
-    items = []
-    for e in entries[:n]:
-        title = e.get("title", "").strip()
-        if not title:
+def _entry_published(entry) -> datetime | None:
+    """
+    Timezone-aware publish time for a feedparser entry, or None if absent.
+
+    feedparser normalises the many RSS/Atom date spellings into a UTC struct_time
+    under published_parsed/updated_parsed, so prefer those over the raw strings.
+    """
+    for key in ("published_parsed", "updated_parsed"):
+        parsed = entry.get(key)
+        if parsed:
+            try:
+                return datetime(*parsed[:6], tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _fresh_entries(entries: list, max_age_days: int) -> tuple[list, int, int]:
+    """
+    Sort entries newest-first and keep only those published within max_age_days.
+
+    Returns (fresh, stale_count, undated_count). Feed order is not publication
+    order in practice, so sorting is required before any "most recent" claim.
+    Undated entries are dropped rather than trusted: an item whose age cannot be
+    established is exactly the case this guard exists to catch.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    dated, undated = [], 0
+    for e in entries:
+        published = _entry_published(e)
+        if published is None:
+            undated += 1
             continue
-        items.append({
-            "title": title,
-            "url": e.get("link", ""),
-            "published": e.get("published", ""),
-        })
-    return items
+        dated.append((published, e))
+
+    dated.sort(key=lambda pair: pair[0], reverse=True)
+    fresh = [(pub, e) for pub, e in dated if pub >= cutoff]
+    return fresh, len(dated) - len(fresh), undated
+
+
+def fetch_market_news(n: int = 8) -> tuple[list[dict], str, list[str]]:
+    """
+    Return (items, source_name, problems) for the first MARKET_NEWS_FEEDS entry
+    that yields articles inside the freshness window.
+
+    Each item carries title, url, published (display string) and age_days, so both
+    the prompt and the digest can show how old a headline is instead of implying
+    it is today's. `problems` records why each rejected feed was skipped, for the
+    log and for the digest's warning line — a silently empty news section is how
+    this went unnoticed for months.
+    """
+    problems = []
+
+    for source, url in MARKET_NEWS_FEEDS:
+        try:
+            entries = _parse_feed(url)
+        except Exception as e:
+            problems.append(f"{source}: fetch failed ({type(e).__name__})")
+            log.warning(f"Market news feed {source} ({url}) failed: {e}")
+            continue
+
+        if not entries:
+            problems.append(f"{source}: feed empty")
+            log.warning(f"Market news feed {source} returned no entries")
+            continue
+
+        fresh, stale, undated = _fresh_entries(entries, NEWS_MAX_AGE_DAYS)
+        if not fresh:
+            newest = max((p for p, _ in [(_entry_published(e), e) for e in entries] if p),
+                         default=None)
+            newest_str = newest.date().isoformat() if newest else "unknown"
+            problems.append(
+                f"{source}: no articles newer than {NEWS_MAX_AGE_DAYS}d "
+                f"(newest {newest_str}, {stale} stale, {undated} undated)"
+            )
+            log.warning(
+                f"Market news feed {source} is stale — newest article {newest_str}, "
+                f"nothing within {NEWS_MAX_AGE_DAYS} days; trying next feed"
+            )
+            continue
+
+        now = datetime.now(timezone.utc)
+        items = []
+        for published, e in fresh[:n]:
+            title = e.get("title", "").strip()
+            if not title:
+                continue
+            items.append({
+                "title": title,
+                "url": e.get("link", ""),
+                "published": published.strftime("%Y-%m-%d"),
+                "age_days": (now - published).days,
+            })
+
+        if not items:
+            problems.append(f"{source}: fresh entries had no titles")
+            continue
+
+        if stale or undated:
+            log.info(f"Market news from {source}: dropped {stale} stale, {undated} undated")
+        log.info(f"Market news source: {source} ({len(items)} fresh articles)")
+        return items, source, problems
+
+    log.error(f"No market news feed returned fresh articles: {'; '.join(problems)}")
+    return [], "", problems
 
 
 def fetch_ticker_news(symbols: list[str], n: int = 3) -> dict[str, list[dict]]:
@@ -1675,12 +2179,22 @@ def fetch_ticker_news(symbols: list[str], n: int = 3) -> dict[str, list[dict]]:
             f"?s={symbol}&region=US&lang=en-US"
         )
         entries = _parse_feed(url)
+        # Same freshness contract as market news: a per-ticker feed that stops
+        # updating would otherwise keep feeding months-old headlines into
+        # individual hold/trim decisions.
+        fresh, _stale, _undated = _fresh_entries(entries, NEWS_MAX_AGE_DAYS)
+        now = datetime.now(timezone.utc)
         items = []
-        for e in entries[:n]:
+        for published, e in fresh[:n]:
             title = e.get("title", "").strip()
             if not title:
                 continue
-            items.append({"title": title, "url": e.get("link", "")})
+            items.append({
+                "title": title,
+                "url": e.get("link", ""),
+                "published": published.strftime("%Y-%m-%d"),
+                "age_days": (now - published).days,
+            })
         return symbol, items
 
     results = {}
@@ -1698,10 +2212,28 @@ def fetch_ticker_news(symbols: list[str], n: int = 3) -> dict[str, list[dict]]:
     return results
 
 
-def save_news_cache(date_str: str, sherwood: list[dict], ticker_news: dict[str, list[dict]]):
+def save_news_cache(
+    date_str: str,
+    sherwood: list[dict],
+    ticker_news: dict[str, list[dict]],
+    source: str = "",
+    problems: list[str] | None = None,
+    newsletters: list[dict] | None = None,
+):
     """Persist today's fetched news to NEWS_FILE for email link rendering."""
     with open(NEWS_FILE, "w") as f:
-        json.dump({"date": date_str, "sherwood": sherwood, "ticker_news": ticker_news}, f, indent=2)
+        json.dump(
+            {
+                "date": date_str,
+                "source": source,
+                "problems": problems or [],
+                "newsletters": newsletters or [],
+                "sherwood": sherwood,
+                "ticker_news": ticker_news,
+            },
+            f,
+            indent=2,
+        )
 
 
 def _read_analysis_file(path: str) -> tuple[dict, float] | None:
@@ -2195,13 +2727,84 @@ def build_prompt(summary: dict) -> str:
             "against today's date before treating a move as new."
         )
 
+    newsletters = summary.get("newsletters") or []
+    if newsletters:
+        names = ", ".join(n["name"] for n in newsletters)
+        lines += [
+            "",
+            f"=== TODAY'S MARKET NEWS — SHERWOOD NEWSLETTERS ({names}) ===",
+            "PREFERRED SOURCE (see NEWS SOURCE TRUST): Robinhood/Sherwood's own newsletters, "
+            "reproduced below as sent. These carry their written analysis — and, in Snacks, "
+            "the next session's earnings calendar. Let them set the macro frame and cite their "
+            "reasoning where it bears on a position.",
+        ]
+        for n in newsletters:
+            when = (
+                "today" if n["age_days"] == 0
+                else "yesterday" if n["age_days"] == 1
+                else f"{n['age_days']} days ago"
+            )
+            lines += [
+                "",
+                f"--- {n['name']} — {n['date']} ({when}) — \"{n['subject']}\" ---",
+                n["text"],
+            ]
+        all_tickers = sorted({t for n in newsletters for t in n["tickers"]})
+        if all_tickers:
+            lines += [
+                "",
+                "Tickers named across today's issues (taken from their own quote links, "
+                "not inferred): " + ", ".join(all_tickers),
+            ]
+
     sherwood = summary.get("sherwood_news", [])
-    if sherwood:
-        lines += ["", "=== TODAY'S MARKET NEWS (Sherwood / Robinhood) ===",
-                  "Use these headlines to identify macro themes, sector trends, and rotation "
-                  "opportunities. Ask what they imply for positions not yet in this portfolio."]
+    news_source = summary.get("news_source", "")
+    if newsletters:
+        pass  # Newsletters rendered above; skip the fallback feed section entirely.
+    elif sherwood:
+        source_label = f" — source: {news_source}" if news_source else ""
+        lines += ["", f"=== RECENT MARKET NEWS{source_label} ===",
+                  "FALLBACK WIRE FEED (see NEWS SOURCE TRUST) — no recent Snacks issue was "
+                  "available, so these are bare headlines from a less-trusted outlet. Use them "
+                  "for facts, not for their framing, and keep the macro read tentative.",
+                  f"Every headline below was published within the last {NEWS_MAX_AGE_DAYS} days "
+                  "and is dated. Use them to identify macro themes, sector trends, and rotation "
+                  "opportunities, and ask what they imply for positions not yet in this "
+                  "portfolio. Weight a headline by its date — a 3-day-old story may already be "
+                  "priced in."]
         for item in sherwood:
-            lines.append(f"• {item['title'] if isinstance(item, dict) else item}")
+            if not isinstance(item, dict):
+                lines.append(f"• {item}")
+                continue
+            age = item.get("age_days")
+            if age == 0:
+                when = "today"
+            elif age == 1:
+                when = "yesterday"
+            elif age is not None:
+                when = f"{age}d ago"
+            else:
+                when = item.get("published", "undated")
+            lines.append(f"• [{when}] {item['title']}")
+    else:
+        # Say this out loud rather than omitting the section. A missing macro
+        # frame that the model cannot see is a missing macro frame it will
+        # invent, or silently substitute stale recollection for.
+        problems = summary.get("news_problems") or []
+        newsletter_problems = summary.get("newsletter_problems") or []
+        if newsletter_problems:
+            problems = [f"Sherwood {np}" for np in newsletter_problems] + list(problems)
+        detail = f" ({'; '.join(problems)})" if problems else ""
+        lines += [
+            "",
+            "=== RECENT MARKET NEWS — NONE AVAILABLE ===",
+            f"No market-news feed returned an article published within the last "
+            f"{NEWS_MAX_AGE_DAYS} days{detail}. You therefore have NO macro news for "
+            "today. Do not infer or assert a macro narrative, sector rotation theme, "
+            "or market driver from anything other than the price and indicator data "
+            "below, and do not cite headlines — you have none. Say plainly in the "
+            "analysis that today's macro read is based on price action alone.",
+        ]
 
     lines += breadth_prompt_lines(summary.get("breadth_history") or [])
 
@@ -2567,6 +3170,26 @@ def format_digest(summary: dict, analysis: str) -> str:
         f"Total Value: ${summary['total_value']:.2f}  |  Cash: {cash_str}",
         SEP,
     ]
+
+    newsletters = summary.get("newsletters") or []
+    if newsletters:
+        lines += ["", "MARKET NEWS — SHERWOOD NEWSLETTERS", sep]
+        for n in newsletters:
+            lines.append(f"{n['name']} ({n['date']}): {n['subject']}")
+        all_tickers = sorted({t for n in newsletters for t in n["tickers"]})
+        if all_tickers:
+            lines.append(f"Tickers named: {', '.join(all_tickers)}")
+
+    news_problems = summary.get("news_problems") or []
+    if not newsletters and not summary.get("sherwood_news") and news_problems:
+        lines += [
+            "",
+            "!! MARKET NEWS UNAVAILABLE",
+            sep,
+            f"No feed returned an article newer than {NEWS_MAX_AGE_DAYS} days. "
+            "Today's analysis had no macro news to work from:",
+        ]
+        lines += [f"  - {p}" for p in news_problems]
 
     pending_orders = summary.get("pending_orders", [])
     if pending_orders:
@@ -3025,9 +3648,40 @@ def format_digest_html(summary: dict, analysis: str) -> str:
                             )
                 watchlist_content += "</div>"
 
-    # ── Sherwood news ─────────────────────────────────────────────────────────
+    # ── Market news ───────────────────────────────────────────────────────────
+    news_source = summary.get("news_source", "")
+    newsletters = summary.get("newsletters") or []
     sherwood_items = summary.get("sherwood_news", [])
-    if sherwood_items:
+    if newsletters:
+        blocks = []
+        for n in newsletters:
+            when = (
+                "today" if n["age_days"] == 0
+                else "yesterday" if n["age_days"] == 1
+                else f"{n['age_days']}d ago"
+            )
+            body_html = "".join(
+                f'<p style="margin:0 0 8px;font-size:13px;line-height:1.6;'
+                f'color:#334155;">{_h(ln)}</p>'
+                for ln in n["text"].splitlines() if ln.strip()
+            )
+            blocks.append(
+                '<div style="background:#f0fdf4;border-left:4px solid #16a34a;'
+                'padding:12px 16px;border-radius:0 4px 4px 0;margin:0 0 12px;">'
+                '<p style="margin:0;font-size:12px;font-weight:700;color:#166534;">'
+                f'{_h(n["name"])} — {_h(n["date"])} ({_h(when)})</p>'
+                '<p style="margin:4px 0 0;font-size:13px;color:#166534;">'
+                f'{_h(n["subject"])}</p></div>'
+                f'{body_html}'
+            )
+        all_tickers = sorted({t for n in newsletters for t in n["tickers"]})
+        tickers_html = (
+            '<p style="margin:10px 0 0;font-size:12px;color:#475569;">'
+            f'<strong>Tickers named:</strong> {_h(", ".join(all_tickers))}</p>'
+            if all_tickers else ""
+        )
+        sherwood_content = "".join(blocks) + tickers_html
+    elif sherwood_items:
         sherwood_content = ""
         for item in sherwood_items:
             url = item.get("url", "") if isinstance(item, dict) else ""
@@ -3047,7 +3701,29 @@ def format_digest_html(summary: dict, analysis: str) -> str:
                     f'font-size:13px;color:#0f172a;">{title}{pub_str}</div>'
                 )
     else:
-        sherwood_content = '<p style="color:#6b7280;font-size:13px;margin:0;">No news fetched.</p>'
+        problems = list(summary.get("news_problems") or [])
+        nl_problems = summary.get("newsletter_problems") or []
+        if nl_problems:
+            problems = [f"Sherwood {np}" for np in nl_problems] + problems
+        detail = (
+            "".join(
+                f'<li style="margin:2px 0;">{_h(p)}</li>' for p in problems
+            )
+            if problems else ""
+        )
+        sherwood_content = (
+            '<div style="background:#fef2f2;border-left:4px solid #dc2626;'
+            'padding:12px 16px;border-radius:0 4px 4px 0;">'
+            '<p style="margin:0 0 6px;font-size:13px;font-weight:700;color:#991b1b;">'
+            f'No market news newer than {NEWS_MAX_AGE_DAYS} days</p>'
+            '<p style="margin:0;font-size:12px;color:#7f1d1d;line-height:1.5;">'
+            "Today's analysis ran without any macro news. A feed that has stopped "
+            "publishing still serves its final articles, so this is checked rather "
+            "than assumed.</p>"
+            + (f'<ul style="margin:6px 0 0;padding-left:18px;font-size:12px;'
+               f'color:#7f1d1d;">{detail}</ul>' if detail else "")
+            + "</div>"
+        )
 
     # ── Per-ticker news ───────────────────────────────────────────────────────
     all_ticker_news = summary.get("ticker_news", {})
@@ -3214,7 +3890,10 @@ def format_digest_html(summary: dict, analysis: str) -> str:
             "Claude Analysis",
             f'<div style="font-size:14px;line-height:1.7;color:#1e293b;">{analysis_html}</div>',
         )
-        + _section("Market News (Sherwood)", sherwood_content)
+        + _section(
+            f"Market News{f' — {news_source}' if news_source else ''}",
+            sherwood_content,
+        )
         + _section("Ticker News", ticker_news_content)
     )
 
@@ -3629,11 +4308,32 @@ def main():
 
     # 8. Fetch market and ticker news
     try:
-        log.info("Fetching Sherwood news")
-        summary["sherwood_news"] = fetch_sherwood_news()
+        log.info("Fetching Sherwood newsletters (preferred market-news source)")
+        summary["newsletters"], summary["newsletter_problems"] = fetch_sherwood_newsletters()
     except Exception as e:
-        log.warning(f"Sherwood news fetch failed: {e}")
+        log.warning(f"Newsletter fetch failed: {e}")
+        summary["newsletters"], summary["newsletter_problems"] = [], [
+            f"fetch raised {type(e).__name__}: {e}"
+        ]
+
+    if summary["newsletters"]:
+        # These carry Robinhood's own analysis, so the wire feeds are not
+        # fetched at all when one is available — they exist only as a fallback.
         summary["sherwood_news"] = []
+        summary["news_source"] = " + ".join(n["name"] for n in summary["newsletters"])
+        summary["news_problems"] = []
+    else:
+        try:
+            log.info("No Sherwood newsletter available — falling back to wire feeds")
+            news_items, news_source, news_problems = fetch_market_news()
+            summary["sherwood_news"] = news_items
+            summary["news_source"] = news_source
+            summary["news_problems"] = news_problems
+        except Exception as e:
+            log.warning(f"Market news fetch failed: {e}")
+            summary["sherwood_news"] = []
+            summary["news_source"] = ""
+            summary["news_problems"] = [f"fetch raised {type(e).__name__}: {e}"]
 
     try:
         log.info(f"Fetching ticker news for {sorted(portfolio_symbols)}")
@@ -3643,7 +4343,14 @@ def main():
         summary["ticker_news"] = {}
 
     try:
-        save_news_cache(today, summary["sherwood_news"], summary["ticker_news"])
+        save_news_cache(
+            today,
+            summary["sherwood_news"],
+            summary["ticker_news"],
+            source=summary.get("news_source", ""),
+            problems=summary.get("news_problems"),
+            newsletters=summary.get("newsletters"),
+        )
         log.info(f"News cache saved to {NEWS_FILE}")
     except Exception as e:
         log.warning(f"Failed to save news cache: {e}")
