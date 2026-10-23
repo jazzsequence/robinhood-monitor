@@ -1503,11 +1503,13 @@ def get_ticker_recommendations(summary: dict, screener_tickers: list[str]) -> di
         f"— judge on momentum data alone)"
     )
 
-    snacks = summary.get("snacks")
-    if snacks and snacks.get("tickers"):
+    newsletters = summary.get("newsletters") or []
+    nl_tickers = sorted({t for n in newsletters for t in n.get("tickers", [])})
+    if nl_tickers:
         sherwood_lines += (
-            f"\n  Tickers named in today's Snacks issue ({snacks['date']}): "
-            + ", ".join(snacks["tickers"])
+            "\n  Tickers named in today's Sherwood newsletters ("
+            + ", ".join(n["name"] for n in newsletters)
+            + "): " + ", ".join(nl_tickers)
         )
 
     ticker_news = summary.get("ticker_news", {})
@@ -1673,15 +1675,34 @@ def apply_ticker_changes(
 # newsletter it was folded into still arrives daily by email, and it carries
 # Robinhood's own written analysis ("THE TAKEAWAY") rather than a bare wire
 # headline — which is the whole reason to prefer it over a generic feed.
-SNACKS_SENDER = "hello@snacks.robinhood.com"
-SNACKS_IMAP_HOST = "imap.gmail.com"
-# Searched in this order. Gmail's "All Mail" deliberately EXCLUDES Trash, so
-# Trash is listed explicitly: these issues are often read and deleted well
-# before the 6am run, and a deleted issue is still the day's analysis.
-SNACKS_MAILBOXES = ('"[Gmail]/All Mail"', "INBOX", '"[Gmail]/Trash"')
-# Cap what reaches the prompt. A full issue is ~70KB of HTML; the cleaned prose
-# is a few KB, and this bounds a pathological one.
-SNACKS_MAX_CHARS = 6000
+# Sherwood newsletters to ingest, in priority order. Each is (name, sender).
+# Snacks is the daily market wrap; EntryPoint covers market insights and
+# technical signals. Note the differing domains — these are not interchangeable
+# and neither is guessable from the other.
+SHERWOOD_NEWSLETTERS = [
+    ("Snacks", "hello@snacks.robinhood.com"),
+    ("EntryPoint", "entrypoint@sherwoodmedia.com"),
+]
+NEWSLETTER_IMAP_HOST = "imap.gmail.com"
+# Searched in this order. "[Gmail]/All Mail" holds everything kept, including
+# ARCHIVED mail, which is why archiving is the recommended habit. Trash is
+# searched last as a safety net: a read-and-deleted issue is still the day's
+# analysis, but Gmail purges Trash after ~30 days so it is not a place to rely
+# on.
+NEWSLETTER_MAILBOXES = ('"[Gmail]/All Mail"', "INBOX", '"[Gmail]/Trash"')
+# Per-issue cap on what reaches the prompt.
+NEWSLETTER_MAX_CHARS = 5000
+# A real issue cleans to ~2KB; a welcome or confirmation email to a few hundred
+# characters. Below this it is not an issue.
+NEWSLETTER_MIN_CHARS = 400
+# Subscription-lifecycle mail arrives from the same address as the issues and
+# is often the NEWEST message from that sender, so picking "latest" alone
+# would hand the analysis a welcome email as the day's market news.
+NEWSLETTER_SKIP_SUBJECT = re.compile(
+    r"\b(welcome|thank(s| you) for subscribing|confirm|verify|"
+    r"subscription|unsubscrib|you'?re in|get started)\b",
+    re.IGNORECASE,
+)
 
 
 class _TextExtractor(HTMLParser):
@@ -1827,8 +1848,8 @@ def _clean_newsletter_text(text: str) -> str:
 
     out = "\n".join(cleaned)
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
-    if len(out) > SNACKS_MAX_CHARS:
-        out = out[:SNACKS_MAX_CHARS].rsplit("\n", 1)[0] + "\n[... issue truncated]"
+    if len(out) > NEWSLETTER_MAX_CHARS:
+        out = out[:NEWSLETTER_MAX_CHARS].rsplit("\n", 1)[0] + "\n[... issue truncated]"
     return out
 
 
@@ -1862,106 +1883,151 @@ def _message_body(msg) -> str:
     return plain
 
 
-def fetch_snacks_newsletter(max_age_days: int | None = None) -> dict | None:
+def _is_newsletter_issue(subject: str, text: str) -> tuple[bool, str]:
     """
-    Return the most recent Snacks issue as
-    {date, subject, text, tickers, age_days}, or None.
+    Whether a message is an actual issue rather than subscription-lifecycle mail.
 
-    Uses the Gmail app password already configured for sending, over IMAP, so
-    no new credential is required. Returns None (never raises) when the mailbox
-    is unreachable, nothing is configured, or the newest issue is too old —
-    callers fall back to the RSS feeds.
+    Returns (is_issue, reason_if_not). Both checks matter: the subject pattern
+    catches welcome/confirmation mail by name, and the length floor catches
+    anything transactional that the pattern misses, since a real issue is an
+    order of magnitude longer than a signup receipt.
+    """
+    if NEWSLETTER_SKIP_SUBJECT.search(subject or ""):
+        return False, f"subscription email, not an issue ({subject!r})"
+    if len(text) < NEWSLETTER_MIN_CHARS:
+        return False, f"body too short to be an issue ({len(text)} chars)"
+    return True, ""
+
+
+def _decode_subject(msg) -> str:
+    try:
+        return str(make_header(decode_header(msg.get("Subject", "")))).strip()
+    except Exception:
+        return (msg.get("Subject") or "").strip()
+
+
+def _message_sent_at(msg) -> datetime | None:
+    try:
+        sent = email.utils.parsedate_to_datetime(msg.get("Date", ""))
+    except (TypeError, ValueError):
+        return None
+    if sent is None:
+        return None
+    return sent.replace(tzinfo=timezone.utc) if sent.tzinfo is None else sent
+
+
+def _newsletter_from_message(name: str, raw: bytes, sent: datetime,
+                             max_age_days: int) -> tuple[dict | None, str]:
+    """Parse one fetched message into an issue dict, or explain why not."""
+    msg = email.message_from_bytes(raw)
+    _message_body.last_links = []  # type: ignore[attr-defined]
+    body = _message_body(msg)
+    links = list(getattr(_message_body, "last_links", []) or [])
+    links += re.findall(r"https?://[^\s)\]<>\"]+", body)
+
+    text = _clean_newsletter_text(body)
+    subject = _decode_subject(msg)
+    is_issue, reason = _is_newsletter_issue(subject, text)
+    if not is_issue:
+        return None, reason
+
+    age_days = (datetime.now(timezone.utc) - sent).days
+    if age_days > max_age_days:
+        return None, (
+            f"newest issue is {age_days}d old ({sent.date().isoformat()}), "
+            f"outside the {max_age_days}d window"
+        )
+
+    return {
+        "name": name,
+        "date": sent.date().isoformat(),
+        "subject": subject,
+        "text": text,
+        "tickers": _extract_tickers(links),
+        "age_days": age_days,
+    }, ""
+
+
+def fetch_sherwood_newsletters(max_age_days: int | None = None) -> tuple[list[dict], list[str]]:
+    """
+    Return (issues, problems) for the configured Sherwood newsletters.
+
+    One issue per newsletter at most — the newest real issue inside the
+    freshness window — newest first. Uses the Gmail app password already
+    configured for sending, over IMAP, so no new credential is required.
+    Never raises: an unreachable mailbox or a newsletter with no recent issue
+    is reported in `problems` and the caller falls back to the wire feeds.
     """
     max_age_days = NEWS_MAX_AGE_DAYS if max_age_days is None else max_age_days
     address = os.getenv("GMAIL_ADDRESS")
     password = os.getenv("GMAIL_APP_PASSWORD")
     if not address or not password:
-        log.info("Snacks: GMAIL_ADDRESS/GMAIL_APP_PASSWORD not set, skipping")
-        return None
+        return [], ["GMAIL_ADDRESS/GMAIL_APP_PASSWORD not set"]
 
     since = (datetime.now(timezone.utc) - timedelta(days=max_age_days + 1)).strftime("%d-%b-%Y")
-    best: tuple[datetime, bytes] | None = None
+    issues: list[dict] = []
+    problems: list[str] = []
 
     try:
-        with imaplib.IMAP4_SSL(SNACKS_IMAP_HOST) as imap:
+        with imaplib.IMAP4_SSL(NEWSLETTER_IMAP_HOST) as imap:
             imap.login(address, password)
-            for mailbox in SNACKS_MAILBOXES:
-                try:
-                    status, _ = imap.select(mailbox, readonly=True)
-                    if status != "OK":
+            for name, sender in SHERWOOD_NEWSLETTERS:
+                # Candidates are gathered across mailboxes first, then tried
+                # newest-first, so a welcome email sitting on top of a real
+                # issue is skipped rather than ending the search.
+                candidates: list[tuple[datetime, bytes]] = []
+                for mailbox in NEWSLETTER_MAILBOXES:
+                    try:
+                        status, _ = imap.select(mailbox, readonly=True)
+                        if status != "OK":
+                            continue
+                        status, data = imap.search(None, "FROM", f'"{sender}"', "SINCE", since)
+                        if status != "OK" or not data or not data[0]:
+                            continue
+                        for num in data[0].split()[-8:]:
+                            status, fetched = imap.fetch(num, "(RFC822)")
+                            if status != "OK" or not fetched or not fetched[0]:
+                                continue
+                            raw = fetched[0][1]
+                            if not isinstance(raw, bytes):
+                                continue
+                            sent = _message_sent_at(email.message_from_bytes(raw))
+                            if sent is not None:
+                                candidates.append((sent, raw))
+                    except Exception as e:
+                        log.warning(f"{name}: mailbox {mailbox} unusable: {e}")
                         continue
-                    status, data = imap.search(
-                        None, "FROM", f'"{SNACKS_SENDER}"', "SINCE", since
-                    )
-                    if status != "OK" or not data or not data[0]:
-                        continue
-                    for num in data[0].split()[-5:]:
-                        status, fetched = imap.fetch(num, "(RFC822)")
-                        if status != "OK" or not fetched or not fetched[0]:
-                            continue
-                        raw = fetched[0][1]
-                        if not isinstance(raw, bytes):
-                            continue
-                        msg = email.message_from_bytes(raw)
-                        try:
-                            sent = email.utils.parsedate_to_datetime(msg.get("Date", ""))
-                        except (TypeError, ValueError):
-                            continue
-                        if sent is None:
-                            continue
-                        if sent.tzinfo is None:
-                            sent = sent.replace(tzinfo=timezone.utc)
-                        if best is None or sent > best[0]:
-                            best = (sent, raw)
-                except Exception as e:
-                    log.warning(f"Snacks: mailbox {mailbox} unusable: {e}")
+
+                if not candidates:
+                    problems.append(f"{name}: no email from {sender} since {since}")
+                    log.warning(f"{name}: no email from {sender} since {since}")
                     continue
+
+                candidates.sort(key=lambda pair: pair[0], reverse=True)
+                seen_reasons = []
+                for sent, raw in candidates:
+                    issue, reason = _newsletter_from_message(name, raw, sent, max_age_days)
+                    if issue:
+                        issues.append(issue)
+                        log.info(
+                            f"{name}: using issue {issue['date']} ({issue['age_days']}d old) "
+                            f"\"{issue['subject']}\" — {len(issue['text'])} chars, "
+                            f"tickers: {issue['tickers'] or 'none'}"
+                        )
+                        break
+                    if reason and reason not in seen_reasons:
+                        seen_reasons.append(reason)
+                        log.info(f"{name}: skipped a message — {reason}")
+                else:
+                    detail = seen_reasons[0] if seen_reasons else "no usable issue"
+                    problems.append(f"{name}: {detail}")
+                    log.warning(f"{name}: no usable issue — {detail}")
     except Exception as e:
-        log.warning(f"Snacks: IMAP fetch failed ({type(e).__name__}): {e}")
-        return None
+        log.warning(f"Newsletter IMAP fetch failed ({type(e).__name__}): {e}")
+        return [], [f"IMAP fetch failed ({type(e).__name__})"]
 
-    if best is None:
-        log.warning(f"Snacks: no issue from {SNACKS_SENDER} since {since}")
-        return None
-
-    sent, raw = best
-    age_days = (datetime.now(timezone.utc) - sent).days
-    if age_days > max_age_days:
-        log.warning(
-            f"Snacks: newest issue is {age_days}d old ({sent.date().isoformat()}), "
-            f"older than the {max_age_days}d window — falling back to feeds"
-        )
-        return None
-
-    msg = email.message_from_bytes(raw)
-    _message_body.last_links = []  # type: ignore[attr-defined]
-    body = _message_body(msg)
-    links = list(getattr(_message_body, "last_links", []) or [])
-    # A text/plain body keeps its URLs inline rather than in parsed hrefs.
-    links += re.findall(r"https?://[^\s)\]<>\"]+", body)
-
-    text = _clean_newsletter_text(body)
-    if not text:
-        log.warning("Snacks: issue body produced no usable text")
-        return None
-
-    try:
-        subject = str(make_header(decode_header(msg.get("Subject", "")))).strip()
-    except Exception:
-        subject = (msg.get("Subject") or "").strip()
-
-    tickers = _extract_tickers(links)
-    log.info(
-        f"Snacks: using issue {sent.date().isoformat()} ({age_days}d old) "
-        f"\"{subject}\" — {len(text)} chars, tickers: {tickers or 'none'}"
-    )
-    return {
-        "date": sent.date().isoformat(),
-        "subject": subject,
-        "text": text,
-        "tickers": tickers,
-        "age_days": age_days,
-    }
+    issues.sort(key=lambda i: i["date"], reverse=True)
+    return issues, problems
 
 
 # ── News ──────────────────────────────────────────────────────────────────────
@@ -2152,7 +2218,7 @@ def save_news_cache(
     ticker_news: dict[str, list[dict]],
     source: str = "",
     problems: list[str] | None = None,
-    snacks: dict | None = None,
+    newsletters: list[dict] | None = None,
 ):
     """Persist today's fetched news to NEWS_FILE for email link rendering."""
     with open(NEWS_FILE, "w") as f:
@@ -2161,7 +2227,7 @@ def save_news_cache(
                 "date": date_str,
                 "source": source,
                 "problems": problems or [],
-                "snacks": snacks,
+                "newsletters": newsletters or [],
                 "sherwood": sherwood,
                 "ticker_news": ticker_news,
             },
@@ -2661,34 +2727,40 @@ def build_prompt(summary: dict) -> str:
             "against today's date before treating a move as new."
         )
 
-    snacks = summary.get("snacks")
-    if snacks:
-        when = (
-            "today" if snacks["age_days"] == 0
-            else "yesterday" if snacks["age_days"] == 1
-            else f"{snacks['age_days']} days ago"
-        )
+    newsletters = summary.get("newsletters") or []
+    if newsletters:
+        names = ", ".join(n["name"] for n in newsletters)
         lines += [
             "",
-            f"=== TODAY'S MARKET NEWS — SNACKS, {snacks['date']} ({when}) ===",
-            "PREFERRED SOURCE (see NEWS SOURCE TRUST): Robinhood/Sherwood's own daily "
-            f"newsletter, \"{snacks['subject']}\", reproduced below as sent. It includes "
-            "their written takeaway and, at the end, the next session's earnings calendar. "
-            "Let this set the macro frame and cite its reasoning where it bears on a position.",
-            "",
-            snacks["text"],
+            f"=== TODAY'S MARKET NEWS — SHERWOOD NEWSLETTERS ({names}) ===",
+            "PREFERRED SOURCE (see NEWS SOURCE TRUST): Robinhood/Sherwood's own newsletters, "
+            "reproduced below as sent. These carry their written analysis — and, in Snacks, "
+            "the next session's earnings calendar. Let them set the macro frame and cite their "
+            "reasoning where it bears on a position.",
         ]
-        if snacks["tickers"]:
+        for n in newsletters:
+            when = (
+                "today" if n["age_days"] == 0
+                else "yesterday" if n["age_days"] == 1
+                else f"{n['age_days']} days ago"
+            )
             lines += [
                 "",
-                "Tickers named in today's issue (taken from its own quote links, not inferred): "
-                + ", ".join(snacks["tickers"]),
+                f"--- {n['name']} — {n['date']} ({when}) — \"{n['subject']}\" ---",
+                n["text"],
+            ]
+        all_tickers = sorted({t for n in newsletters for t in n["tickers"]})
+        if all_tickers:
+            lines += [
+                "",
+                "Tickers named across today's issues (taken from their own quote links, "
+                "not inferred): " + ", ".join(all_tickers),
             ]
 
     sherwood = summary.get("sherwood_news", [])
     news_source = summary.get("news_source", "")
-    if snacks:
-        pass  # Snacks rendered above; skip the fallback feed section entirely.
+    if newsletters:
+        pass  # Newsletters rendered above; skip the fallback feed section entirely.
     elif sherwood:
         source_label = f" — source: {news_source}" if news_source else ""
         lines += ["", f"=== RECENT MARKET NEWS{source_label} ===",
@@ -2719,9 +2791,9 @@ def build_prompt(summary: dict) -> str:
         # frame that the model cannot see is a missing macro frame it will
         # invent, or silently substitute stale recollection for.
         problems = summary.get("news_problems") or []
-        snacks_problem = summary.get("snacks_problem")
-        if snacks_problem:
-            problems = [f"Snacks newsletter: {snacks_problem}"] + list(problems)
+        newsletter_problems = summary.get("newsletter_problems") or []
+        if newsletter_problems:
+            problems = [f"Sherwood {np}" for np in newsletter_problems] + list(problems)
         detail = f" ({'; '.join(problems)})" if problems else ""
         lines += [
             "",
@@ -3099,19 +3171,17 @@ def format_digest(summary: dict, analysis: str) -> str:
         SEP,
     ]
 
-    snacks = summary.get("snacks")
-    if snacks:
-        lines += [
-            "",
-            f"MARKET NEWS — SNACKS ({snacks['date']})",
-            sep,
-            snacks["subject"],
-        ]
-        if snacks["tickers"]:
-            lines.append(f"Tickers named: {', '.join(snacks['tickers'])}")
+    newsletters = summary.get("newsletters") or []
+    if newsletters:
+        lines += ["", "MARKET NEWS — SHERWOOD NEWSLETTERS", sep]
+        for n in newsletters:
+            lines.append(f"{n['name']} ({n['date']}): {n['subject']}")
+        all_tickers = sorted({t for n in newsletters for t in n["tickers"]})
+        if all_tickers:
+            lines.append(f"Tickers named: {', '.join(all_tickers)}")
 
     news_problems = summary.get("news_problems") or []
-    if not snacks and not summary.get("sherwood_news") and news_problems:
+    if not newsletters and not summary.get("sherwood_news") and news_problems:
         lines += [
             "",
             "!! MARKET NEWS UNAVAILABLE",
@@ -3580,32 +3650,37 @@ def format_digest_html(summary: dict, analysis: str) -> str:
 
     # ── Market news ───────────────────────────────────────────────────────────
     news_source = summary.get("news_source", "")
-    snacks = summary.get("snacks")
+    newsletters = summary.get("newsletters") or []
     sherwood_items = summary.get("sherwood_news", [])
-    if snacks:
-        when = (
-            "today" if snacks["age_days"] == 0
-            else "yesterday" if snacks["age_days"] == 1
-            else f"{snacks['age_days']}d ago"
-        )
-        body_html = "".join(
-            f'<p style="margin:0 0 8px;font-size:13px;line-height:1.6;color:#334155;">{_h(ln)}</p>'
-            for ln in snacks["text"].splitlines() if ln.strip()
-        )
+    if newsletters:
+        blocks = []
+        for n in newsletters:
+            when = (
+                "today" if n["age_days"] == 0
+                else "yesterday" if n["age_days"] == 1
+                else f"{n['age_days']}d ago"
+            )
+            body_html = "".join(
+                f'<p style="margin:0 0 8px;font-size:13px;line-height:1.6;'
+                f'color:#334155;">{_h(ln)}</p>'
+                for ln in n["text"].splitlines() if ln.strip()
+            )
+            blocks.append(
+                '<div style="background:#f0fdf4;border-left:4px solid #16a34a;'
+                'padding:12px 16px;border-radius:0 4px 4px 0;margin:0 0 12px;">'
+                '<p style="margin:0;font-size:12px;font-weight:700;color:#166534;">'
+                f'{_h(n["name"])} — {_h(n["date"])} ({_h(when)})</p>'
+                '<p style="margin:4px 0 0;font-size:13px;color:#166534;">'
+                f'{_h(n["subject"])}</p></div>'
+                f'{body_html}'
+            )
+        all_tickers = sorted({t for n in newsletters for t in n["tickers"]})
         tickers_html = (
             '<p style="margin:10px 0 0;font-size:12px;color:#475569;">'
-            f'<strong>Tickers named:</strong> {_h(", ".join(snacks["tickers"]))}</p>'
-            if snacks["tickers"] else ""
+            f'<strong>Tickers named:</strong> {_h(", ".join(all_tickers))}</p>'
+            if all_tickers else ""
         )
-        sherwood_content = (
-            '<div style="background:#f0fdf4;border-left:4px solid #16a34a;'
-            'padding:12px 16px;border-radius:0 4px 4px 0;margin-bottom:12px;">'
-            '<p style="margin:0;font-size:12px;font-weight:700;color:#166534;">'
-            f'Robinhood/Sherwood Snacks — {_h(snacks["date"])} ({_h(when)})</p>'
-            '<p style="margin:4px 0 0;font-size:13px;color:#166534;">'
-            f'{_h(snacks["subject"])}</p></div>'
-            f"{body_html}{tickers_html}"
-        )
+        sherwood_content = "".join(blocks) + tickers_html
     elif sherwood_items:
         sherwood_content = ""
         for item in sherwood_items:
@@ -3627,8 +3702,9 @@ def format_digest_html(summary: dict, analysis: str) -> str:
                 )
     else:
         problems = list(summary.get("news_problems") or [])
-        if summary.get("snacks_problem"):
-            problems = [f"Snacks newsletter: {summary['snacks_problem']}"] + problems
+        nl_problems = summary.get("newsletter_problems") or []
+        if nl_problems:
+            problems = [f"Sherwood {np}" for np in nl_problems] + problems
         detail = (
             "".join(
                 f'<li style="margin:2px 0;">{_h(p)}</li>' for p in problems
@@ -4232,23 +4308,23 @@ def main():
 
     # 8. Fetch market and ticker news
     try:
-        log.info("Fetching Snacks newsletter (preferred market-news source)")
-        summary["snacks"] = fetch_snacks_newsletter()
+        log.info("Fetching Sherwood newsletters (preferred market-news source)")
+        summary["newsletters"], summary["newsletter_problems"] = fetch_sherwood_newsletters()
     except Exception as e:
-        log.warning(f"Snacks fetch failed: {e}")
-        summary["snacks"] = None
+        log.warning(f"Newsletter fetch failed: {e}")
+        summary["newsletters"], summary["newsletter_problems"] = [], [
+            f"fetch raised {type(e).__name__}: {e}"
+        ]
 
-    if summary.get("snacks"):
-        # Snacks carries Robinhood's own analysis, so the wire feeds are not
-        # fetched at all when it is available — they exist only as a fallback.
+    if summary["newsletters"]:
+        # These carry Robinhood's own analysis, so the wire feeds are not
+        # fetched at all when one is available — they exist only as a fallback.
         summary["sherwood_news"] = []
-        summary["news_source"] = "Snacks"
+        summary["news_source"] = " + ".join(n["name"] for n in summary["newsletters"])
         summary["news_problems"] = []
-        summary["snacks_problem"] = None
     else:
-        summary["snacks_problem"] = "no issue within the freshness window (see log)"
         try:
-            log.info("No Snacks issue available — falling back to wire feeds")
+            log.info("No Sherwood newsletter available — falling back to wire feeds")
             news_items, news_source, news_problems = fetch_market_news()
             summary["sherwood_news"] = news_items
             summary["news_source"] = news_source
@@ -4273,7 +4349,7 @@ def main():
             summary["ticker_news"],
             source=summary.get("news_source", ""),
             problems=summary.get("news_problems"),
-            snacks=summary.get("snacks"),
+            newsletters=summary.get("newsletters"),
         )
         log.info(f"News cache saved to {NEWS_FILE}")
     except Exception as e:

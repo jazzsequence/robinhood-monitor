@@ -2,7 +2,7 @@
 
 > **At the start of every session, read `session_notes.md`** for current project state, recent changes, and known issues. Update it at the end of the session before closing.
 
-Daily Robinhood portfolio digest: pulls live positions, enriches with technical indicators (RSI, MAs, volume), scans a self-updating watchlist for momentum opportunities, fetches market news from the Robinhood/Sherwood Snacks newsletter (with wire feeds as fallback) plus per-ticker Yahoo Finance news, generates a Claude AI analysis, and emails a formatted HTML digest.
+Daily Robinhood portfolio digest: pulls live positions, enriches with technical indicators (RSI, MAs, volume), scans a self-updating watchlist for momentum opportunities, fetches market news from the Robinhood/Sherwood newsletters (with wire feeds as fallback) plus per-ticker Yahoo Finance news, generates a Claude AI analysis, and emails a formatted HTML digest.
 
 ## Project Structure
 
@@ -111,7 +111,7 @@ Python 3.11+ required (uses `float | None` union type syntax).
 7. Compute indicators per symbol: RSI, MA50, MA200, volume ratio, daily % change
 8. Run momentum scan — score each screener ticker (0–100), return top N
 9. Build summary dict
-10. Fetch market news (Snacks newsletter via IMAP, else first fresh wire feed — see Market News Sources) + per-ticker Yahoo Finance news (parallel); save to `news.json`
+10. Fetch market news (Sherwood newsletters via IMAP, else first fresh wire feed — see Market News Sources) + per-ticker Yahoo Finance news (parallel); save to `news.json`
 11. Call Claude Haiku for ticker recommendations (JSON: adds + removes with reasons, informed by news + watchlist candidates) → rewrite `tickers.json`
 11b. Build the risk context (`portfolio_risk.build_risk_context`) from the price history `fetch_bulk_market_data` stashed in `PRICE_HISTORY` — non-critical, omitted on failure
 12. Compute session breadth, roll the breadth history forward, and load any still-open watch items — see Session-Over-Session Continuity
@@ -296,28 +296,42 @@ Market news has a **trust hierarchy**, because the account owner trusts Robinhoo
 over other traders' commentary. The two tiers are labelled in the prompt and the system prompt's
 `NEWS SOURCE TRUST` rule tells the analysis how to weight each:
 
-1. **Snacks (preferred)** — Robinhood/Sherwood's daily newsletter, fetched over IMAP from Gmail.
-   This is editorial analysis from the brokerage the portfolio is held at, not a wire summary: it
-   carries a written takeaway, a chart of the day, and **the next session's earnings calendar**
-   (which no other source here provides). When a Snacks issue is available the wire feeds are not
-   fetched at all.
+1. **Sherwood newsletters (preferred)** — fetched over IMAP from Gmail. Editorial analysis from
+   the brokerage the portfolio is held at, not a wire summary. `SHERWOOD_NEWSLETTERS` lists them
+   as `(name, sender)`; note the **differing domains**, neither guessable from the other:
+
+   | Newsletter | Sender | Content |
+   |---|---|---|
+   | Snacks | `hello@snacks.robinhood.com` | Daily market wrap, written takeaway, chart of the day, **next session's earnings calendar** (no other source here provides this) |
+   | EntryPoint | `entrypoint@sherwoodmedia.com` | Market insights and technical signals |
+
+   The newest real issue of *each* is ingested, newest first. When any is available the wire feeds
+   are not fetched at all. To add Scoreboard or another, append to the list.
 2. **Wire feeds (fallback)** — `MARKET_NEWS_FEEDS`, used only when no recent Snacks issue exists.
    Marked in the prompt as a less-trusted source whose headlines are facts, not analysis; the
    analysis is told to keep the macro read tentative and not build a thesis on them.
 
-### How Snacks is ingested
+### How the newsletters are ingested
 
 - **No new credentials.** `fetch_snacks_newsletter()` logs into `imap.gmail.com` with the
   `GMAIL_ADDRESS` / `GMAIL_APP_PASSWORD` already used for sending. `imaplib` is stdlib.
-- **Mailbox order** (`SNACKS_MAILBOXES`): `[Gmail]/All Mail`, `INBOX`, then `[Gmail]/Trash`.
-  Gmail's All Mail deliberately **excludes** Trash, and these issues are frequently read and
-  deleted before the 6am run — a deleted issue is still the day's analysis, so Trash is searched
-  explicitly. Keeping them out of Trash (a filter that labels Snacks and skips delete) makes the
-  lookup cheaper but is not required.
+- **Mailbox order** (`NEWSLETTER_MAILBOXES`): `[Gmail]/All Mail`, `INBOX`, then `[Gmail]/Trash`.
+  All Mail holds everything retained, **including archived mail**, which is why archiving is the
+  recommended habit — archived issues are found on the first search and are never auto-removed.
+  Trash is searched last as a safety net, since a read-and-deleted issue is still the day's
+  analysis, but Gmail purges Trash after ~30 days so it is not somewhere to rely on.
+- **Subscription mail is filtered out** (`_is_newsletter_issue`). Welcome and confirmation emails
+  come from the *same address* as the issues and are frequently the **newest** message from that
+  sender — on 2026-10-23 the newest mail from Snacks was "Thank you for subscribing to Snacks!",
+  so taking the latest message alone would have fed the analysis a signup receipt as the day's
+  market news. Two independent checks: a subject pattern (`NEWSLETTER_SKIP_SUBJECT`) and a
+  `NEWSLETTER_MIN_CHARS` (400) floor, since a real issue cleans to ~2KB and a receipt to a few
+  hundred characters. Candidates are gathered across all mailboxes and tried newest-first, so a
+  confirmation email sitting on top of a real issue is skipped rather than ending the search.
 - **The issue is passed to Claude as prose, not parsed into fields.** `_clean_newsletter_text()`
   strips the table scaffolding these emails are built from, the tracking-link remnants, photo
   credits, the repeated preheader line, and the legal footer, then caps the result at
-  `SNACKS_MAX_CHARS` (6000). Section structure is left intact on purpose: there are no
+  `NEWSLETTER_MAX_CHARS` (5000, per issue). Section structure is left intact on purpose: there are no
   per-section regexes to break when the layout changes, and the takeaway reaches the model in
   Sherwood's own words. A real 4.1KB issue cleans to ~2KB.
 - **Tickers are extracted mechanically, not linguistically.** The newsletter links every company
@@ -332,7 +346,7 @@ over other traders' commentary. The two tiers are labelled in the prompt and the
 - **Fails soft, never raises.** Missing credentials, an unreachable mailbox, no matching message,
   or an issue older than `NEWS_MAX_AGE_DAYS` all return `None`, and the run falls through to the
   wire feeds. The reason lands in the log and in the digest's warning block.
-- `news.json` stores the issue actually used under `snacks`.
+- `news.json` stores the issues actually used under `newsletters`.
 
 ## News Freshness
 
@@ -541,7 +555,7 @@ A second Claude call (Haiku model, 500 tokens) runs after the momentum scan and 
 4. Top Momentum Movers (table)
 5. Watchlist Updates (add/remove with reasons + linked source articles)
 6. Claude Analysis (markdown-rendered)
-7. Market News — the Snacks issue (green source banner, full text, tickers named), or dated wire headlines, or a red warning block if neither was available
+7. Market News — each Sherwood issue (green source banner, full text) with the merged tickers named, or dated wire headlines, or a red warning block if neither was available
 8. Ticker News — Yahoo Finance per holding (linked, dated headlines)
 9. Abbreviations glossary (footer)
 
