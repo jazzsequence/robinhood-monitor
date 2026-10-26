@@ -23,6 +23,10 @@
     "GEO": {
       "reason": "Operates private prisons and immigration detention facilities, violating criterion (5).",
       "added": "2026-10-13"
+    },
+    "LUMN": {
+      "reason": "Lumen Technologies operates a major data center infrastructure business as a core revenue driver, qualifying as a data center operator under criterion (4).",
+      "added": "2026-10-26"
     }
   },
   "screened": [
@@ -50,6 +54,7 @@
     "JD",
     "KLAC",
     "LRCX",
+    "LUMN",
     "MARA",
     "META",
     "MRVL",
