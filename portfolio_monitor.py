@@ -35,6 +35,7 @@ import robin_stocks.robinhood as r
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+import newsletter_views
 import portfolio_risk
 
 # Set a recognizable User-Agent for device-approval prompts in the Robinhood app.
@@ -79,6 +80,12 @@ WATCHLIST_MIN_SCORE = 15  # minimum momentum score to surface a watchlist ticker
 PROTECTED_SYMBOLS = {"COST"}  # core long-term holdings; see PROTECTED SYMBOL rule in CLAUDE_SYSTEM_PROMPT
 PROTECTED_TRIM_MAX_PCT = 0.10  # max fraction of a protected symbol's OWN equity trimmable per action
 PROTECTED_COMMITMENT_PENDING_DAYS = 7  # days to wait for a recommended trim to actually execute before dropping it
+# A CONFIRMED commitment used to live until a buy at/below its target price landed. A core holding
+# that keeps rising (COST: trimmed at $938, back at $1,009 three days later) never comes back to the
+# target, so the trim lock was permanent. Two more ways out: restore the position at any price, or
+# let it age out.
+PROTECTED_COMMITMENT_MAX_DAYS = 14
+PROTECTED_COMMITMENT_RESTORE_FRACTION = 0.6  # share of the trimmed $ that must be bought back (loose, like the sell match)
 PROTECTED_COMMITMENTS_FILE = "protected_commitments.json"
 SMALL_POSITION_THRESHOLD = 10  # equity ($) at/under which a position is a cleanup candidate
 ETHICAL_EXCLUSIONS_FILE = "ethical_exclusions.json"
@@ -100,7 +107,7 @@ SYNC_DIR = os.path.expanduser("~/Dropbox/robinhood-monitor")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CLAUDE_MODEL = "claude-sonnet-5"
-CLAUDE_MAX_TOKENS = 4000
+CLAUDE_MAX_TOKENS = 5000
 CLAUDE_SYSTEM_PROMPT = (
     "You are a female stock trading advisor for a high-risk-tolerance retail investor "
     "interested in making ethically responsible investment choices "
@@ -157,6 +164,29 @@ CLAUDE_SYSTEM_PROMPT = (
     "when) and do NOT treat a headline's framing or implied conclusion as analysis. Do not build "
     "a confident macro thesis on them; say the macro read is thin when that is all you have.\n"
     "Either way, do not invent a macro narrative that the section does not support.\n\n"
+    "ANALYST VIEWS — HARD CONSTRAINT: When an '=== ANALYST VIEWS ===' section appears, it is the "
+    "newsletters' analytical content — Sherwood's own read, strategists and firms the issues "
+    "quote, and Robinhood retail-flow data — and the account owner wants this feedback, not just "
+    "a list of tickers that were mentioned. Open the analysis (after SINCE LAST SESSION, before "
+    "OPPORTUNITY COST CHECK) with an **ANALYST VIEWS** block of at most five lines: pick the views "
+    "that bear most on what is held, on a CONCENTRATED cluster, or on the market's direction, "
+    "plus each issue's overall read. Each line states who said it, what, then AGREE / DISAGREE / "
+    "PARTLY measured against the data in THIS prompt (a specific price, RSI, MA50, breadth or "
+    "cluster figure), then 'changes: <the specific action>' or 'changes: nothing'. Disagreeing "
+    "with a view is fine; ignoring one that bears on a position you act on is not. Weight: "
+    "Sherwood's editorial read counts most; a third-party analyst an issue quotes is second-hand "
+    "opinion — attribute it by name and never present it as Sherwood's own; retail flow is what "
+    "customers are DOING, a behavioural datapoint, not evidence they are right. Keep their "
+    "hedging: do not turn a 'may' or 'could' into a 'will'. Never cite a view that is not in the "
+    "section. Any EVENT on a [HELD] symbol must be weighed in that position's reasoning if you "
+    "trim, exit, buy or hold it with conviction — an equity raise, guidance change or deal is "
+    "exactly the sort of fact a technical-only rationale misses.\n\n"
+    "CATALYSTS — HARD CONSTRAINT: A held position tagged [REPORTS EARNINGS …] (and the "
+    "'=== THIS WEEK'S CATALYSTS ===' section) reports within days. Any BUY, add or trim of that "
+    "symbol must acknowledge the event in its reasoning — earnings are binary risk and a buy "
+    "into one is a different decision from a buy on a quiet week. This does not forbid acting; "
+    "it forbids acting as if the event were not there. Name the macro releases in the same "
+    "section (a Fed decision, PCE) when they bear on the tape you describe.\n\n"
     "NEWS INTEGRATION: The market news section appears at the top of the "
     "prompt — read it first and let it set the macro frame before evaluating individual positions. "
     "Ask: what sectors or themes are these headlines pointing to? Are any of those themes "
@@ -247,11 +277,16 @@ CLAUDE_SYSTEM_PROMPT = (
     "'=== OUTSTANDING REINVESTMENT COMMITMENTS ===' section, you are FORBIDDEN from recommending "
     "another partial trim of it — no exceptions — until that commitment no longer appears there. "
     "This is tracked by the script from actual order history, not from anything stated in a prior "
-    "analysis, so there is no way to satisfy it except a real buy-back — restating the plan again "
-    "does not clear it. The only allowed override is a FULL EXIT for a specifically broken thesis "
-    "(adverse news, structural change), named explicitly. If the current price shown alongside "
-    "the commitment has already reached the committed level, prioritize recommending that "
-    "reinvestment buy this session over other new entries.\n\n"
+    "analysis, so restating the plan again does not clear it — only real trades do: a buy at or "
+    "below the target, a buy of roughly the trimmed amount at ANY price, or the commitment aging "
+    "out. The lock covers TRIMS only. It never forbids BUYING the symbol: when the price is above "
+    "the target and the position is strong, adding to it is a normal buy judged by the usual entry "
+    "standard (no chasing), and it also clears the commitment. Do not describe the symbol as "
+    "'locked' or 'frozen' for buying purposes, and do not write a TRIMS/EXITS line about it — "
+    "a blocked trim is just a hold. The only allowed override of the trim ban is a FULL EXIT for a "
+    "specifically broken thesis (adverse news, structural change), named explicitly. If the "
+    "current price shown alongside the commitment has already reached the committed level, "
+    "prioritize recommending that reinvestment buy this session over other new entries.\n\n"
     "SMALL POSITION CLEANUP RULE: Positions tagged [SMALL POSITION] default to a full-exit "
     "candidate rather than an automatic hold. Recommend a full exit when the position is stale — "
     "no momentum signal (RSI outside the 55-75 momentum zone, price flat against MA50, volume "
@@ -376,14 +411,20 @@ CLAUDE_SYSTEM_PROMPT = (
     "fresh read: state plainly that nothing has changed enough to act on, and name the "
     "condition that would change it.\n\n"
     "Write the analysis in blocks, in this order: SINCE LAST SESSION (only when an OPEN WATCH "
-    "ITEMS section appears below), OPPORTUNITY COST CHECK, TRIMS/EXITS, BUYS, HOLDS. "
+    "ITEMS section appears below), ANALYST VIEWS (only when an ANALYST VIEWS section appears "
+    "below), OPPORTUNITY COST CHECK, TRIMS/EXITS, BUYS, HOLDS. "
     "Do not use --- as dividers between blocks. "
     "Avoid trading jargon — write plainly for someone who trades casually but is not an expert.\n\n"
     "TRIMS/EXITS: Only list positions actually being trimmed or exited — one bold action line "
     "per trim (e.g. **TRIM ARM — Sell $50**) followed by one sentence of reasoning. For a "
     "protected-symbol trim, state the reinvestment condition in that same sentence — this is "
     "required for the commitment to be tracked. "
-    "Do not mention positions that are merely being held; those go in HOLDS. "
+    "Do not mention positions that are merely being held; those go in HOLDS. Never write a "
+    "TRIM/EXIT/SELL action line for a position you are NOT trimming or exiting — no '**TRIM COST — "
+    "no action**'. A protected symbol that is blocked by an outstanding commitment, or any other "
+    "restricted position, is simply a hold: one line in HOLDS, nothing here. The one exception is "
+    "a GAIN GIVEBACK alert you are holding through, which is written as '**HOLD META (giveback "
+    "alert) — specific reason**' and not as a trim line. "
     "If nothing to trim, say so in one sentence — but only after checking that no position is "
     "being exited for any reason, including SMALL POSITION CLEANUP, and that every GAIN GIVEBACK "
     "alert has been either acted on or named here with its specific reason for holding. "
@@ -465,7 +506,11 @@ CLAUDE_SYSTEM_PROMPT = (
     "The mood you describe must be the same one the analysis reasoned from. Do not name a "
     "trend, risk, or opportunity that is absent from the analysis or that points the opposite "
     "way from what you recommended — a tl;dr telling a different story than the advice beneath "
-    "it is a failure, not a difference in altitude. If the market mood genuinely argues against "
+    "it is a failure, not a difference in altitude. When ANALYST VIEWS give an issue's overall "
+    "read, the mood you describe may not be stated more confidently or more settled than that "
+    "read: if the newsletter calls the picture unresolved and the day's breadth looks green, say "
+    "both rather than declaring the worry over. Name only companies, sectors and themes that "
+    "appear in the news or the position data — do not coin groupings of your own. If the market mood genuinely argues against "
     "your recommendations, the analysis is what is wrong: go back and fix the recommendations "
     "rather than papering over the gap here. This includes hinting at a shift you did not act "
     "on: if you say the picture may be changing while recommending exactly what you recommended "
@@ -1081,7 +1126,10 @@ def resolve_protected_commitments(
     future trims of that symbol.
 
     Confirmed commitments are dropped once the symbol is fully exited, or a real
-    buy order at/below the committed price lands after the trim.
+    buy order at/below the committed price lands after the trim, or buys after the
+    trim at ANY price add back roughly the trimmed amount (the position is restored —
+    insisting on the lower price would make a rising core holding untouchable), or
+    PROTECTED_COMMITMENT_MAX_DAYS pass since the trim.
     """
     still_outstanding = []
     for c in commitments:
@@ -1118,16 +1166,30 @@ def resolve_protected_commitments(
                 )
             continue
 
-        fulfilled = any(
-            o["symbol"] == symbol
+        buys_since = [
+            o for o in recent_orders
+            if o["symbol"] == symbol
             and o["side"] == "buy"
             and o["price"] is not None
-            and o["price"] <= c["reinvest_price"]
             and o["date"] > c["trim_date"]
-            for o in recent_orders
-        )
-        if not fulfilled:
-            still_outstanding.append(c)
+        ]
+        if any(o["price"] <= c["reinvest_price"] for o in buys_since):
+            continue
+        restored = sum(o["quantity"] * o["price"] for o in buys_since)
+        if restored >= c["trim_amount"] * PROTECTED_COMMITMENT_RESTORE_FRACTION:
+            log.info(
+                f"{symbol} commitment cleared: ${restored:.2f} bought back since "
+                f"{c['trim_date']} restores the ${c['trim_amount']:.2f} trim (above the "
+                f"${c['reinvest_price']:.2f} target, which is fine)"
+            )
+            continue
+        if _days_between(c["trim_date"], today) > PROTECTED_COMMITMENT_MAX_DAYS:
+            log.info(
+                f"{symbol} commitment from {c['trim_date']} expired after "
+                f"{PROTECTED_COMMITMENT_MAX_DAYS} days without a buy-back — trims unlocked"
+            )
+            continue
+        still_outstanding.append(c)
     return still_outstanding
 
 
@@ -1690,8 +1752,11 @@ NEWSLETTER_IMAP_HOST = "imap.gmail.com"
 # analysis, but Gmail purges Trash after ~30 days so it is not a place to rely
 # on.
 NEWSLETTER_MAILBOXES = ('"[Gmail]/All Mail"', "INBOX", '"[Gmail]/Trash"')
-# Per-issue cap on what reaches the prompt.
-NEWSLETTER_MAX_CHARS = 5000
+# Per-issue cap on what reaches the prompt. 5000 used to be the cap and silently cut
+# off the back half of every issue — which is where Snacks puts its "This Week"
+# earnings calendar (the issue is ~7.4k) and where EntryPoint's strategist quotes
+# live (~11.2k). 12000 holds both whole; two issues are still only ~6k tokens.
+NEWSLETTER_MAX_CHARS = 12000
 # A real issue cleans to ~2KB; a welcome or confirmation email to a few hundred
 # characters. Below this it is not an issue.
 NEWSLETTER_MIN_CHARS = 400
@@ -1742,8 +1807,16 @@ class _TextExtractor(HTMLParser):
             self.parts.append("\n")
 
     def handle_data(self, data):
-        if not self._skipping and data.strip():
+        if self._skipping:
+            return
+        if data.strip():
             self.parts.append(data)
+        elif self.parts and not self.parts[-1].endswith((" ", "\n")):
+            # A whitespace-only node is often the ONLY separator between inline
+            # elements ("from<a> <strong>Cadence</strong></a>"). Dropping it glued
+            # words together ("fromCadence", "EntryPoint last Friday" -> "entrypointlast").
+            # Block tags still break lines; _clean_newsletter_text collapses the rest.
+            self.parts.append(" ")
 
     def text(self) -> str:
         return "".join(self.parts)
@@ -2219,6 +2292,7 @@ def save_news_cache(
     source: str = "",
     problems: list[str] | None = None,
     newsletters: list[dict] | None = None,
+    newsletter_views_data: list[dict] | None = None,
 ):
     """Persist today's fetched news to NEWS_FILE for email link rendering."""
     with open(NEWS_FILE, "w") as f:
@@ -2228,6 +2302,7 @@ def save_news_cache(
                 "source": source,
                 "problems": problems or [],
                 "newsletters": newsletters or [],
+                "newsletter_views": newsletter_views_data or [],
                 "sherwood": sherwood,
                 "ticker_news": ticker_news,
             },
@@ -2528,7 +2603,9 @@ def apply_watch_verdicts(
         return open_items, []
     block = analysis_text[m.end():]
     # The block ends at the next analysis header.
-    end = re.search(r"\n[\s#*]*(OPPORTUNITY COST|TRIMS|EXITS|BUYS|HOLDS)\b", block, re.IGNORECASE)
+    end = re.search(
+        r"\n[\s#*]*(ANALYST VIEWS|OPPORTUNITY COST|TRIMS|EXITS|BUYS|HOLDS)\b", block, re.IGNORECASE
+    )
     if end:
         block = block[: end.start()]
 
@@ -2756,6 +2833,11 @@ def build_prompt(summary: dict) -> str:
                 "Tickers named across today's issues (taken from their own quote links, "
                 "not inferred): " + ", ".join(all_tickers),
             ]
+        lines += newsletter_views.prompt_lines(
+            summary.get("newsletter_views") or [],
+            {p["symbol"] for p in summary["positions"]} | pending_buy_symbols,
+            summary["date"],
+        )
 
     sherwood = summary.get("sherwood_news", [])
     news_source = summary.get("news_source", "")
@@ -2878,6 +2960,11 @@ def build_prompt(summary: dict) -> str:
 
     total_value = summary["total_value"] or 1  # avoid div/0 if somehow zero
     ticker_news = summary.get("ticker_news", {})
+    catalyst_tags = newsletter_views.held_catalyst_tags(
+        summary.get("newsletter_views") or [],
+        {p["symbol"] for p in summary["positions"]},
+        summary["date"],
+    )
     for pos in summary["positions"]:
         ind = pos.get("indicators", {})
         alloc_pct = pos["equity"] / total_value * 100
@@ -2923,10 +3010,14 @@ def build_prompt(summary: dict) -> str:
             f"  [GAIN GIVEBACK ALERT — {giveback['given_back_pct']:.0f}% of the open gain given back]"
             if giveback and giveback["status"] == "alert" else ""
         )
+        catalyst_tag = (
+            f"  [{catalyst_tags[symbol]} — see THIS WEEK'S CATALYSTS]"
+            if symbol in catalyst_tags else ""
+        )
         lines += [
             f"\n{symbol}: {pos['shares']} shares @ ${pos['current_price']} "
             f"(avg cost ${pos['avg_cost']}, return {pos['total_return_pct']:+.1f}%, "
-            f"equity ${pos['equity']}, {alloc_pct:.1f}% of portfolio)  [{funding_tag}]{small_tag}{ethical_tag}{giveback_tag}",
+            f"equity ${pos['equity']}, {alloc_pct:.1f}% of portfolio)  [{funding_tag}]{small_tag}{ethical_tag}{giveback_tag}{catalyst_tag}",
             f"  RSI: {_fmt(ind.get('rsi'), '.1f')} | "
             f"MA50: ${_fmt(ind.get('ma50'), '.2f')} "
             f"({_fmt(ind.get('price_vs_ma50_pct'), '+.1f')}%) | "
@@ -2945,6 +3036,7 @@ def build_prompt(summary: dict) -> str:
             for item in sym_news:
                 title = item["title"] if isinstance(item, dict) else item
                 lines.append(f"  News: {title}")
+        lines += newsletter_views.symbol_notes(summary.get("newsletter_views") or [], symbol)
 
     eligible = sorted(
         (p for p in summary["positions"]
@@ -2991,10 +3083,19 @@ def build_prompt(summary: dict) -> str:
         price_by_symbol = {p["symbol"]: p["current_price"] for p in summary["positions"]}
         for c in outstanding:
             current_price = price_by_symbol.get(c["symbol"])
+            expires = (
+                date.fromisoformat(c["trim_date"]) + timedelta(days=PROTECTED_COMMITMENT_MAX_DAYS)
+            ).isoformat()
             met = (
                 "condition MET — reinvest now"
                 if current_price is not None and current_price <= c["reinvest_price"]
-                else "condition not yet met"
+                else (
+                    f"price is above the target. TRIMS stay locked, but buying {c['symbol']} is "
+                    f"NOT blocked: judge it like any other buy (normal entry standard). A purchase "
+                    f"of about ${c['trim_amount'] * PROTECTED_COMMITMENT_RESTORE_FRACTION:.0f}+ at "
+                    f"ANY price restores the position and clears this commitment; it also expires "
+                    f"{expires}"
+                )
             )
             lines.append(
                 f"  {c['symbol']:<8} trimmed ${c['trim_amount']:.2f} on {c['trim_date']}, "
@@ -3081,7 +3182,86 @@ def build_prompt(summary: dict) -> str:
             f"Vol ratio {_fmt(m.get('volume_ratio'), '.2f')}x | "
             f"Score {m['score']}"
         )
+    if summary.get("newsletter_views"):
+        # Last thing the model reads before writing. The system prompt carries the full
+        # rules, but on a long prompt the block was skipped outright on a rerun.
+        lines += [
+            "",
+            "=== BEFORE YOU WRITE ===",
+            "The newsletters' analysis is in the ANALYST VIEWS section above. Your analysis MUST "
+            "contain an **ANALYST VIEWS** block (agree/disagree against this prompt's data, "
+            "ending 'changes: <action>' or 'changes: nothing') ahead of OPPORTUNITY COST CHECK. "
+            "Any position with a 'Newsletter event' line gets that event weighed in its own "
+            "trim/buy/hold reasoning, and a position tagged [REPORTS EARNINGS …] gets the "
+            "earnings named in any buy or trim of it.",
+        ]
     return "\n".join(lines)
+
+
+_NOOP_TRIM_RE = re.compile(
+    r"^\s*[-*\u2022]*\s*\*\*\s*(?:"
+    # "TRIM COST — no action"
+    r"(?:TRIM|EXIT|SELL)\s+(?-i:[A-Z][A-Z.\-]{0,9})\s*[\u2014\u2013-]+\s*"
+    r"(?:no action|no trim|no change|hold(?:ing)?|not trimming|skipp?(?:ing)?)\b"
+    # ...or its rewording "HOLD COST — no trim" (the rule against the first just moves it)
+    r"|HOLD\s+(?-i:[A-Z][A-Z.\-]{0,9})\b"
+    r")[^*\n]*\*\*",
+    re.IGNORECASE,
+)
+_TRIMS_HEADER_RE = re.compile(r"^[\s#*]*TRIMS\s*/\s*EXITS\b", re.IGNORECASE)
+_AFTER_TRIMS_RE = re.compile(
+    r"^[\s#*]*(?:BUYS|HOLDS|OPPORTUNITY COST|ANALYST VIEWS|SINCE LAST SESSION|ONE KEY THING)\b",
+    re.IGNORECASE,
+)
+
+
+def strip_noop_trim_lines(
+    analysis: str,
+    keep_symbols: set[str] = frozenset(),
+    blocked_symbols: set[str] = frozenset(),
+) -> str:
+    """
+    Remove '**TRIM COST — no action**' (and '**HOLD COST — no trim**') lines from the TRIMS/EXITS block.
+
+    TRIMS/EXITS is for trades. A restricted position (a protected symbol under an
+    outstanding commitment, say) gets a bold TRIM header only so the model can say it
+    is not trimming it — noise in the email, and it reads like an action. The prompt
+    asks the model not to, but the model is the thing that did it, so it is enforced
+    here too. `keep_symbols` (symbols with a gain-giveback alert) are left alone: a
+    hold-despite-alert must stay written in this block. `blocked_symbols` (protected
+    symbols under an outstanding commitment) also lose any plain-prose line that names
+    them — the model's second try at the same explanation after being told not to write
+    a TRIM line is "No action on COST — it's protected…" — while a bold EXIT/TRIM header
+    for one is untouched. If removing lines empties the block, a one-line "nothing"
+    statement takes their place.
+    """
+    lines = analysis.split("\n")
+    start = next((i for i, ln in enumerate(lines) if _TRIMS_HEADER_RE.match(ln)), None)
+    if start is None:
+        return analysis
+    end = next(
+        (i for i in range(start + 1, len(lines)) if _AFTER_TRIMS_RE.match(lines[i])), len(lines)
+    )
+    kept, removed = [], []
+    for ln in lines[start + 1:end]:
+        m = _NOOP_TRIM_RE.match(ln)
+        sym = re.search(r"\b(?:TRIM|EXIT|SELL|HOLD)\s+([A-Z][A-Z.\-]{0,9})\b", ln) if m else None
+        if m and not (sym and sym.group(1) in keep_symbols):
+            removed.append(sym.group(1) if sym else "?")
+            continue
+        named = next(
+            (b for b in blocked_symbols if re.search(rf"\b{re.escape(b)}\b", ln)), None
+        )
+        if named and ln.strip() and not re.match(r"^\s*[-\u2022]*\s*\*\*", ln):
+            removed.append(named)
+            continue
+        kept.append(ln)
+    if not removed:
+        return analysis
+    log.info(f"Dropped no-action line(s) from TRIMS/EXITS: {removed}")
+    if not any(ln.strip() for ln in kept):
+        kept = ["", "No trims or exits today.", ""]
+    return "\n".join(lines[:start + 1] + kept + lines[end:])
 
 
 def get_claude_analysis(summary: dict) -> tuple[str, str]:
@@ -3150,10 +3330,27 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
     analysis_part = re.sub(r"^---[ \t]*\n+", "", analysis_part).strip()
     analysis_part = re.sub(r"\n-{3,}[ \t]*$", "", analysis_part).strip()
 
+    analysis_part = strip_noop_trim_lines(
+        analysis_part,
+        set(portfolio_risk.giveback_alerts(summary.get("risk_context")) or {}),
+        {c["symbol"] for c in summary.get("protected_commitments", [])},
+    )
+    if summary.get("newsletter_views") and not re.search(r"ANALYST\s+VIEWS", analysis_part, re.IGNORECASE):
+        log.warning(
+            "Analysis omitted the ANALYST VIEWS block even though "
+            f"{sum(len(v['views']) for v in summary['newsletter_views'])} newsletter views were supplied"
+        )
+
     return tldr, analysis_part
 
 
 # ── Email digest ──────────────────────────────────────────────────────────────
+def _held_symbols(summary: dict) -> set[str]:
+    """Symbols owned or about to be (unfilled buys), for flagging newsletter items."""
+    pending_buys = {o["symbol"] for o in summary.get("pending_orders", []) if o["side"] == "buy"}
+    return {p["symbol"] for p in summary["positions"]} | pending_buys
+
+
 def format_digest(summary: dict, analysis: str) -> str:
     SEP = "=" * 64
     sep = "-" * 64
@@ -3179,6 +3376,9 @@ def format_digest(summary: dict, analysis: str) -> str:
         all_tickers = sorted({t for n in newsletters for t in n["tickers"]})
         if all_tickers:
             lines.append(f"Tickers named: {', '.join(all_tickers)}")
+        lines += newsletter_views.plain_lines(
+            summary.get("newsletter_views") or [], _held_symbols(summary), summary["date"]
+        )
 
     news_problems = summary.get("news_problems") or []
     if not newsletters and not summary.get("sherwood_news") and news_problems:
@@ -3680,7 +3880,18 @@ def format_digest_html(summary: dict, analysis: str) -> str:
             f'<strong>Tickers named:</strong> {_h(", ".join(all_tickers))}</p>'
             if all_tickers else ""
         )
-        sherwood_content = "".join(blocks) + tickers_html
+        views_html = newsletter_views.html_block(
+            summary.get("newsletter_views") or [], _held_symbols(summary), summary["date"]
+        )
+        if views_html:
+            views_html = (
+                '<p style="margin:0 0 4px;font-size:12px;font-weight:700;color:#166534;'
+                'text-transform:uppercase;letter-spacing:.04em;">What Sherwood is saying</p>'
+                + views_html
+                + '<p style="margin:16px 0 4px;font-size:12px;font-weight:700;color:#166534;'
+                  'text-transform:uppercase;letter-spacing:.04em;">The issues, as sent</p>'
+            )
+        sherwood_content = views_html + "".join(blocks) + tickers_html
     elif sherwood_items:
         sherwood_content = ""
         for item in sherwood_items:
@@ -4316,12 +4527,22 @@ def main():
             f"fetch raised {type(e).__name__}: {e}"
         ]
 
+    summary["newsletter_views"] = []
     if summary["newsletters"]:
         # These carry Robinhood's own analysis, so the wire feeds are not
         # fetched at all when one is available — they exist only as a fallback.
         summary["sherwood_news"] = []
         summary["news_source"] = " + ".join(n["name"] for n in summary["newsletters"])
         summary["news_problems"] = []
+        # Distill the analysis out of the prose (views, retail flow, the earnings
+        # calendar). Non-critical: on failure the analysis still gets the raw issues.
+        try:
+            summary["newsletter_views"] = newsletter_views.extract_all(
+                Anthropic(), CLAUDE_MODEL, summary["newsletters"],
+                sorted(committed_symbols | set(screener_tickers)),
+            )
+        except Exception as e:
+            log.warning(f"Newsletter view extraction failed: {e}")
     else:
         try:
             log.info("No Sherwood newsletter available — falling back to wire feeds")
@@ -4350,6 +4571,7 @@ def main():
             source=summary.get("news_source", ""),
             problems=summary.get("news_problems"),
             newsletters=summary.get("newsletters"),
+            newsletter_views_data=summary.get("newsletter_views"),
         )
         log.info(f"News cache saved to {NEWS_FILE}")
     except Exception as e:

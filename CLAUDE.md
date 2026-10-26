@@ -10,6 +10,7 @@ Daily Robinhood portfolio digest: pulls live positions, enriches with technical 
 |------|---------|
 | `portfolio_monitor.py` | Main script — orchestration, prompt, digest, state |
 | `portfolio_risk.py` | Pure risk calculations (gain giveback, correlation clusters, benchmarks) + their text rendering. Split out because `portfolio_monitor.py` is already 3.6k lines; importable for tests |
+| `newsletter_views.py` | Distills each Sherwood newsletter into verified analyst views, events and a dated catalyst calendar (one model call per issue), plus the prompt/digest renderers for them. Importable without the rest of `portfolio_monitor.py` |
 | `tickers.json` | Screener watchlist — read at startup, rewritten by Claude each run |
 | `news.json` | Latest run's fetched news with URLs (overwritten each run, gitignored) |
 | `last_analysis.json` | Full daily technical snapshot + analysis. Lives in `~/Dropbox/robinhood-monitor/` (gitignored — repo is public and this carries real dollar figures), synced across machines via Dropbox instead |
@@ -82,12 +83,15 @@ Python 3.11+ required (uses `float | None` union type syntax).
 | `MAX_SCREENER_TICKERS` | `40` | Hard cap on watchlist size |
 | `WATCHLIST_MIN_SCORE` | `15` | Minimum momentum score to surface a Robinhood watchlist ticker |
 | `CLAUDE_MODEL` | `claude-sonnet-5` | Model for portfolio analysis (thinking explicitly disabled — see below) |
-| `CLAUDE_MAX_TOKENS` | `4000` | Max response length for analysis |
+| `CLAUDE_MAX_TOKENS` | `5000` | Max response length for analysis (the TL;DR is written last, so truncation loses it) |
 | `RSI_PERIOD` | `14` | RSI calculation window |
 | `MOMENTUM_TOP_N` | `10` | Max momentum candidates returned |
 | `USER_WATCHLISTS` | `{"My First List", "Gaming", "Tech"}` | Your watchlists (highest priority) |
 | `ROBINHOOD_WATCHLISTS` | `{"Cannabis", "Software"}` | Robinhood-provided watchlists (lower priority) |
 | `PROTECTED_SYMBOLS` | `{"COST"}` | Core long-term holdings — trims are heavily constrained, see below |
+| `PROTECTED_COMMITMENT_MAX_DAYS` / `PROTECTED_COMMITMENT_RESTORE_FRACTION` | `14` / `0.6` | A confirmed reinvestment commitment expires this many days after the trim; buys after the trim adding back this share of the trimmed $ (at any price) also clear it |
+| `NEWSLETTER_MAX_CHARS` | `12000` | Per-issue cap on newsletter text reaching the prompt |
+| `CATALYST_TAG_DAYS` / `CATALYST_HORIZON_DAYS` | `4` / `10` | (`newsletter_views.py`) a held name reporting inside the first window gets a `[REPORTS EARNINGS …]` tag; catalysts past the second are ignored |
 | `PROTECTED_TRIM_MAX_PCT` | `0.10` | Max fraction of a protected symbol's own equity trimmable per action |
 | `SMALL_POSITION_THRESHOLD` | `10` | Equity ($) at/under which a position is a stale-cleanup candidate |
 | `WATCH_ITEM_MAX_AGE_DAYS` | `5` | Days a "one key thing to watch" item is carried forward and re-reported |
@@ -111,7 +115,7 @@ Python 3.11+ required (uses `float | None` union type syntax).
 7. Compute indicators per symbol: RSI, MA50, MA200, volume ratio, daily % change
 8. Run momentum scan — score each screener ticker (0–100), return top N
 9. Build summary dict
-10. Fetch market news (Sherwood newsletters via IMAP, else first fresh wire feed — see Market News Sources) + per-ticker Yahoo Finance news (parallel); save to `news.json`
+10. Fetch market news (Sherwood newsletters via IMAP, else first fresh wire feed — see Market News Sources); when newsletters are present, distill them into verified analyst views / events / catalysts (`newsletter_views.extract_all`, one Sonnet call per issue, non-critical — see Newsletter Analyst Views & Catalysts); fetch per-ticker Yahoo Finance news (parallel); save to `news.json`
 11. Call Claude Haiku for ticker recommendations (JSON: adds + removes with reasons, informed by news + watchlist candidates) → rewrite `tickers.json`
 11b. Build the risk context (`portfolio_risk.build_risk_context`) from the price history `fetch_bulk_market_data` stashed in `PRICE_HISTORY` — non-critical, omitted on failure
 12. Compute session breadth, roll the breadth history forward, and load any still-open watch items — see Session-Over-Session Continuity
@@ -331,9 +335,16 @@ over other traders' commentary. The two tiers are labelled in the prompt and the
 - **The issue is passed to Claude as prose, not parsed into fields.** `_clean_newsletter_text()`
   strips the table scaffolding these emails are built from, the tracking-link remnants, photo
   credits, the repeated preheader line, and the legal footer, then caps the result at
-  `NEWSLETTER_MAX_CHARS` (5000, per issue). Section structure is left intact on purpose: there are no
+  `NEWSLETTER_MAX_CHARS` (12000, per issue — it was 5000, which cut off the back half of every
+  issue: Snacks' "This Week" earnings calendar sits at the very end of a ~7.4k issue and EntryPoint's
+  strategist quotes in the last half of ~11.2k; neither ever reached the model before 2026-10-26). Section structure is left intact on purpose: there are no
   per-section regexes to break when the layout changes, and the takeaway reaches the model in
-  Sherwood's own words. A real 4.1KB issue cleans to ~2KB.
+  Sherwood's own words. The *analysis* in the prose is additionally distilled into structured items —
+  see Newsletter Analyst Views & Catalysts below.
+- **Whitespace-only text nodes are kept as a space** (`_TextExtractor.handle_data`). Snacks is
+  HTML-only and often separates inline elements with nothing but `<a> <strong>…`; dropping those nodes
+  glued words together ("fromCadence", "EntryPoint last Friday" → "entrypointlast"), which also broke
+  exact quote matching.
 - **Tickers are extracted mechanically, not linguistically.** The newsletter links every company
   it mentions to `robinhood.com/stocks/<TICKER>`, wrapped as a base64 path segment inside a
   `link.sherwood.news` tracking URL. `_decode_tracking_url()` + `_extract_tickers()` recover them,
@@ -496,6 +507,75 @@ as **Portfolio Risk**. Not yet seen on a scheduled cron run — first validated 
 (real Robinhood + yfinance + Claude, email/git/state writes skipped): AMD (50% given back) and COST
 (34%) alerted, both were trimmed, and proceeds went to GOOGL/META outside the semis cluster.
 
+## Newsletter Analyst Views & Catalysts
+
+The newsletters are the one source here carrying *analysis*: Sherwood's own read, strategists and
+firms it quotes, Robinhood retail-flow data, and (Snacks) the week's earnings calendar. Passing the
+raw issue text was not enough — on 2026-10-26 the analysis trimmed META "for no dated catalyst" while
+EntryPoint's lead item was Meta's $95B equity raise, and recommended buying GOOGL without noting that
+GOOGL, MSFT and KLAC report Wednesday and AMZN Thursday (the calendar had been truncated away).
+Matching tickers to paragraphs was rejected: it is sentiment-blind, and the useful content is the
+view, not the mention.
+
+`newsletter_views.extract_all()` runs one Sonnet call per issue (parallel, thinking disabled, fails soft —
+the raw issue still reaches the analysis) and returns `views` (`editorial` / `third_party` /
+`retail_flow`, each with direction, horizon, claim, reasoning, an invalidation condition only if the
+text states one, and a **verbatim quote**), `events` (material facts: offerings, guidance, deals),
+`catalysts` (dated earnings/macro, weekday names resolved against the issue date) and the issue's
+overall `stance`. Nothing the model emits is trusted unchecked (`validate_extraction`):
+
+- an item whose quote isn't a contiguous span of the issue (whitespace/case/curly-quote
+  insensitive) is dropped and counted in the log (`N dropped as unverifiable`); stitched multi-sentence
+  quotes with ellipses fail on purpose;
+- a ticker not in the issue's own `robinhood.com/stocks/<T>` links is removed, so a symbol can't be
+  invented; earnings catalysts keep tickers only; a bad date drops the catalyst.
+
+What it does **not** check is that the claim is *entailed* by the quote — a quote can support only part
+of a claim. The prompt tells the extractor the claim must not say more than the quote does, but this
+is the residual risk.
+
+How it reaches the analysis:
+- `=== ANALYST VIEWS ===` and `=== THIS WEEK'S CATALYSTS ===` sections right after the raw issues, with
+  the trust weighting stated (Sherwood editorial > third-party quoted analysts, who are second-hand and
+  must be attributed > retail flow, which is behaviour, not analysis). Catalysts are deduplicated across
+  issues (earnings merged per date + premarket/after-close slot; macro by word overlap).
+- Each held position carries its own `Newsletter event` / `Newsletter view` lines and, if it reports
+  within `CATALYST_TAG_DAYS` (4), a `[REPORTS EARNINGS …]` tag — next to the price/RSI data it is
+  deciding on rather than in a section it has no reason to reread. This is what actually made the
+  META trim cite the equity raise; the section alone did not.
+- Hard constraints in `CLAUDE_SYSTEM_PROMPT`: `ANALYST VIEWS` (an **ANALYST VIEWS** block of ≤5 lines
+  between `SINCE LAST SESSION` and `OPPORTUNITY COST CHECK`, each AGREE/DISAGREE/PARTLY against this
+  prompt's data and ending `changes: <action>` / `changes: nothing`; hedging preserved; events on
+  held symbols weighed in that position's reasoning) and `CATALYSTS` (any buy/add/trim of a symbol
+  reporting within days must name the event). The TL;DR rule gained: do not state the market mood more
+  confidently than the issue's own `stance`, and name only companies/themes present in the news or
+  positions (it had coined "AMD-adjacent suppliers").
+- An `=== BEFORE YOU WRITE ===` reminder ends the prompt. Without it the model skipped the ANALYST
+  VIEWS block outright on a same-day rerun. A missing block also logs a warning. If it keeps being
+  skipped, the next step is a post-parse retry, not more prompt text.
+- `apply_watch_verdicts()`'s block-boundary regex now stops at `ANALYST VIEWS` too.
+- Rendered in both digests (`What Sherwood is saying`); extraction results are saved to `news.json`
+  under `newsletter_views`. They are not yet persisted to `last_analysis.json`, and view outcomes are
+  not tracked across sessions (deferred: watch items already carry the multi-day thread).
+
+`CLAUDE_MAX_TOKENS` went 4000 → 5000 because the new block lengthens the response, and the TL;DR is
+written last — a truncated response would lose it.
+
+Extraction is stochastic: across runs on the same issue the view count varied (3–5 Snacks, 7–12
+EntryPoint) and the earnings-slot ticker lists varied in completeness (held names were found every
+time). Not a correctness problem, but don't diff two runs expecting identical output.
+
+## No-action lines in TRIMS/EXITS
+
+The analysis was writing `**TRIM COST — no action**` into `TRIMS/EXITS` to explain a blocked protected
+symbol. That block is for trades. The prompt now says a restricted position is one line in `HOLDS`, but
+the model rewords around the rule (`**HOLD COST — no trim**`, then plain-prose `No action on COST — …`),
+so `strip_noop_trim_lines()` enforces it after parsing: it drops no-action TRIM/EXIT/SELL and HOLD
+header lines from the block, and plain-prose lines naming a commitment-blocked symbol. It leaves
+alone symbols with a gain-giveback alert (a hold-despite-alert must stay written in this block,
+as `**HOLD X (giveback alert) — reason**`) and any bold EXIT/TRIM header. If that empties the block it
+writes `No trims or exits today.`
+
 ## Exits Belong in TRIMS/EXITS (block-order hazard)
 
 The analysis blocks are written in order (`TRIMS/EXITS` → `BUYS` → `HOLDS`), and with thinking
@@ -523,8 +603,9 @@ Reads all Robinhood watchlists each run. Tickers not already in `tickers.json` o
 
 That reinvestment condition is **mechanically enforced across runs, not just requested in the prompt**. When the daily analysis *recommends* a protected-symbol trim, a small follow-up Claude call extracts the trim amount and reinvestment price into `protected_commitments.json` — but only as a **pending** commitment, since this script never places trades itself (trading is manual/human-in-the-loop, see the MCP workflow below). A recommendation is not a trade. Every subsequent run:
 - Checks each pending commitment against real order history (`get_recent_orders`) for a matching sell — only then is it promoted to **confirmed** and actually enforced. If no matching trade shows up within `PROTECTED_COMMITMENT_PENDING_DAYS` (7 days), the pending commitment is dropped as never executed.
-- Resolves each *confirmed* commitment against real order history — a qualifying buy-back, or the position being fully exited, clears it. Nothing the model says clears or confirms a commitment; only real trade data does.
-- Injects any confirmed, still-outstanding commitment into the prompt as `=== OUTSTANDING REINVESTMENT COMMITMENTS ===`, and the `PROTECTED SYMBOL REINVESTMENT` hard constraint forbids recommending another partial trim of that symbol until it's gone (a full exit for a specifically broken thesis is the only override). Pending (unconfirmed) commitments don't block anything yet.
+- Resolves each *confirmed* commitment against real order history. It clears on any of: a buy at/below the target price; buys after the trim, **at any price**, adding back ≥ `PROTECTED_COMMITMENT_RESTORE_FRACTION` (60%) of the trimmed dollars (the position is restored); the position being fully exited; or `PROTECTED_COMMITMENT_MAX_DAYS` (14) elapsing since the trim. Nothing the model says clears or confirms a commitment; only real trade data (or the clock) does.
+  - **Why the last three exist (2026-10-26):** COST was trimmed at $938.04 and was $1,009 three days later. A confirmed commitment used to live until a buy at/below $938 landed, so a rising core holding was un-trimmable indefinitely and the prompt framed it as "condition not yet met", which in practice meant nobody added to it. The lock covers **trims only**; buying a protected symbol was never forbidden and the prompt now says so (a buy is judged by the normal no-chasing entry standard, and a big enough one clears the commitment). Restoring above the original price is deliberately allowed — the discipline is "don't sell and never come back", not "never pay more than you sold for".
+- Injects any confirmed, still-outstanding commitment into the prompt as `=== OUTSTANDING REINVESTMENT COMMITMENTS ===`, and the `PROTECTED SYMBOL REINVESTMENT` hard constraint forbids recommending another partial trim of that symbol until it's gone (a full exit for a specifically broken thesis is the only override). A blocked trim is just a hold: it is not written up in `TRIMS/EXITS` (see No-action lines below). Pending (unconfirmed) commitments don't block anything yet.
 - `protected_commitments.json` lives in `~/Dropbox/robinhood-monitor/` (via `resolve_sync_paths()`, called at the top of `main()`), not the repo, so the state stays in sync across the two machines this script runs from without putting real dollar figures in the (public) git history.
 
 This is the second place in the codebase (after `compute_trim_warnings`/TRIM COUNT WARNINGS) where Python-tracked state — not model self-restraint — blocks what the analysis is allowed to recommend.
@@ -555,7 +636,7 @@ A second Claude call (Haiku model, 500 tokens) runs after the momentum scan and 
 4. Top Momentum Movers (table)
 5. Watchlist Updates (add/remove with reasons + linked source articles)
 6. Claude Analysis (markdown-rendered)
-7. Market News — each Sherwood issue (green source banner, full text) with the merged tickers named, or dated wire headlines, or a red warning block if neither was available
+7. Market News — **What Sherwood is saying** (each issue's overall read, direction-tagged views with `HELD` flags, and the week's catalyst table), then each Sherwood issue as sent (green source banner, full text) with the merged tickers named, or dated wire headlines, or a red warning block if neither was available
 8. Ticker News — Yahoo Finance per holding (linked, dated headlines)
 9. Abbreviations glossary (footer)
 
@@ -632,3 +713,5 @@ claude mcp add robinhood-trading --transport http https://agent.robinhood.com/mc
 ## No Tests
 
 No test suite. Validate changes by running the script directly and checking `monitor.log`.
+
+Pure helpers (`newsletter_views.py`, `strip_noop_trim_lines`, `resolve_protected_commitments`, `_TextExtractor`) are easy to exercise inline without a suite. The validation that has actually caught things here is a **live dry run**: call `main()` with `send_email`, `git_*`, `save_analysis`, `save_news_cache`, `save_protected_commitments` and `save_ethical_exclusions` stubbed, `TICKERS_FILE` pointed at a scratch copy, and the file log handler removed — real Robinhood, yfinance and Claude, nothing written. Capture `build_prompt`'s output and read the prompt, not just the analysis. Model compliance is stochastic, so run it twice before believing a prompt change worked.
