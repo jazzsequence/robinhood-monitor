@@ -27,6 +27,10 @@
     "LUMN": {
       "reason": "Lumen Technologies operates a major data center infrastructure business as a core revenue driver, qualifying as a data center operator under criterion (4).",
       "added": "2026-10-26"
+    },
+    "MPWR": {
+      "reason": "Criterion (4): Mpower Financing primarily operates as a data center power infrastructure specialist, focusing on power delivery and cooling solutions for data centers.",
+      "added": "2026-10-30"
     }
   },
   "screened": [
@@ -57,12 +61,14 @@
     "LUMN",
     "MARA",
     "META",
+    "MPWR",
     "MRVL",
     "MSFT",
     "MU",
     "NFLX",
     "NVDA",
     "ONTO",
+    "ORCL",
     "PANW",
     "PLTR",
     "QCOM",
