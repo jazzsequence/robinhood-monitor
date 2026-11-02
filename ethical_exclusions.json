@@ -31,6 +31,10 @@
     "MPWR": {
       "reason": "Criterion (4): Mpower Financing primarily operates as a data center power infrastructure specialist, focusing on power delivery and cooling solutions for data centers.",
       "added": "2026-10-30"
+    },
+    "FTNT": {
+      "reason": "Fortinet primarily manufactures cybersecurity and network security products that are widely used for mass surveillance, policing, and ICE/immigration-enforcement technology deployment, meeting criterion (2).",
+      "added": "2026-11-02"
     }
   },
   "screened": [
@@ -48,6 +52,7 @@
     "COST",
     "CRWD",
     "DELL",
+    "FTNT",
     "GE",
     "GEO",
     "GOOGL",
