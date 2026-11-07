@@ -229,8 +229,11 @@ CLAUDE_SYSTEM_PROMPT = (
     "why you are overriding it. The only valid overrides are: (1) the position's thesis is "
     "specifically broken (adverse news, structural change) and you are selling for that reason, "
     "independent of funding a new buy, or (2) the eligible list is empty or insufficient and the "
-    "capital is urgently needed with no other option. If you recommend trimming a NOT "
-    "FUNDING-ELIGIBLE position without invoking one of these two overrides by name, your output "
+    "capital is urgently needed with no other option, or (3) the position is a member of a cluster "
+    "listed in '=== CLUSTER BREAKDOWN ===' and the trim is part of that section's required cut "
+    "(see CLUSTER BREAKDOWN — those proceeds are held as cash, they do not fund a buy). If you "
+    "recommend trimming a NOT "
+    "FUNDING-ELIGIBLE position without invoking one of these overrides by name, your output "
     "is invalid. When you do recommend a trim, state the position's total_return_pct in your "
     "one-sentence reasoning so the funding source is verifiably a winner, not just a mover. "
     "'It has been going down' is not a thesis — price weakness alone does not justify "
@@ -247,7 +250,9 @@ CLAUDE_SYSTEM_PROMPT = (
     "find a different funding source that is NOT flagged, or state plainly that no compelling "
     "funding source is currently available and the opportunity should wait for new cash or a "
     "different position's proceeds. Do not treat the warning as advisory — it is a rule, not a "
-    "data point to weigh against the buy.\n\n"
+    "data point to weigh against the buy. The one exception is the cut required by a "
+    "'=== CLUSTER BREAKDOWN ===' section: that cut is exposure reduction, not funding a new "
+    "opportunity, and TRIM COUNT WARNINGS do not block it.\n\n"
     "POSITION-SIZE-AWARE TRIM SIZING — HARD CONSTRAINT: A trim's dollar amount must be sized "
     "relative to that position's current equity (shown per position as 'equity $X'), never picked "
     "as a fixed dollar figure in isolation. A trim by definition leaves the MAJORITY of the "
@@ -339,7 +344,49 @@ CLAUDE_SYSTEM_PROMPT = (
     "protect against. Buying inside a flagged cluster needs a specific, named reason stronger "
     "than 'it is at support'. Cash may be held only when no candidate clears the entry standard; then "
     "say so plainly and name the candidate you rejected and why. That exception is for a thin "
-    "field of candidates, not a way to avoid the decision.\n\n"
+    "field of candidates, not a way to avoid the decision. The one exception is the cut "
+    "required by CLUSTER BREAKDOWN, whose proceeds are held as cash.\n\n"
+    "CLUSTER BREAKDOWN — HARD CONSTRAINT: If a '=== CLUSTER BREAKDOWN ===' section appears, a "
+    "cluster of holdings that moves together has broken down: most of its names are below "
+    "their own 50-session average and the cluster as a whole is well under its recent high. "
+    "These are measurements computed in Python from price history, not an impression. GAIN "
+    "GIVEBACK cannot see this — it only watches positions that were once well in profit — and "
+    "in the October-November 2026 chip slide every chip holding was either underwater, "
+    "trim-count-blocked, or had never been 20% up, so nothing was ever sold while the cluster "
+    "fell 35%. In a 2-year backtest of that cluster, cutting it by half when this condition "
+    "appeared and restoring it when it cleared beat holding (+94% vs +71%) and cut the worst "
+    "drawdown from -44% to -36%; the condition first appeared about three weeks before the "
+    "worst of the slide, when the cluster was only ~8% off its high. "
+    "(1) CUT: when the section says CUT REQUIRED, TRIMS/EXITS must recommend sales across "
+    "that cluster's members totalling the stated dollar amount (within ~10%). The section "
+    "lists a suggested sale for every member, computed in Python so the figures sum exactly to "
+    "the required cut and no member exceeds half its equity: use them as written, moving "
+    "dollars between members only for a stated reason (a pending sell, a protected symbol's "
+    "cap, a member bought under 7 days ago). Your individual trim lines must ADD UP to the "
+    "total you state — add them before you write the total, and never state a total the lines "
+    "do not sum to (a person places these trades from this list). State the total and the "
+    "members in one bold line, e.g. **CUT SEMIS CLUSTER — Sell $180 across NVDA, MRVL, "
+    "TSM…**, then list the individual trims. This cut overrides COST "
+    "BASIS DISCIPLINE (underwater members are sellable), REPEATED SELL PATTERN (TRIM COUNT "
+    "WARNINGS do not apply to it) and the 'a position must be up' logic of TRIM SIGNALS. It does "
+    "not override a pending sell order, a protected symbol's 10% cap, or RECENT POSITIONS "
+    "(a member bought under 7 days ago is cut last). 'Thesis intact', 'oversold', 'RSI near "
+    "30', 'sector-wide pullback', 'already down a lot' and 'down with everything else' are NOT "
+    "reasons to skip or shrink the cut — they describe why the cluster is falling, not why it "
+    "will stop, and being oversold is the normal state of a breakdown. The only valid reason is "
+    "specific and checkable: a dated catalyst within days that you name, or a named support "
+    "level with its price that has held; state it inside TRIMS/EXITS as '**HOLD <cluster> "
+    "(breakdown) — reason**'. "
+    "(2) HOLD THE PROCEEDS: the cut's proceeds stay in cash. While any cluster is in breakdown, "
+    "EXITS FUND BUYS and the BUYS deploy-idle-cash default are suspended — do not redeploy into "
+    "another high-beta holding to rebuild the same exposure. Write 'proceeds held in cash — "
+    "CLUSTER BREAKDOWN' in BUYS; this exception needs no rejected candidate named. "
+    "(3) NO BUYING THE FALLING CLUSTER: no BUY of any member of a cluster in breakdown, and "
+    "'oversold' or 'dip' is not an entry reason for one. "
+    "(4) The condition is re-measured every session. When the section no longer appears, the "
+    "restrictions end and the normal rules resume, including deploying idle cash; if it appears "
+    "with 'No cut required', keep (2) and (3) in force and say so in one clause. A cluster "
+    "that is still over target the next session is cut again by the remainder shown.\n\n"
     "PORTFOLIO RISK CONTEXT: If a '=== PORTFOLIO RISK CONTEXT ===' section appears, reason "
     "from it instead of from impressions. (1) Before attributing a drop to a 'sector-wide "
     "pullback' or a 'broad risk-off day', check the benchmark figures: if the portfolio fell "
@@ -351,8 +398,9 @@ CLAUDE_SYSTEM_PROMPT = (
     "recommendation — a cluster below its recent high while the benchmark that tracks it is "
     "weak is one exposure falling, not several independent holds. If nothing about it changed "
     "since the PRIOR RUN ANALYSIS, say so in a clause rather than re-describing it. (3) These "
-    "figures describe exposure; concentration alone is not a sell trigger. GAIN GIVEBACK is "
-    "the sell trigger.\n\n"
+    "figures describe exposure; concentration alone is not a sell trigger. GAIN GIVEBACK and "
+    "CLUSTER BREAKDOWN (a cluster that is concentrated AND falling together) are the sell "
+    "triggers.\n\n"
     "OPPORTUNITY COST CHECK — HARD CONSTRAINT: Before writing TRIMS/EXITS, explicitly answer "
     "one question: is there a better use of capital right now than what is already held? Name "
     "the single strongest candidate not already owned or pending — the top-scoring symbol from "
@@ -371,7 +419,9 @@ CLAUDE_SYSTEM_PROMPT = (
     "this check answers a different question and must not be skipped just because a candidate is "
     "not compelling. If no momentum or watchlist candidate scores above roughly 15, say so "
     "explicitly and treat that as this session's actual reason to ride it out — a weak field is "
-    "an answer, not a skipped check.\n\n"
+    "an answer, not a skipped check. If a CLUSTER BREAKDOWN section is present the check is "
+    "still answered, but no member of the broken cluster can be the candidate and the cut's "
+    "proceeds are not funding for it (they are held as cash).\n\n"
     "WATCH ITEM FOLLOW-THROUGH — HARD CONSTRAINT: If an '=== OPEN WATCH ITEMS ===' section "
     "appears in the data below, each numbered item is something a prior run flagged as the one "
     "thing to watch, and the script has been tracking it ever since. Every item comes with "
@@ -422,9 +472,10 @@ CLAUDE_SYSTEM_PROMPT = (
     "Do not mention positions that are merely being held; those go in HOLDS. Never write a "
     "TRIM/EXIT/SELL action line for a position you are NOT trimming or exiting — no '**TRIM COST — "
     "no action**'. A protected symbol that is blocked by an outstanding commitment, or any other "
-    "restricted position, is simply a hold: one line in HOLDS, nothing here. The one exception is "
+    "restricted position, is simply a hold: one line in HOLDS, nothing here. The exceptions are "
     "a GAIN GIVEBACK alert you are holding through, which is written as '**HOLD META (giveback "
-    "alert) — specific reason**' and not as a trim line. "
+    "alert) — specific reason**' and not as a trim line, and the cut required by a CLUSTER "
+    "BREAKDOWN section (see that rule), which is always written here. "
     "If nothing to trim, say so in one sentence — but only after checking that no position is "
     "being exited for any reason, including SMALL POSITION CLEANUP, and that every GAIN GIVEBACK "
     "alert has been either acted on or named here with its specific reason for holding. "
@@ -442,7 +493,8 @@ CLAUDE_SYSTEM_PROMPT = (
     "(including a few dollars of leftover proceeds) is to deploy it into the best available "
     "opportunity this session. Holding cash is an exception that needs a specific, named reason "
     "(e.g. every candidate is overbought or news-damaged, or a pending order already "
-    "earmarks it) — 'it's only $7' and 'nothing is broken' are not reasons. If you hold cash, "
+    "earmarks it, or a CLUSTER BREAKDOWN is active — see that rule) — 'it's only $7' and "
+    "'nothing is broken' are not reasons. If you hold cash, "
     "say which exception applies. Deploying is not a license to chase: the target of a small "
     "deployment must pass the SAME entry standard as any other buy. A one-session bounce, a "
     "green day, or an analyst price-target headline is NOT a reason to buy a name — if you "
@@ -2965,6 +3017,7 @@ def build_prompt(summary: dict) -> str:
         {p["symbol"] for p in summary["positions"]},
         summary["date"],
     )
+    breakdown_by_symbol = portfolio_risk.breakdown_symbols(summary.get("risk_context"))
     for pos in summary["positions"]:
         ind = pos.get("indicators", {})
         alloc_pct = pos["equity"] / total_value * 100
@@ -2974,6 +3027,14 @@ def build_prompt(summary: dict) -> str:
             funding_tag = (
                 "NOT FUNDING-ELIGIBLE — an unfilled sell order is already placed on "
                 "this position (see PENDING ORDERS); its proceeds are already spoken for"
+            )
+        elif symbol in breakdown_by_symbol:
+            # Takes precedence over losing / trim-count / etc.: the cut is exposure
+            # reduction, which those rules were never written to block.
+            funding_tag = (
+                "CLUSTER BREAKDOWN — SELL-ELIGIBLE for the required cut even if underwater or "
+                "trim-count-blocked; proceeds are held as cash, NOT a funding source for buys"
+                + (" (bought within the last 7 days: cut last)" if symbol in recent_buy_symbols else "")
             )
         elif not is_winner:
             funding_tag = "NOT FUNDING-ELIGIBLE — losing position (see COST BASIS DISCIPLINE)"
@@ -3044,6 +3105,7 @@ def build_prompt(summary: dict) -> str:
          and p["symbol"] not in trim_warnings
          and p["symbol"] not in recent_buy_symbols
          and p["symbol"] not in pending_sell_symbols
+         and p["symbol"] not in breakdown_by_symbol
          and p["symbol"] not in PROTECTED_SYMBOLS),
         key=lambda p: p["total_return_pct"],
         reverse=True,
@@ -3116,6 +3178,28 @@ def build_prompt(summary: dict) -> str:
                     + portfolio_risk.giveback_summary(sym, g, pos["total_return_pct"])
                     + f"; equity ${pos['equity']:.2f}"
                 )
+    broken_clusters = portfolio_risk.breakdown_clusters(risk_context)
+    if broken_clusters:
+        lines += ["", "=== CLUSTER BREAKDOWN (computed in Python — see CLUSTER BREAKDOWN rule) ==="]
+        position_by_symbol = {p["symbol"]: p for p in summary["positions"]}
+        for c in broken_clusters:
+            lines.append(f"⚠ {c['pct_of_equity']:.0f}% of equity, {len(c['symbols'])} names:")
+            split = portfolio_risk.breakdown_split(
+                c, {p["symbol"]: p["equity"] for p in summary["positions"]}
+            )
+            for sym in c["symbols"]:
+                pos = position_by_symbol.get(sym)
+                if pos:
+                    sale = f" -> suggested sale ${split[sym]:.2f}" if sym in split else ""
+                    lines.append(
+                        f"    {sym:<8} equity ${pos['equity']:.2f}, return {pos['total_return_pct']:+.1f}%{sale}"
+                    )
+            if split:
+                lines.append(
+                    f"    (suggested sales sum to ${sum(split.values()):.2f}, the required cut; "
+                    "your trim lines must add up to that)"
+                )
+            lines += [f"  {line}" for line in portfolio_risk.breakdown_cluster_lines(c)]
     risk_lines = portfolio_risk.risk_text_lines(risk_context, summary["positions"])
     if risk_lines:
         lines += ["", "=== PORTFOLIO RISK CONTEXT (computed in Python) ==="] + risk_lines
@@ -3182,19 +3266,33 @@ def build_prompt(summary: dict) -> str:
             f"Vol ratio {_fmt(m.get('volume_ratio'), '.2f')}x | "
             f"Score {m['score']}"
         )
+    # Last thing the model reads before writing. The system prompt carries the full
+    # rules, but on a long prompt a required block was skipped outright on a rerun.
+    reminders = []
     if summary.get("newsletter_views"):
-        # Last thing the model reads before writing. The system prompt carries the full
-        # rules, but on a long prompt the block was skipped outright on a rerun.
-        lines += [
-            "",
-            "=== BEFORE YOU WRITE ===",
+        reminders.append(
             "The newsletters' analysis is in the ANALYST VIEWS section above. Your analysis MUST "
             "contain an **ANALYST VIEWS** block (agree/disagree against this prompt's data, "
             "ending 'changes: <action>' or 'changes: nothing') ahead of OPPORTUNITY COST CHECK. "
             "Any position with a 'Newsletter event' line gets that event weighed in its own "
             "trim/buy/hold reasoning, and a position tagged [REPORTS EARNINGS …] gets the "
-            "earnings named in any buy or trim of it.",
-        ]
+            "earnings named in any buy or trim of it."
+        )
+    if broken_clusters:
+        cut_total = sum(c["cut_usd"] for c in broken_clusters)
+        reminders.append(
+            "A CLUSTER BREAKDOWN section is present above. "
+            + (
+                f"TRIMS/EXITS MUST contain the cluster cut (about ${cut_total:.2f} in total across "
+                "its members; 'oversold' and 'thesis intact' are not reasons to skip it), "
+                if cut_total > 0 else
+                "No cut is required, but "
+            )
+            + "BUYS must hold the proceeds and any idle cash instead of deploying them, and no "
+            "member of the broken cluster may be bought."
+        )
+    if reminders:
+        lines += ["", "=== BEFORE YOU WRITE ==="] + reminders
     return "\n".join(lines)
 
 
@@ -3264,6 +3362,78 @@ def strip_noop_trim_lines(
     return "\n".join(lines[:start + 1] + kept + lines[end:])
 
 
+# "**TRIM NVDA — Sell $40**" / "**NVDA — Sell $40.48**" / "**EXIT SOLV — Sell all ($7.15)**":
+# the verb is optional (the model drops it under a bold cluster header), then the symbol,
+# then the first $ amount. The caller keeps only symbols in the cluster, so a header such
+# as "**CUT SEMIS CLUSTER — Sell $174 …**" (symbol 'CUT') is ignored rather than double-counted.
+_TRIM_AMOUNT_RE = re.compile(
+    r"^[\s\-*•]*\*\*\s*(?:(?:TRIM|EXIT|SELL)\s+)?([A-Z][A-Z.\-]{0,9})\b[^*\n]*?\$\s*([\d,]+(?:\.\d+)?)",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Trims totalling less than this share of the required cut get logged as under-delivered.
+CLUSTER_CUT_MIN_FRACTION = 0.85
+
+
+def _trims_block(analysis: str) -> str:
+    """Text of the TRIMS/EXITS block (header to the next block header); '' if absent."""
+    body, inside = [], False
+    for line in analysis.splitlines():
+        if _TRIMS_HEADER_RE.match(line):
+            inside = True
+            continue
+        if inside and _AFTER_TRIMS_RE.match(line):
+            break
+        if inside:
+            body.append(line)
+    return "\n".join(body)
+
+
+def _warn_if_cluster_cut_ignored(analysis: str, risk_context: dict | None) -> None:
+    """Log when a required CLUSTER BREAKDOWN cut never reached TRIMS/EXITS.
+
+    Same stance as the missing-ANALYST-VIEWS warning: a skipped block is logged
+    rather than patched with more prompt text. If this fires repeatedly the next
+    step is a post-parse retry, not more wording. Naming a member (as a trim or as
+    a hold with a reason) or the word 'breakdown' counts as addressing it; whether
+    the reason given is a *valid* one is for the human reading the digest.
+    """
+    block = _trims_block(analysis)
+    for c in portfolio_risk.breakdown_clusters(risk_context):
+        if c["cut_usd"] <= 0:
+            continue
+        named = [
+            s for s in c["symbols"]
+            if re.search(rf"\b(?:TRIM|EXIT|SELL|HOLD)\b[^\n]*\b{re.escape(s)}\b", block, re.IGNORECASE)
+        ]
+        if not named and not re.search(r"breakdown", block, re.IGNORECASE):
+            log.warning(
+                f"CLUSTER BREAKDOWN cut of ${c['cut_usd']:.2f} was required for "
+                f"{c['symbols']} but TRIMS/EXITS neither trims nor addresses any of them"
+            )
+            continue
+        # The model sums its own trims unreliably (it once listed $138 against a $174
+        # target and called that "within ~10%"), so total the per-position lines here.
+        members = set(c["symbols"])
+        total = sum(
+            float(m.group(2).replace(",", ""))
+            for m in _TRIM_AMOUNT_RE.finditer(block)
+            if m.group(1).upper() in members
+        )
+        if total == 0:
+            # No trim lines at all: a decline written as '**HOLD … (breakdown) — reason**'.
+            # Allowed, but only with a specific checkable reason — worth a human's eye.
+            log.info(
+                f"CLUSTER BREAKDOWN cut of ${c['cut_usd']:.2f} was declined in TRIMS/EXITS — "
+                "check the stated reason is a dated catalyst or a named held support level"
+            )
+        elif total < CLUSTER_CUT_MIN_FRACTION * c["cut_usd"]:
+            log.warning(
+                f"CLUSTER BREAKDOWN cut under-delivered: trims on {sorted(members)} total "
+                f"${total:.2f} against ${c['cut_usd']:.2f} required "
+                f"(floor {CLUSTER_CUT_MIN_FRACTION:.0%})"
+            )
+
+
 def get_claude_analysis(summary: dict) -> tuple[str, str]:
     """Return (tldr, analysis) parsed from Claude's structured response."""
     client = Anthropic()
@@ -3330,11 +3500,15 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
     analysis_part = re.sub(r"^---[ \t]*\n+", "", analysis_part).strip()
     analysis_part = re.sub(r"\n-{3,}[ \t]*$", "", analysis_part).strip()
 
+    # A hold-despite-signal must stay written in TRIMS/EXITS: giveback alerts, and
+    # members of a broken-down cluster (a declined cut is '**HOLD <member> …**').
     analysis_part = strip_noop_trim_lines(
         analysis_part,
-        set(portfolio_risk.giveback_alerts(summary.get("risk_context")) or {}),
+        set(portfolio_risk.giveback_alerts(summary.get("risk_context")) or {})
+        | set(portfolio_risk.breakdown_symbols(summary.get("risk_context"))),
         {c["symbol"] for c in summary.get("protected_commitments", [])},
     )
+    _warn_if_cluster_cut_ignored(analysis_part, summary.get("risk_context"))
     if summary.get("newsletter_views") and not re.search(r"ANALYST\s+VIEWS", analysis_part, re.IGNORECASE):
         log.warning(
             "Analysis omitted the ANALYST VIEWS block even though "
@@ -4438,6 +4612,17 @@ def main():
             log.info(
                 "Concentrated clusters: "
                 + "; ".join(f"{c['pct_of_equity']:.0f}% {c['symbols']}" for c in concentrated)
+            )
+        broken = portfolio_risk.breakdown_clusters(risk_context)
+        if broken:
+            log.info(
+                "Cluster breakdown: "
+                + "; ".join(
+                    f"{c['pct_of_equity']:.0f}% {c['symbols']} "
+                    f"({c['n_below_ma']}/{c['n_with_ma']} below MA, {c['below_high_pct']:+.1f}% vs high, "
+                    f"cut ${c['cut_usd']:.2f})"
+                    for c in broken
+                )
             )
     except Exception as e:
         log.warning(f"Risk context failed: {e}")

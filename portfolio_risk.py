@@ -19,6 +19,11 @@ rather than left to its impression.
 3. Correlation clusters — groups of holdings that actually move together,
    found from return correlations rather than a hard-coded sector list, so any
    concentration (semis today, something else tomorrow) is surfaced.
+4. Cluster breakdown — the sell trigger for what giveback cannot see: ordinary,
+   often underwater positions in a sector falling together. Concentration alone
+   stayed context-only until the Oct-Nov 2026 slide, when every chip name was
+   either underwater, trim-count-blocked, or never 20% up, so nothing could be
+   sold. See BREAKDOWN_* below.
 
 Everything here is non-critical: callers wrap it in try/except and the digest
 simply omits what could not be computed.
@@ -55,6 +60,36 @@ CLUSTER_MIN_HISTORY = 100  # a name with less history than this is left out
 CLUSTER_REPORT_MIN_PCT = 10.0  # don't list clusters smaller than this share of equity
 CONCENTRATION_ALERT_PCT = 25.0
 CLUSTER_HIGH_WINDOW = 60  # sessions for the "below its recent high" figure
+
+# Cluster breakdown — the sell trigger for the thing GAIN GIVEBACK cannot see:
+# ordinary (often underwater) positions in a sector that is falling together.
+# A cluster has "broken down" when most of its names are under their own
+# 50-session average AND the cluster as a whole is well under its recent high.
+# Both are measurements from the price history, not an impression.
+#
+# Calibrated on the 10-name chip cluster over 2y of daily closes (current holdings
+# back-cast, so survivorship flatters everything — read the comparison, not the
+# absolutes): buy-and-hold +71% / worst drawdown -44%; cutting the cluster by half
+# whenever the condition holds and restoring it when it clears, +94% / -36%, ~26%
+# of days in the cut state, 11 episodes. Every parameter variant tried (60/70% of
+# names below the average, 5-12% under the high) first fired 2026-10-13/14, about
+# three weeks before the worst of the October-November slide, with the cluster
+# only ~8% off its high. The parameters were chosen after seeing that episode,
+# so the out-of-sample edge is unproven. The earlier finding that portfolio- and
+# sector-level *trailing stops* lose (see CLAUDE.md) still stands: this is a
+# breadth rule, not a stop.
+CLUSTER_MA_WINDOW = 50
+BREAKDOWN_MA_SHARE = 0.6  # share of a cluster's names below their own average
+BREAKDOWN_DRAWDOWN_PCT = 8.0  # cluster value this far under its 60-session high
+# A broken-down cluster larger than this share of equity is cut back to it; the
+# existing concentration line, so the rule needs no new number to explain.
+BREAKDOWN_TARGET_PCT = CONCENTRATION_ALERT_PCT
+# ...but never more than half the cluster in one session. That is what the backtest
+# cut, it keeps every member inside the 50%-per-position trim rule (no forced full
+# exits), and without it a portfolio that is mostly one cluster would be told to
+# sell nearly everything. If the cluster is still over target next session the
+# remainder is cut then.
+BREAKDOWN_MAX_CUT_SHARE = 0.5
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -216,7 +251,36 @@ def compute_concentration(
         value = (closes[members] * pd.Series({s: shares[s] for s in members})).sum(axis=1)
         recent_high = float(value.tail(CLUSTER_HIGH_WINDOW).max())
         tracker = _best_tracker(value, bench) if bench else None
+        below_high = round(_pct(float(value.iloc[-1]), recent_high), 1)
+
+        # Breadth: how many of the cluster's names sit under their own average.
+        # Counted by name, not by dollars, so one big position can't mask the rest.
+        avg = closes[members].rolling(CLUSTER_MA_WINDOW).mean().iloc[-1]
+        valid = avg.dropna().index
+        n_below = int((closes[members].iloc[-1][valid] < avg[valid]).sum())
+        below_share = n_below / len(valid) if len(valid) else 0.0
+        broken = bool(
+            len(valid) >= 2
+            and below_share >= BREAKDOWN_MA_SHARE
+            and below_high <= -BREAKDOWN_DRAWDOWN_PCT
+        )
+        # Dollars to sell so the cluster is BREAKDOWN_TARGET_PCT of what is left
+        # (proceeds leave the positions list as cash, so the denominator shrinks
+        # with the numerator). Solved exactly so that executing it clears the
+        # excess instead of re-triggering a smaller cut every session, then capped
+        # at BREAKDOWN_MAX_CUT_SHARE of the cluster per session.
+        cluster_equity = sum(equity[s] for s in members)
+        w = BREAKDOWN_TARGET_PCT / 100
+        cut_usd = 0.0
+        if broken:
+            cut_usd = max(0.0, (cluster_equity - w * total_equity) / (1 - w))
+            cut_usd = min(cut_usd, BREAKDOWN_MAX_CUT_SHARE * cluster_equity)
         out.append({
+            "breakdown": broken,
+            "cut_usd": round(cut_usd, 2),
+            "equity": round(cluster_equity, 2),
+            "n_below_ma": n_below,
+            "n_with_ma": int(len(valid)),
             "tracks": tracker[0] if tracker else None,
             "tracks_corr": tracker[1] if tracker else None,
             "tracks_5d": tracker[2] if tracker else None,
@@ -224,7 +288,7 @@ def compute_concentration(
             "pct_of_equity": round(share, 1),
             "ret_5d": round(_pct(value.iloc[-1], value.iloc[-6]), 1) if len(value) > 5 else None,
             "ret_1m": round(_pct(value.iloc[-1], value.iloc[-22]), 1) if len(value) > 21 else None,
-            "below_high_pct": round(_pct(float(value.iloc[-1]), recent_high), 1),
+            "below_high_pct": below_high,
             "concentrated": share >= CONCENTRATION_ALERT_PCT,
         })
     return sorted(out, key=lambda c: -c["pct_of_equity"])
@@ -311,6 +375,60 @@ def giveback_alerts(ctx: dict | None) -> dict[str, dict]:
     return {s: g for s, g in ((ctx or {}).get("giveback") or {}).items() if g["status"] == "alert"}
 
 
+def breakdown_clusters(ctx: dict | None) -> list[dict]:
+    """Clusters currently in breakdown, largest first (empty when none / no context)."""
+    return [c for c in ((ctx or {}).get("concentration") or []) if c.get("breakdown")]
+
+
+def breakdown_symbols(ctx: dict | None) -> dict[str, dict]:
+    """symbol -> the broken-down cluster it belongs to."""
+    return {s: c for c in breakdown_clusters(ctx) for s in c["symbols"]}
+
+
+def breakdown_split(c: dict, equity_by_symbol: dict[str, float]) -> dict[str, float]:
+    """Per-member sale amounts for a cluster's cut, proportional to equity and
+    summing exactly to cut_usd.
+
+    The model was asked to size the individual trims itself and twice wrote a
+    headline total ($174) over lines that added up to far less ($138, then $86) —
+    in a digest a person executes trades from. Python does the division; the model
+    copies the numbers. Proportional means no member exceeds half its equity
+    (the cut is capped at half the cluster)."""
+    members = {s: equity_by_symbol[s] for s in c["symbols"] if equity_by_symbol.get(s, 0) > 0}
+    total = sum(members.values())
+    if c["cut_usd"] <= 0 or total <= 0:
+        return {}
+    split = {s: round(c["cut_usd"] * e / total, 2) for s, e in members.items()}
+    drift = round(c["cut_usd"] - sum(split.values()), 2)  # rounding remainder -> largest member
+    if drift:
+        big = max(members, key=members.get)
+        split[big] = round(split[big] + drift, 2)
+    return split
+
+
+def breakdown_cluster_lines(c: dict) -> list[str]:
+    """The measurements and required action for one broken-down cluster."""
+    lines = [
+        f"{c['n_below_ma']} of {c['n_with_ma']} names are below their own "
+        f"{CLUSTER_MA_WINDOW}-session average and the cluster is "
+        f"{abs(c['below_high_pct']):.1f}% under its {CLUSTER_HIGH_WINDOW}-session high "
+        f"(trigger: >= {BREAKDOWN_MA_SHARE:.0%} of names and >= {BREAKDOWN_DRAWDOWN_PCT:.0f}% under the high)."
+    ]
+    if c["cut_usd"] > 0:
+        lines.append(
+            f"CUT REQUIRED: the cluster is ${c['equity']:.2f} ({c['pct_of_equity']:.0f}% of equity); "
+            f"sell about ${c['cut_usd']:.2f} across its members (never more than half the "
+            f"cluster in one session; the aim is {BREAKDOWN_TARGET_PCT:.0f}% of equity). "
+            "Proceeds are held as cash."
+        )
+    else:
+        lines.append(
+            f"No cut required: the cluster is already at or under {BREAKDOWN_TARGET_PCT:.0f}% of equity. "
+            "It stays closed to new buys and its proceeds/idle cash are not redeployed into it."
+        )
+    return lines
+
+
 def giveback_summary(symbol: str, g: dict, return_pct: float) -> str:
     peak = f"peak +{g['peak_gain_pct']:.1f}% on {g['peak_date']}"
     if g["status"] == "alert":
@@ -363,6 +481,8 @@ def risk_text_lines(ctx: dict | None, positions: list[dict]) -> list[str]:
         lines.append("Correlated clusters (holdings that actually move together, found from return correlations):")
         for c in clusters:
             flag = "  ** CONCENTRATED **" if c["concentrated"] else ""
+            if c.get("breakdown"):
+                flag += "  ** BREAKDOWN **"
             lines.append(
                 f"  {c['pct_of_equity']:.0f}% of equity{flag}: {', '.join(c['symbols'])} | "
                 f"5d {_fmt_pct(c['ret_5d'])}, 1m {_fmt_pct(c['ret_1m'])}, "
@@ -376,6 +496,8 @@ def risk_text_lines(ctx: dict | None, positions: list[dict]) -> list[str]:
                     f"5d {_fmt_pct(c['ret_5d'])} vs {c['tracks']} {_fmt_pct(c['tracks_5d'])} "
                     f"— {abs(gap):.1f} pts {verdict} than the benchmark that tracks it"
                 )
+            if c.get("breakdown"):
+                lines += [f"      {line}" for line in breakdown_cluster_lines(c)]
 
     held = {p["symbol"]: p for p in positions}
     protectable = [

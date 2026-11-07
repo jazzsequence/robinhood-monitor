@@ -102,6 +102,9 @@ Python 3.11+ required (uses `float | None` union type syntax).
 | `GIVEBACK_MIN_PEAK_GAIN_PCT` / `GIVEBACK_ALERT_PCT` | `20` / `33` | (`portfolio_risk.py`) peak gain over cost needed to be protectable / share of it surrendered to alert |
 | `CONCENTRATION_ALERT_PCT` | `25` | (`portfolio_risk.py`) cluster share of equity flagged CONCENTRATED |
 | `CLUSTER_CORR_THRESHOLD` | `0.45` | (`portfolio_risk.py`) average-linkage cutoff for "moves together" |
+| `BREAKDOWN_MA_SHARE` / `BREAKDOWN_DRAWDOWN_PCT` | `0.6` / `8` | (`portfolio_risk.py`) cluster breakdown trigger: share of names under their own 50-session average, and % under the cluster's 60-session high — see Cluster Breakdown |
+| `BREAKDOWN_TARGET_PCT` / `BREAKDOWN_MAX_CUT_SHARE` | `25` / `0.5` | (`portfolio_risk.py`) a broken-down cluster is cut toward this share of equity, never by more than this fraction of the cluster per session |
+| `CLUSTER_CUT_MIN_FRACTION` | `0.85` | (`portfolio_monitor.py`) trims summing to less than this share of the required cut are logged as under-delivered |
 | `ETHICAL_SCREEN_CRITERIA` | (see below) | Exclusion rubric applied by the ethical screen — not a user-curated symbol list |
 
 ## Script Flow
@@ -117,7 +120,7 @@ Python 3.11+ required (uses `float | None` union type syntax).
 9. Build summary dict
 10. Fetch market news (Sherwood newsletters via IMAP, else first fresh wire feed — see Market News Sources); when newsletters are present, distill them into verified analyst views / events / catalysts (`newsletter_views.extract_all`, one Sonnet call per issue, non-critical — see Newsletter Analyst Views & Catalysts); fetch per-ticker Yahoo Finance news (parallel); save to `news.json`
 11. Call Claude Haiku for ticker recommendations (JSON: adds + removes with reasons, informed by news + watchlist candidates) → rewrite `tickers.json`
-11b. Build the risk context (`portfolio_risk.build_risk_context`) from the price history `fetch_bulk_market_data` stashed in `PRICE_HISTORY` — non-critical, omitted on failure
+11b. Build the risk context (`portfolio_risk.build_risk_context`) from the price history `fetch_bulk_market_data` stashed in `PRICE_HISTORY` — non-critical, omitted on failure. Includes the per-cluster **breakdown** flag and required cut (see Cluster Breakdown)
 12. Compute session breadth, roll the breadth history forward, and load any still-open watch items — see Session-Over-Session Continuity
 13. Call Claude Sonnet for portfolio analysis
 14. Parse the analysis's `SINCE LAST SESSION` verdicts (closing resolved/escalated watch items) and its new `ONE KEY THING TO WATCH` line (snapshotting baselines for next run)
@@ -484,6 +487,9 @@ A portfolio- or sector-level trailing stop gave up half or more of the return an
 the worst drawdown (the sleeve fell 34% Jun 22 – Jul 29 and recovered; stops sold into it and
 re-entered late). A per-position giveback exit did better: price was lower 40 sessions after the exit
 ~80% of the time. So the sell trigger is per position, and concentration is context only.
+**(Revised 2026-11-07: concentration alone is still context, but a concentrated cluster that is *falling
+together* is now a second sell trigger — see Cluster Breakdown below. The "context only" line above is what
+let a 45% chip cluster fall 35% with no sell recommended.)**
 
 **Concentration — no hard-coded sector lists.** `correlation_clusters()` does average-linkage
 clustering (threshold 0.45) on ~6 months of daily returns. On this portfolio it recovered the real
@@ -506,6 +512,84 @@ risk context is also saved to `last_analysis.json` under `risk_context` and rend
 as **Portfolio Risk**. Not yet seen on a scheduled cron run — first validated by a live dry run
 (real Robinhood + yfinance + Claude, email/git/state writes skipped): AMD (50% given back) and COST
 (34%) alerted, both were trimmed, and proceeds went to GOOGL/META outside the semis cluster.
+
+## Cluster Breakdown (sell trigger for a sector falling together)
+
+Added 2026-11-07, after the portfolio went ~$1,060 → $860 (10-06 → 11-06) while the analysis said "hold" every
+day. Reading the archived digests (they live in Gmail **Trash**, which purges at ~30 days — see session_notes)
+showed it was not one bad call but three independent rules that together left **no chip name sellable**:
+
+1. `COST BASIS DISCIPLINE` — the names that fell hardest were underwater (MRVL -36%, ARM -36%, LRCX -22% on
+   10-13), so NOT FUNDING-ELIGIBLE. The system could only sell winners (DELL, META, CRWD) and kept the laggards.
+2. `REPEATED SELL PATTERN` — the 10-12..10-14 trims of AMD/MU were *correct* and then locked those names as
+   `TRIM COUNT BLOCKED` through the crash.
+3. `GAIN GIVEBACK` needs a >=20% peak gain; MRVL peaked +7.6%, TSM +3.6%, ASML +0.2%. It is a fading-winner
+   alarm, blind to ordinary positions in a falling sector — and `PORTFOLIO RISK CONTEXT` told the model
+   "concentration alone is not a sell trigger".
+
+Plus `EXITS FUND BUYS` / deploy-idle-cash: proceeds were redeployed into GOOGL/NVDA/PANW (same risk factor,
+-12% to -20% since). Net effect of all trading since 10-13 was only ~+$12. The election (11-03) was a *known*
+catalyst: the 11-02 digest listed it "tomorrow" and called it "nothing actionable"; the 11-04 digest carried a
+BEARISH data-center-build-out item, which the 5-line ANALYST VIEWS cap dropped.
+
+**The trigger** (`portfolio_risk.compute_concentration`, per cluster >= 10% of equity, stateless — recomputed
+every run, no new state file): `breakdown` = at least `BREAKDOWN_MA_SHARE` (60%) of the cluster's names are below
+their own 50-session average AND the cluster's value is at least `BREAKDOWN_DRAWDOWN_PCT` (8%) under its
+60-session high. Counted by name, not dollars, so one big position can't mask the rest.
+
+**The action** (all computed in Python, same pattern as trim warnings; nothing is auto-sold):
+- `cut_usd` — dollars to sell so the cluster is `BREAKDOWN_TARGET_PCT` (25%, the existing concentration line) of
+  what remains, solved exactly (proceeds leave the positions list, so the denominator shrinks too) and **capped
+  at half the cluster per session**. The cap matches what was backtested, keeps every member inside the 50%-per-
+  position trim rule, and stops a portfolio that is mostly one cluster being told to sell nearly everything. A
+  cluster still over target next session is cut by the remainder; when it is at/under target `cut_usd` is 0 but
+  the restrictions below stay on while the condition holds.
+- `breakdown_split()` — per-member sale amounts, proportional to equity, summing exactly to the cut. **Why the
+  model does not size the trims:** on two live dry runs it wrote a headline "Sell ~$174" over trim lines that added
+  up to $138 and then $86, and called $138 "within ~10%". The digest is what a person places trades from, so
+  Python does the division and the model copies it (after that change: two runs, both exactly $173.94).
+- Members are tagged `CLUSTER BREAKDOWN — SELL-ELIGIBLE` and removed from ELIGIBLE FUNDING SOURCES. The tag takes
+  precedence over losing / trim-count tags (but not a pending sell; a member bought <7 days ago is cut last).
+- `CLUSTER BREAKDOWN` hard constraint (in `CLAUDE_SYSTEM_PROMPT`): the cut must appear in TRIMS/EXITS and
+  overrides COST BASIS DISCIPLINE (new override 3), REPEATED SELL PATTERN and the "must be up" logic of TRIM
+  SIGNALS; "oversold", "RSI near 30", "thesis intact" are explicitly not reasons to skip it (being oversold is the
+  normal state of a breakdown). A decline needs a dated catalyst or a named held support level, written as
+  `**HOLD <member> (breakdown) — reason**` — `strip_noop_trim_lines` keeps those lines.
+- **Hold the proceeds:** the cut's proceeds stay cash. `EXITS FUND BUYS` and the BUYS deploy-idle-cash default are
+  suspended while any cluster is in breakdown (an explicit exception in both rules), and no member of the cluster
+  may be bought. This reverses nothing from 10-12: that rule was about not leaving cash idle *by default*; this is a
+  named exception.
+- Re-measured every session; when the condition stops holding the restrictions end and normal rules (including
+  deploying idle cash, still behind the no-chasing entry standard) resume. There is no separate re-buy trigger.
+- Post-parse guard `_warn_if_cluster_cut_ignored()` logs (never patches): cut absent from TRIMS/EXITS; trims
+  summing to < `CLUSTER_CUT_MIN_FRACTION` of the requirement (parses "**TRIM X — Sell $N**" and the verb-less
+  "**X — Sell $N**" form; it first mistook the latter for a decline); and an INFO line when the cut was declined so
+  a human checks the reason. If these fire repeatedly the next step is a post-parse retry, not more prompt text.
+- Rendered in both digests inside **Portfolio Risk** (`** BREAKDOWN **` flag + the measurements + CUT REQUIRED),
+  since that block is shared with the prompt. Saved to `last_analysis.json` under `risk_context.concentration`
+  (new keys: `breakdown`, `cut_usd`, `equity`, `n_below_ma`, `n_with_ma`).
+
+**Backtest** (2y of daily closes, the 10-name chip cluster, current share counts back-cast — survivorship flatters
+everything, so read the comparison, not the absolutes): buy-and-hold **+71% / worst drawdown -44%**; the stateless
+rule with a 50% cut **+94% / -36%**, in the cut state ~26% of days over 11 episodes. All 18 parameter variants tried
+first fired on **2026-10-13/14**, with the cluster only ~8% off its high — about three weeks before the 11-05 crash —
+and re-entry rules mattered (restoring at <=50% of names under the average beat <=30%). **Caveats stated plainly:**
+the parameters were chosen after seeing that episode (in-sample; out-of-sample edge unproven); the cut is a hedge,
+not an escape (max drawdown improved 44 -> 36, not to zero); and the earlier finding that portfolio/sector
+*trailing stops* lose over a year still stands — this is a breadth rule, but ~11 whipsaws in 2 years is the price.
+Replaying the real 10-13 portfolio against real prices: no fire on 10-02/10-06/10-09, fires 10-13 (6 of 9 names
+under their average, -8.1% from the high).
+
+**Known limitations / judgment calls to revisit:**
+- Introduced mid-breakdown, the **first run recommends cutting at the lows**: on 2026-11-07 the cluster was 40% of
+  equity, 10/10 names under their average, 34.4% under its high, RSI ~30, the morning after a +4.9% median bounce, and
+  the rule asked for ~$174. Stateless means it cannot know the cut wasn't made on 10-14. The human-in-the-loop trade
+  step is the filter. A grandfather clause (don't fire if already >X% under the high) would trade this off against
+  whipsaw protection and is not built.
+- Parameters, the 25% target and the 50% cap are mine, not Chris's. Only clusters >= 10% of equity are evaluated.
+- Cluster membership comes from return correlations, so it can drift run to run (IONQ/RKLB are in the chip cluster).
+- The guard checks the cut was *written*, not that a stated decline reason is *valid*.
+- Not yet seen on a scheduled cron run. Validated by 4 live dry runs (see session_notes 2026-11-07).
 
 ## Newsletter Analyst Views & Catalysts
 
