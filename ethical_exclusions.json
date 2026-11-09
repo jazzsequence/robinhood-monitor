@@ -35,6 +35,10 @@
     "FTNT": {
       "reason": "Fortinet primarily manufactures cybersecurity and network security products that are widely used for mass surveillance, policing, and ICE/immigration-enforcement technology deployment, meeting criterion (2).",
       "added": "2026-11-02"
+    },
+    "CEG": {
+      "reason": "Criterion (3): Constellation Energy is primarily a fossil fuel extraction and nuclear power company with substantial coal and natural gas operations.",
+      "added": "2026-11-09"
     }
   },
   "screened": [
@@ -47,7 +51,9 @@
     "ASML",
     "AVGO",
     "AXON",
+    "CBRS",
     "CCI",
+    "CEG",
     "CIFR",
     "COIN",
     "COST",
@@ -72,6 +78,7 @@
     "MRVL",
     "MSFT",
     "MU",
+    "NET",
     "NFLX",
     "NVDA",
     "OKLO",
