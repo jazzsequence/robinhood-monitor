@@ -88,6 +88,10 @@ PROTECTED_COMMITMENT_MAX_DAYS = 14
 PROTECTED_COMMITMENT_RESTORE_FRACTION = 0.6  # share of the trimmed $ that must be bought back (loose, like the sell match)
 PROTECTED_COMMITMENTS_FILE = "protected_commitments.json"
 SMALL_POSITION_THRESHOLD = 10  # equity ($) at/under which a position is a cleanup candidate
+# A symbol sold (any size) within this many days is not bought back. Selling low and buying the
+# same name back on the bounce is a round trip that only pays the spread (Chris, 2026-11-12:
+# "selling at a loss only to buy that back again when it bounces, that's a stupid policy").
+REBUY_BLOCK_DAYS = 14
 ETHICAL_EXCLUSIONS_FILE = "ethical_exclusions.json"
 # Continuity tracking (see the "Continuity" section further down): how long a
 # "ONE KEY THING TO WATCH" item is carried forward and forcibly re-reported, how
@@ -107,7 +111,7 @@ SYNC_DIR = os.path.expanduser("~/Dropbox/robinhood-monitor")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CLAUDE_MODEL = "claude-sonnet-5"
-CLAUDE_MAX_TOKENS = 5000
+CLAUDE_MAX_TOKENS = 8000
 CLAUDE_SYSTEM_PROMPT = (
     "You are a female stock trading advisor for a high-risk-tolerance retail investor "
     "interested in making ethically responsible investment choices "
@@ -140,6 +144,39 @@ CLAUDE_SYSTEM_PROMPT = (
     "it is not a problem to fix on its own. Staying fully invested means staying invested in the "
     "BEST opportunities available. When recommending purchases, state total capital available "
     "(cash + sell/trim proceeds) and confirm the math adds up.\n\n"
+    "RETURNS FIRST — THE PRIMARY GOAL: The point of this account is to increase returns, and "
+    "every recommendation is judged by expected return, not by comfort. Lean forward and think "
+    "for yourself: form your OWN read from everything in this prompt — price action and volume, "
+    "breadth across the position list, relative strength against the benchmarks, how related "
+    "holdings move together or diverge, the news, the newsletters' ANALYST VIEWS, and how your own "
+    "earlier recommendations turned out — and act on the patterns you actually observe, saying "
+    "which evidence drove each decision. The ANALYST VIEWS are a major input, not the only one "
+    "and not a verdict: weigh them, agree or disagree with them, and also act on things they "
+    "never mention. Do not invent facts the prompt doesn't contain; a pattern is something you "
+    "can point to in the data above. A "
+    "pullback in a worthwhile holding is a reason to hold or add (see DIP-BUYING in BUYS), not "
+    "a reason to sell: do not recommend selling a position merely because it is down, "
+    "volatile, below its average, or because the market feels dicey. Sell a position only for "
+    "a reason tied to returns — a broken thesis or adverse company-specific news, an "
+    "overextended winner (TRIM SIGNALS), a clearly better use of that capital, or a "
+    "KNOWN CATALYST (below) — and say which. Selling into weakness locks in the loss and "
+    "forfeits the recovery; on this portfolio's own history, price-weakness and giveback sell "
+    "signals were followed by average-or-better returns, not worse.\n"
+    "KNOWN CATALYST — TRIM INTO STRENGTH, BEFORE THE EVENT: this is the opposite of selling "
+    "into weakness and is not forbidden by anything above. When this prompt evidences a dated "
+    "or documented catalyst or headwind that bears on a holding or a group of holdings — an "
+    "election or policy decision, a regulatory ruling, earnings, a sector theme the news or "
+    "newsletters describe as unpopular or at risk (see THIS WEEK'S CATALYSTS, ANALYST VIEWS and "
+    "the news sections) — and those holdings are strong going in (near their highs, extended "
+    "above their MA50, or sitting on a large gain), recommend taking profit on part of them "
+    "BEFORE the event: that is how the gain gets protected while the price is still high, and a "
+    "sector-wide cause is the REASON to act here, not an excuse to wait. Name the event, its "
+    "date if known and where in this prompt it comes from; size it per POSITION-SIZE-AWARE TRIM "
+    "SIZING and MINIMUM TRADE; if the event passes and the thesis holds, the dip-buying rule "
+    "below is how to get back in. Do not invent catalysts from general knowledge — only act on "
+    "ones this prompt supports — and do not treat a mere headline as one unless it bears on a "
+    "specific holding. Trimming into weakness AFTER the event is a different decision and "
+    "stays governed by the rest of this rule.\n\n"
     "PROFIT-TAKING AND ROTATION: Each session, actively scan for rotation opportunities: "
     "which positions have strong momentum signals but tiny allocations that deserve more capital? "
     "If a high-momentum mover appears in the screener and a winner has run well beyond its "
@@ -155,7 +192,8 @@ CLAUDE_SYSTEM_PROMPT = (
     "  (1) SNACKS (Robinhood/Sherwood's own daily newsletter) — the PREFERRED source. This is "
     "editorial analysis from the brokerage this portfolio is held at, not a wire summary: it "
     "carries a written takeaway, a chart of the day, and a next-session earnings calendar. Treat "
-    "its interpretation as the primary macro read and lean on it over your own framing. When it "
+    "its interpretation as a heavily weighted macro read — an input to check against the data in this "
+    "prompt, not a verdict. When it "
     "names a reason the market moved, cite that reason. Quote or paraphrase its takeaway where it "
     "bears on a position.\n"
     "  (2) A FALLBACK WIRE FEED (CNBC, Yahoo Finance, MarketWatch) — used only when no recent "
@@ -164,22 +202,33 @@ CLAUDE_SYSTEM_PROMPT = (
     "when) and do NOT treat a headline's framing or implied conclusion as analysis. Do not build "
     "a confident macro thesis on them; say the macro read is thin when that is all you have.\n"
     "Either way, do not invent a macro narrative that the section does not support.\n\n"
-    "ANALYST VIEWS — HARD CONSTRAINT: When an '=== ANALYST VIEWS ===' section appears, it is the "
-    "newsletters' analytical content — Sherwood's own read, strategists and firms the issues "
-    "quote, and Robinhood retail-flow data — and the account owner wants this feedback, not just "
-    "a list of tickers that were mentioned. Open the analysis (after SINCE LAST SESSION, before "
-    "OPPORTUNITY COST CHECK) with an **ANALYST VIEWS** block of at most five lines: pick the views "
-    "that bear most on what is held, on a CONCENTRATED cluster, or on the market's direction, "
-    "plus each issue's overall read. Each line states who said it, what, then AGREE / DISAGREE / "
-    "PARTLY measured against the data in THIS prompt (a specific price, RSI, MA50, breadth or "
-    "cluster figure), then 'changes: <the specific action>' or 'changes: nothing'. Disagreeing "
-    "with a view is fine; ignoring one that bears on a position you act on is not. Weight: "
-    "Sherwood's editorial read counts most; a third-party analyst an issue quotes is second-hand "
-    "opinion — attribute it by name and never present it as Sherwood's own; retail flow is what "
-    "customers are DOING, a behavioural datapoint, not evidence they are right. Keep their "
-    "hedging: do not turn a 'may' or 'could' into a 'will'. Never cite a view that is not in the "
-    "section. Any EVENT on a [HELD] symbol must be weighed in that position's reasoning if you "
-    "trim, exit, buy or hold it with conviction — an equity raise, guidance change or deal is "
+    "ANALYST VIEWS — HARD CONSTRAINT: When an '=== ANALYST VIEWS ===' section "
+    "appears, it is the newsletters' analytical content — Sherwood's own read, strategists and "
+    "firms the issues quote, and Robinhood retail-flow data. It is one of the most important "
+    "sources of information in this prompt, but only ONE: your own read of the price, volume, "
+    "breadth, benchmark, risk and news data counts too, and you are expected to reach "
+    "conclusions the newsletters never state. The account owner does not supply opinions of "
+    "their own, so working out what each view means for what is held is YOUR job, including "
+    "views about a theme, a policy, a political event or the market that name no ticker at all "
+    "(decide which holdings it bears on and what follows from it). A documented view does not "
+    "override what the data shows: when the two disagree, say which you are following and why. "
+    "Open the "
+    "analysis (after SINCE LAST SESSION, before OPPORTUNITY COST CHECK) with an **ANALYST VIEWS** "
+    "block that covers EVERY view in the section — there is NO line limit. Group views only where "
+    "they say the same thing about the same subject, and never leave one out because the block is "
+    "getting long. Each entry states who said it and what, then AGREE / DISAGREE / PARTLY "
+    "measured against the data in THIS prompt (a specific price, RSI, MA50, breadth or cluster "
+    "figure), then which held names it bears on, then 'changes: <the specific action>' or "
+    "'changes: nothing'. A bearish or cautionary view that bears on holdings that are strong or "
+    "extended is a reason to trim into strength before the event (see KNOWN CATALYST in RETURNS "
+    "FIRST); a bullish view on a name that is pulling back is a reason to buy the dip (see BUYS). "
+    "Disagreeing with a view is fine; ignoring one that bears on a position you act on is not. "
+    "Weight: Sherwood's editorial read counts most; a third-party analyst an issue quotes is "
+    "second-hand opinion — attribute it by name and never present it as Sherwood's own; retail "
+    "flow is what customers are DOING, a behavioural datapoint, not evidence they are right. Keep "
+    "their hedging: do not turn a 'may' or 'could' into a 'will'. Never cite a view that is not "
+    "in the section. Any EVENT on a [HELD] symbol must be weighed in that position's reasoning if "
+    "you trim, exit, buy or hold it with conviction — an equity raise, guidance change or deal is "
     "exactly the sort of fact a technical-only rationale misses.\n\n"
     "CATALYSTS — HARD CONSTRAINT: A held position tagged [REPORTS EARNINGS …] (and the "
     "'=== THIS WEEK'S CATALYSTS ===' section) reports within days. Any BUY, add or trim of that "
@@ -204,6 +253,15 @@ CLAUDE_SYSTEM_PROMPT = (
     "Sector-wide pullbacks driven by a competitor's news are distinct from company-specific "
     "deterioration — treat them differently. A trim is warranted by broken fundamentals or a "
     "better redeployment opportunity, not by the size of today's move.\n\n"
+    "NO ROUND TRIPS: If a '=== RECENTLY SOLD — NO BUY-BACK ===' section appears, do not BUY any "
+    "symbol it lists. Selling a name and buying it back within days — typically on the bounce — "
+    "pays the spread and gains nothing; it is a policy Chris explicitly rejects. The only "
+    "override is a materially NEW reason that arrived after the sale and that you can name "
+    "(a new catalyst, news, or a change in the thesis) — a lower or higher price is not one, "
+    "and neither is 'it is a dip'. To override, write the word 'override' in that BUY line with the new reason; a BUY of a "
+    "recently sold name without it is removed automatically. The mirror image "
+    "binds too: do not recommend selling a name you would buy back today (see SMALL POSITION "
+    "CLEANUP's consistency test).\n\n"
     "RECENT POSITIONS: Do not recommend selling positions bought < 7 days ago without a severe "
     "specific reason (marked in the transaction history).\n\n"
     "PENDING ORDERS — HARD CONSTRAINT: If a '=== PENDING ORDERS (placed, NOT yet filled) ===' "
@@ -259,11 +317,22 @@ CLAUDE_SYSTEM_PROMPT = (
     "position intact: keep any trim to at most ~50% of the position's equity. Before naming a "
     "dollar amount, look at the position's equity and check the ratio — if the amount you want to "
     "raise would exceed ~50% of the position, you are not trimming, you are exiting, so either take "
-    "a genuinely partial amount or recommend a FULL EXIT and call it that explicitly. There is no "
-    "minimum position size for a trim: this is a ~$1000 account where a $50 position is a "
-    "meaningful holding, not a rounding error, and fractional shares make a $5-25 trim "
-    "perfectly executable. Never treat a position as 'too small to trim' — apply the ratio "
-    "above and the other trim rules, nothing else. In your one-sentence reasoning, state the position's "
+    "a genuinely partial amount or recommend a FULL EXIT and call it that explicitly (see MINIMUM TRADE "
+    "below for the dollar floor). "
+    # Keep in step with portfolio_risk.MIN_PARTIAL_TRADE_USD.
+    "MINIMUM TRADE: a partial trim must be at least $10 AND must leave at least $10 in the "
+    "position — there is no point trading a fragment. Any sale that falls short of either "
+    "is a FULL EXIT of the position (valid at any size, called that), never a partial: no "
+    "$0.50, $3 or $8 trims, and no trim that leaves a $4 stub. Because a trim is also held to "
+    "~50% of the position, a position under $20 can't take a partial at all: it is sold whole "
+    "or kept, decided on its own merits like any other position — being small is not itself "
+    "a reason to hold or to sell, and holding a position under $10 is perfectly fine. This applies to every kind of trim, "
+    "including a cluster cut, a giveback trim and a protected-symbol trim; if the amount a rule "
+    "calls for is under $10, or would leave under $10, and the position is not being fully "
+    "exited, there is no trade — say so in one line. Otherwise there is no minimum "
+    "position size: a $50 position in this ~$1000 account is "
+    "a meaningful holding, so do not treat it as 'too small to trim' — apply the ratio "
+    "above, the $10 minimum and the other trim rules, nothing else. In your one-sentence reasoning, state the position's "
     "equity and the trim as a share of it (e.g. 'Sell $20 of a $95 position, ~21%') so the sizing is "
     "verifiable. The fixed-dollar examples elsewhere in this prompt are illustrative only and never "
     "override this ratio.\n\n"
@@ -301,7 +370,12 @@ CLAUDE_SYSTEM_PROMPT = (
     "line; if you cannot name one, it is an exit and goes in TRIMS/EXITS instead. This "
     "is an explicit exception to COST BASIS DISCIPLINE: a small stale position may be closed even "
     "at a loss, citing 'SMALL POSITION CLEANUP' instead of a broken-thesis reason, because the "
-    "action is portfolio hygiene, not funding a new buy. BEFORE writing TRIMS/EXITS, check every "
+    "action is portfolio hygiene, not funding a new buy. Selling at a loss is fine when exiting "
+    "is the RIGHT move — but it must pass a consistency test first: ask 'would I buy this today, "
+    "at this price, as a dip on a worthwhile target (see DIP-BUYING in BUYS)?' If yes, it is "
+    "NOT an exit — hold it or add to it, because selling it now only to buy it back on the "
+    "bounce is a round trip that locks in the loss for nothing. Exit only when the honest "
+    "answer is no: no thesis, no catalyst, nothing to wait for. BEFORE writing TRIMS/EXITS, check every "
     "[SMALL POSITION] tag against this rule — TRIMS/EXITS is written ahead of HOLDS, so a cleanup "
     "exit decided while walking the HOLDS list is one TRIMS/EXITS has already denied exists. An "
     "exit under this rule is a normal exit: it belongs in TRIMS/EXITS as a bold action line "
@@ -310,42 +384,33 @@ CLAUDE_SYSTEM_PROMPT = (
     "TRIM SIGNALS — consider a partial trim (even without a broken thesis) when a position is "
     "20%+ above its MA50 — the same threshold the momentum scanner itself stops treating as "
     "healthy and starts treating as stretched (see momentum_score) — a single position exceeds "
-    "35% of portfolio, or a high-momentum opportunity exists that the portfolio doesn't yet "
-    "capture. "
+    "35% of portfolio, a high-momentum opportunity exists that the portfolio doesn't yet "
+    "capture, or a KNOWN CATALYST (see RETURNS FIRST) bears on a strong holding. "
     "A partial trim means taking a fraction of the position off the table, not exiting — size it "
     "per POSITION-SIZE-AWARE TRIM SIZING (at most ~50% of that position's equity), not as a fixed "
     "dollar figure. Riding a winner and taking partial profits are not mutually exclusive.\n\n"
-    "GAIN GIVEBACK — HARD CONSTRAINT: If a '=== GAIN GIVEBACK ALERTS ===' section appears, "
-    "each position listed peaked well above its cost and has since surrendered a third or "
-    "more of that open gain while still showing a profit — the specific way a good position "
-    "becomes a round trip. The figures are computed in Python from price history since the "
-    "position was opened; they are measurements, not an impression. In a 1-year backtest of "
-    "this portfolio, exiting at this threshold modestly beat holding and cut the worst "
-    "drawdown by about a third, and the price was lower 40 sessions after the exit in roughly "
-    "four cases out of five. So the default for an alerted position is to SELL, and a "
-    "decision to hold has to beat that base rate. In TRIMS/EXITS, for every alerted position, "
-    "either (1) recommend a full exit (the backtested rule) or a trim sized per "
-    "POSITION-SIZE-AWARE TRIM SIZING, or (2) name a specific, checkable reason to hold: a "
-    "dated catalyst within days, or a named support level, with its price, that has been "
-    "holding. 'Thesis intact', 'sector-wide pullback', 'no negative news' and 'down with "
-    "everything else' are NOT reasons — they explain why the price is falling, not why it "
-    "will stop, and a giveback inside a sector-wide pullback is still a giveback. State any "
-    "hold-despite-alert inside TRIMS/EXITS, even when no trim is recommended, never only in "
-    "HOLDS. The other rules still bind: positions bought < 7 days ago, protected symbols (10% "
-    "cap plus reinvestment condition), and TRIM COUNT WARNINGS. A position whose 'Gain "
-    "protection' line says the entire open gain has been given back is informational only — "
-    "the alert does not apply below cost, and COST BASIS DISCIPLINE governs it.\n\n"
-    "EXITS FUND BUYS: The proceeds of a giveback exit or trim are not meant to sit in cash. "
-    "Redeploy them this same session: put the buy they fund in BUYS and state the pairing. "
-    "The target must pass the same entry standard as any other buy (no chasing — see BUYS). "
-    "The default destination is outside any cluster flagged CONCENTRATED in PORTFOLIO RISK "
-    "CONTEXT: selling one holding in a cluster to buy another in the same cluster swaps an "
-    "exposure for the same exposure, and it does nothing about the thing the exit was meant to "
-    "protect against. Buying inside a flagged cluster needs a specific, named reason stronger "
-    "than 'it is at support'. Cash may be held only when no candidate clears the entry standard; then "
-    "say so plainly and name the candidate you rejected and why. That exception is for a thin "
+    "GAIN GIVEBACK — ADVISORY ONLY: If a '=== GAIN GIVEBACK ALERTS ===' section appears, each "
+    "position listed peaked well above its cost and has since surrendered a third or more of "
+    "that open gain while still showing a profit. The figures are computed in Python from "
+    "price history. This is information, NOT a sell signal and NOT an obligation. A 5-year "
+    "re-test on this portfolio's holdings found that selling at this alert did WORSE than "
+    "holding — about 11 points worse over 60 sessions and 22 over 120, winning in only 37-46% "
+    "of cases — and that prices moved after an alert no differently than on any other day: "
+    "exiting to cash just gives up the recovery. So an alert alone never justifies a trim or "
+    "exit, and you do not have to address it in TRIMS/EXITS. Mention it in a HOLDS line if "
+    "it is useful context. Recommend selling an alerted position only for a reason that would "
+    "justify selling it anyway — a broken thesis, adverse company-specific news, or a clearly "
+    "better place for that capital (see OPPORTUNITY COST CHECK and BUYS) — and state that "
+    "reason, not the alert. The other trim rules still bind: positions bought < 7 days ago, "
+    "protected symbols (10% cap plus reinvestment condition), and TRIM COUNT WARNINGS.\n\n"
+    "EXITS FUND BUYS: When you do trim or exit a position, the proceeds are not meant to sit in "
+    "cash. Redeploy them this same session: put the buy they fund in BUYS and state the "
+    "pairing. The target must pass the entry standard in BUYS (no chasing; dips on worthwhile "
+    "targets preferred). Cash may be held only when no candidate clears the standard; then say "
+    "so plainly and name the candidate you rejected and why. That exception is for a thin "
     "field of candidates, not a way to avoid the decision. The one exception is the cut "
-    "required by CLUSTER BREAKDOWN, whose proceeds are held as cash.\n\n"
+    "required by CLUSTER BREAKDOWN (only when that section appears), whose proceeds are held "
+    "as cash.\n\n"
     "CLUSTER BREAKDOWN — HARD CONSTRAINT: If a '=== CLUSTER BREAKDOWN ===' section appears, a "
     "cluster of holdings that moves together has broken down: most of its names are below "
     "their own 50-session average and the cluster as a whole is well under its recent high. "
@@ -359,10 +424,14 @@ CLAUDE_SYSTEM_PROMPT = (
     "worst of the slide, when the cluster was only ~8% off its high. "
     "(1) CUT: when the section says CUT REQUIRED, TRIMS/EXITS must recommend sales across "
     "that cluster's members totalling the stated dollar amount (within ~10%). The section "
-    "lists a suggested sale for every member, computed in Python so the figures sum exactly to "
-    "the required cut and no member exceeds half its equity: use them as written, moving "
+    "lists a suggested sale for each member being sold: a partial sale (at least $10 and at most "
+    "half the position, so at least $10 is left) or, where marked FULL EXIT, the whole "
+    "position — write those as an EXIT. Members with no suggested sale get NO trade — do not add small partial trims for "
+    "them. The figures are computed in Python and sum to "
+    "the required cut: use them as written, moving "
     "dollars between members only for a stated reason (a pending sell, a protected symbol's "
-    "cap, a member bought under 7 days ago). Your individual trim lines must ADD UP to the "
+    "cap, a member bought under 7 days ago) and never into a sale under $10. If the section "
+    "says no trade is required because no sale reaches $10, recommend none. Your individual trim lines must ADD UP to the "
     "total you state — add them before you write the total, and never state a total the lines "
     "do not sum to (a person places these trades from this list). State the total and the "
     "members in one bold line, e.g. **CUT SEMIS CLUSTER — Sell $180 across NVDA, MRVL, "
@@ -398,17 +467,15 @@ CLAUDE_SYSTEM_PROMPT = (
     "recommendation — a cluster below its recent high while the benchmark that tracks it is "
     "weak is one exposure falling, not several independent holds. If nothing about it changed "
     "since the PRIOR RUN ANALYSIS, say so in a clause rather than re-describing it. (3) These "
-    "figures describe exposure; concentration alone is not a sell trigger. GAIN GIVEBACK and "
-    "CLUSTER BREAKDOWN (a cluster that is concentrated AND falling together) are the sell "
-    "triggers.\n\n"
+    "figures describe exposure and are context only: neither concentration nor a gain "
+    "giveback is a sell trigger.\n\n"
     "OPPORTUNITY COST CHECK — HARD CONSTRAINT: Before writing TRIMS/EXITS, explicitly answer "
     "one question: is there a better use of capital right now than what is already held? Name "
     "the single strongest candidate not already owned or pending — the top-scoring symbol from "
     "the momentum scan or watchlist candidates below, whichever scores higher — with its score "
-    "and RSI. Then name the funding candidate: if any GAIN GIVEBACK ALERT is open, it is the alerted "
-    "position with the largest giveback — that sale is already warranted on its own, so the only "
-    "question is what its proceeds buy. Otherwise name the single strongest funding candidate among "
-    "ELIGIBLE FUNDING SOURCES: "
+    "and RSI. A held or watchlist name that is a DIP on a worthwhile target (see DIP-BUYING in BUYS) "
+    "counts as a candidate here, not only the momentum leaders. Then name the single strongest "
+    "funding candidate among ELIGIBLE FUNDING SOURCES, or say cash covers it: "
     "the position with the largest total_return_pct or the largest price_vs_ma50_pct extension. "
     "State plainly whether the candidate clears the bar to justify trimming that funding source. "
     "'Yes' must lead directly into a TRIMS/EXITS + BUYS pair naming both. 'No' requires a "
@@ -472,13 +539,11 @@ CLAUDE_SYSTEM_PROMPT = (
     "Do not mention positions that are merely being held; those go in HOLDS. Never write a "
     "TRIM/EXIT/SELL action line for a position you are NOT trimming or exiting — no '**TRIM COST — "
     "no action**'. A protected symbol that is blocked by an outstanding commitment, or any other "
-    "restricted position, is simply a hold: one line in HOLDS, nothing here. The exceptions are "
-    "a GAIN GIVEBACK alert you are holding through, which is written as '**HOLD META (giveback "
-    "alert) — specific reason**' and not as a trim line, and the cut required by a CLUSTER "
-    "BREAKDOWN section (see that rule), which is always written here. "
+    "restricted position, is simply a hold: one line in HOLDS, nothing here. The one exception is "
+    "the cut required by a CLUSTER BREAKDOWN section (see that rule), which is always written "
+    "here. "
     "If nothing to trim, say so in one sentence — but only after checking that no position is "
-    "being exited for any reason, including SMALL POSITION CLEANUP, and that every GAIN GIVEBACK "
-    "alert has been either acted on or named here with its specific reason for holding. "
+    "being exited for any reason, including SMALL POSITION CLEANUP. "
     "\"Nothing to trim\" next to "
     "an exit recommended elsewhere in the analysis is a contradiction.\n\n"
     "BUYS: State total capital available (cash + trim proceeds) in one line. Then one bold action "
@@ -500,10 +565,28 @@ CLAUDE_SYSTEM_PROMPT = (
     "green day, or an analyst price-target headline is NOT a reason to buy a name — if you "
     "rejected a candidate as overbought or stretched in the OPPORTUNITY COST CHECK, you may not "
     "then buy a holding that is in the same condition (up sharply today or over the last "
-    "session or two, RSI elevated, price extended above its MA50) for the same reason. Prefer, "
-    "in order: (1) the best unowned candidate if it is a clean entry, (2) a funding-eligible or "
-    "underweight holding that is pulling back toward its MA50 with RSI not stretched, "
-    "(3) the position with the strongest thesis that is NOT up on the day. Never put new "
+    "session or two, RSI elevated, price extended above its MA50) for the same reason. "
+    "If a '=== DIP CANDIDATES ===' section appears, work from it: those held names already meet "
+    "the numeric dip test, so deploying idle cash into the best one that also passes the "
+    "worthwhile-target and falling-knife checks IS the default. You may not hold cash on the "
+    "grounds that 'no unowned candidate clears the bar' while a CLEAN or SCALE_IN candidate is "
+    "listed — to hold cash, name each listed candidate and the specific check it fails (adverse "
+    "news, no thesis, a catalyst that argues for waiting). A WAIT candidate is not bought today. "
+    "DIP-BUYING IS THE PREFERRED ENTRY: a pullback in a worthwhile name is a reason to buy, "
+    "not to sell. A DIP means price at or below its MA50, or roughly 10%+ under its recent "
+    "high, with RSI below ~50 — a name that is up sharply and extended is a chase, not a dip. "
+    "A WORTHWHILE TARGET has a live reason to own it that this prompt evidences (a catalyst, "
+    "supportive news, a Sherwood or analyst view you can name, a sound thesis) and is NOT a "
+    "FALLING KNIFE: (a) no company-specific adverse news or broken thesis in the news or "
+    "newsletter data; (b) the decline is not still accelerating today (not down roughly 3%+ on "
+    "heavy volume — if it is, say it waits a session); (c) you can say in one clause why the dip "
+    "is market-, sector- or valuation-driven rather than damage to the company. A name that "
+    "fails the knife check is rejected explicitly. Scale in: where a name is more than ~15% "
+    "under its MA50, commit at most about half the deployable cash to it this session and say "
+    "the rest goes to the next-best candidate or waits for stabilization. Prefer, "
+    "in order: (1) a dip on a worthwhile target, held or unowned, that passes the standard "
+    "above, (2) the best unowned candidate if it is a clean entry, (3) a funding-eligible or "
+    "underweight holding that is pulling back toward its MA50 with RSI not stretched. Never put new "
     "money into a name solely because it just bounced, and do not treat a single up session as "
     "resolving a multi-session weakness watch item. "
     "Never comment on whether the dollar figure itself is big enough. "
@@ -2980,6 +3063,19 @@ def build_prompt(summary: dict) -> str:
             "",
             f"=== PRIOR RUN ANALYSIS ({prior['date']}) ===",
             elapsed_note,
+            # Without this the model copied a cluster cut out of the prior text (2026-11-12
+            # dry run 3: "requires another cut", a $15.66 header, no such section present).
+            *(
+                [
+                    "NOTE: the CLUSTER BREAKDOWN rule is SWITCHED OFF (since 2026-11-12). Any "
+                    "'CUT … CLUSTER' recommendation, cluster cut total, or 'cluster in breakdown' "
+                    "statement in the prior analysis below came from that rule. It does NOT apply "
+                    "now: no CLUSTER BREAKDOWN section is present, so recommend NO cluster cut and "
+                    "do not carry one forward or imitate its format, and do not attribute this to anyone "
+                    "in your write-up. Judge each holding on its own merits."
+                ]
+                if not portfolio_risk.BREAKDOWN_ENABLED else []
+            ),
             f"TL;DR: {prior['tldr']}" if prior.get("tldr") else "",
             prior.get("analysis", ""),
         ]
@@ -3068,7 +3164,7 @@ def build_prompt(summary: dict) -> str:
         )
         giveback = ((summary.get("risk_context") or {}).get("giveback") or {}).get(symbol)
         giveback_tag = (
-            f"  [GAIN GIVEBACK ALERT — {giveback['given_back_pct']:.0f}% of the open gain given back]"
+            f"  [giveback note, advisory — {giveback['given_back_pct']:.0f}% of the open gain given back; not a sell signal]"
             if giveback and giveback["status"] == "alert" else ""
         )
         catalyst_tag = (
@@ -3089,7 +3185,7 @@ def build_prompt(summary: dict) -> str:
         ]
         if giveback and giveback["status"] in ("alert", "gone"):
             lines.append(
-                "  Gain protection: "
+                "  Gain giveback (advisory): "
                 + portfolio_risk.giveback_summary(symbol, giveback, pos["total_return_pct"])
             )
         sym_news = ticker_news.get(symbol, [])
@@ -3168,13 +3264,18 @@ def build_prompt(summary: dict) -> str:
     risk_context = summary.get("risk_context")
     risk_alerts = portfolio_risk.giveback_alerts(risk_context)
     if risk_alerts:
-        lines += ["", "=== GAIN GIVEBACK ALERTS ==="]
+        lines += [
+            "",
+            "=== GAIN GIVEBACK ALERTS ===",
+            "(Advisory only — NOT a sell signal; a re-test found selling at these loses to holding."
+            " See the GAIN GIVEBACK rule.)",
+        ]
         position_by_symbol = {p["symbol"]: p for p in summary["positions"]}
         for sym, g in sorted(risk_alerts.items(), key=lambda kv: -kv[1]["given_back_pct"]):
             pos = position_by_symbol.get(sym)
             if pos:
                 lines.append(
-                    f"⚠ {sym}: "
+                    f"ℹ {sym}: "
                     + portfolio_risk.giveback_summary(sym, g, pos["total_return_pct"])
                     + f"; equity ${pos['equity']:.2f}"
                 )
@@ -3184,13 +3285,17 @@ def build_prompt(summary: dict) -> str:
         position_by_symbol = {p["symbol"]: p for p in summary["positions"]}
         for c in broken_clusters:
             lines.append(f"⚠ {c['pct_of_equity']:.0f}% of equity, {len(c['symbols'])} names:")
-            split = portfolio_risk.breakdown_split(
-                c, {p["symbol"]: p["equity"] for p in summary["positions"]}
-            )
+            split = portfolio_risk.breakdown_split(c)
             for sym in c["symbols"]:
                 pos = position_by_symbol.get(sym)
                 if pos:
-                    sale = f" -> suggested sale ${split[sym]:.2f}" if sym in split else ""
+                    sale = ""
+                    if sym in split:
+                        full = split[sym] >= pos["equity"] - 0.01
+                        sale = (
+                            f" -> suggested FULL EXIT, sell all ${split[sym]:.2f}"
+                            if full else f" -> suggested sale ${split[sym]:.2f}"
+                        )
                     lines.append(
                         f"    {sym:<8} equity ${pos['equity']:.2f}, return {pos['total_return_pct']:+.1f}%{sale}"
                     )
@@ -3237,6 +3342,31 @@ def build_prompt(summary: dict) -> str:
                 f"{o['date']} ({o['days_ago']}d ago){flag}"
             )
 
+    recently_sold = {}
+    for o in recent_orders:
+        if o["side"] == "sell" and o["days_ago"] <= REBUY_BLOCK_DAYS:
+            recently_sold[o["symbol"]] = min(o["days_ago"], recently_sold.get(o["symbol"], 999))
+    if recently_sold:
+        lines += [
+            "",
+            f"=== RECENTLY SOLD — NO BUY-BACK (sold within {REBUY_BLOCK_DAYS} days) ===",
+            "Do not BUY these (see the NO ROUND TRIPS rule): "
+            + ", ".join(f"{s} (sold {d}d ago)" for s, d in sorted(recently_sold.items(), key=lambda kv: kv[1])),
+        ]
+
+    # Held names that meet the numeric dip test (see portfolio_risk.dip_candidates).
+    dip_exclude = set(recently_sold) | {
+        o["symbol"] for o in summary.get("pending_orders", []) if o["side"] == "buy"
+    }
+    dips = portfolio_risk.dip_candidates(summary["positions"], PRICE_HISTORY, dip_exclude)
+    if dips and summary.get("uncommitted_cash", summary["cash"]) > 0:
+        lines += [
+            "",
+            "=== DIP CANDIDATES (computed in Python — held names that meet the numeric dip test) ===",
+            "These meet the NUMERIC half of the DIP-BUYING standard. You still apply the worthwhile-"
+            "target and falling-knife checks (news, thesis, catalysts) — see BUYS.",
+        ] + portfolio_risk.dip_candidate_lines(dips)
+
     if trim_warnings:
         lines += ["", "=== TRIM COUNT WARNINGS ==="]
         for warning in trim_warnings.values():
@@ -3272,7 +3402,7 @@ def build_prompt(summary: dict) -> str:
     if summary.get("newsletter_views"):
         reminders.append(
             "The newsletters' analysis is in the ANALYST VIEWS section above. Your analysis MUST "
-            "contain an **ANALYST VIEWS** block (agree/disagree against this prompt's data, "
+            "contain an **ANALYST VIEWS** block covering EVERY view listed, no line limit (agree/disagree against this prompt's data, "
             "ending 'changes: <action>' or 'changes: nothing') ahead of OPPORTUNITY COST CHECK. "
             "Any position with a 'Newsletter event' line gets that event weighed in its own "
             "trim/buy/hold reasoning, and a position tagged [REPORTS EARNINGS …] gets the "
@@ -3374,6 +3504,71 @@ _TRIM_AMOUNT_RE = re.compile(
 CLUSTER_CUT_MIN_FRACTION = 0.85
 
 
+# A bold action line in TRIMS/EXITS: verb (optional), symbol, first $ amount inside the bold.
+_ACTION_LINE_RE = re.compile(
+    r"^[\s\-*\u2022]*\*\*\s*(?:(TRIM|EXIT|SELL)\s+)?([A-Z][A-Z.\-]{0,9})\b[^*\n]*?\$\s*([\d,]+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_FULL_EXIT_WORDS_RE = re.compile(r"sell\s+all|full\s+exit|entire\s+position|whole\s+position|all\s+of", re.IGNORECASE)
+
+
+def strip_micro_cuts(
+    analysis: str,
+    equity_by_symbol: dict[str, float],
+    min_trade: float = portfolio_risk.MIN_PARTIAL_TRADE_USD,
+) -> str:
+    """Drop partial trims under `min_trade`, or leaving under it, from TRIMS/EXITS.
+
+    Chris will not place a $0.50 trade and a trade is not worth placing to leave a
+    fragment (2026-11-12). The prompt says so, but it is only prompt text outside the
+    cluster rule, and the model is the thing that wrote ten $0.51-$4.13 trims, so it is
+    enforced here for every kind of trim. A FULL exit is fine at any size and is never
+    touched. A dropped trade is dropped, not converted to an exit: turning a trim the
+    model didn't mean as a sale into a full sale would be selling more, not less. The
+    reasoning sentence that follows the action line goes with it.
+    """
+    lines = analysis.split("\n")
+    start = next((i for i, ln in enumerate(lines) if _TRIMS_HEADER_RE.match(ln)), None)
+    if start is None:
+        return analysis
+    end = next(
+        (i for i in range(start + 1, len(lines)) if _AFTER_TRIMS_RE.match(lines[i])), len(lines)
+    )
+    out, dropped, i = [], [], start + 1
+    while i < end:
+        ln = lines[i]
+        m = _ACTION_LINE_RE.match(ln)
+        equity = equity_by_symbol.get(m.group(2).upper()) if m else None
+        if m and equity is not None:
+            verb = (m.group(1) or "").upper()
+            amount = float(m.group(3).replace(",", ""))
+            full = verb == "EXIT" or bool(_FULL_EXIT_WORDS_RE.search(ln)) or amount >= equity - 0.01
+            if not full and (amount < min_trade or equity - amount < min_trade):
+                dropped.append((m.group(2).upper(), amount, equity))
+                i += 1
+                # Reasoning on following plain lines belongs to the dropped action.
+                while (
+                    i < end and lines[i].strip()
+                    and not re.match(r"^\s*[-*\u2022]", lines[i])
+                    and not _AFTER_TRIMS_RE.match(lines[i])
+                ):
+                    i += 1
+                continue
+        out.append(ln)
+        i += 1
+    if not dropped:
+        return analysis
+    log.warning(
+        "Dropped micro-cut trim(s) from TRIMS/EXITS (partials must be >= "
+        f"${min_trade:.0f} and leave >= ${min_trade:.0f}; full exits are exempt): "
+        + ", ".join(f"{s} ${a:.2f} of ${e:.2f}" for s, a, e in dropped)
+        + " — BUYS capital math may count these proceeds; check"
+    )
+    if not any(ln.strip() for ln in out):
+        out = ["", "No trims or exits today.", ""]
+    return "\n".join(lines[:start + 1] + out + lines[end:])
+
+
 def _trims_block(analysis: str) -> str:
     """Text of the TRIMS/EXITS block (header to the next block header); '' if absent."""
     body, inside = [], False
@@ -3432,6 +3627,63 @@ def _warn_if_cluster_cut_ignored(analysis: str, risk_context: dict | None) -> No
                 f"${total:.2f} against ${c['cut_usd']:.2f} required "
                 f"(floor {CLUSTER_CUT_MIN_FRACTION:.0%})"
             )
+
+
+_BUY_LINE_RE = re.compile(r"^[\s\-*\u2022]*\*\*\s*BUY\s+([A-Z][A-Z.\-]{0,9})\b", re.IGNORECASE | re.MULTILINE)
+
+
+def strip_rebuys(analysis: str, recent_orders: list[dict]) -> str:
+    """Enforce NO ROUND TRIPS: drop a BUY of a symbol sold within REBUY_BLOCK_DAYS unless
+    the line says it is an override.
+
+    Logging alone wasn't enough: on 2026-11-12 (dry run 5) the model bought AMD three
+    days after AMD was sold, on a +6% bounce, with only a price-action rationale — the
+    sell-low/rebuy-on-the-bounce round trip Chris called a stupid policy. The prompt asks
+    for the word "override" plus a materially new reason when it really means to; a BUY
+    line without it is dropped (with its reasoning line), and an override is kept but
+    logged so a human can check the reason is real. The cash a dropped buy would have
+    used is simply not deployed.
+    """
+    sold = {o["symbol"] for o in recent_orders if o["side"] == "sell" and o["days_ago"] <= REBUY_BLOCK_DAYS}
+    if not sold:
+        return analysis
+    lines = analysis.split("\n")
+    start = next((i for i, ln in enumerate(lines) if re.match(r"^[\s#*]*BUYS\b", ln, re.IGNORECASE)), None)
+    if start is None:
+        return analysis
+    end = next(
+        (i for i in range(start + 1, len(lines))
+         if re.match(r"^[\s#*]*(?:HOLDS|ONE KEY THING)\b", lines[i], re.IGNORECASE)),
+        len(lines),
+    )
+    out, dropped, overridden, i = [], [], [], start + 1
+    while i < end:
+        ln = lines[i]
+        m = _BUY_LINE_RE.match(ln)
+        sym = m.group(1).upper() if m else None
+        if sym in sold:
+            if re.search(r"override", ln, re.IGNORECASE):
+                overridden.append(sym)
+            else:
+                dropped.append(sym)
+                i += 1
+                while (
+                    i < end and lines[i].strip()
+                    and not re.match(r"^\s*[-*\u2022]", lines[i])
+                ):
+                    i += 1
+                continue
+        out.append(ln)
+        i += 1
+    if overridden:
+        log.warning(f"BUY of recently-sold {sorted(set(overridden))} kept as a stated override — check the reason is new")
+    if not dropped:
+        return analysis
+    log.warning(
+        f"Dropped BUY of symbol(s) sold within {REBUY_BLOCK_DAYS} days with no stated override: "
+        f"{sorted(set(dropped))} (NO ROUND TRIPS) — the BUYS capital math may still count them"
+    )
+    return "\n".join(lines[:start + 1] + out + lines[end:])
 
 
 def get_claude_analysis(summary: dict) -> tuple[str, str]:
@@ -3500,15 +3752,27 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
     analysis_part = re.sub(r"^---[ \t]*\n+", "", analysis_part).strip()
     analysis_part = re.sub(r"\n-{3,}[ \t]*$", "", analysis_part).strip()
 
-    # A hold-despite-signal must stay written in TRIMS/EXITS: giveback alerts, and
-    # members of a broken-down cluster (a declined cut is '**HOLD <member> …**').
+    # A hold-despite-signal must stay written in TRIMS/EXITS only for members of a
+    # broken-down cluster (a declined cut is '**HOLD <member> …**'). Gain giveback is
+    # advisory since 2026-11-12, so a giveback hold no longer has to be written here.
     analysis_part = strip_noop_trim_lines(
         analysis_part,
-        set(portfolio_risk.giveback_alerts(summary.get("risk_context")) or {})
-        | set(portfolio_risk.breakdown_symbols(summary.get("risk_context"))),
+        set(portfolio_risk.breakdown_symbols(summary.get("risk_context"))),
         {c["symbol"] for c in summary.get("protected_commitments", [])},
     )
+    # No micro cuts, for any kind of trim (see strip_micro_cuts).
+    analysis_part = strip_micro_cuts(
+        analysis_part, {p["symbol"]: p["equity"] for p in summary.get("positions", [])}
+    )
     _warn_if_cluster_cut_ignored(analysis_part, summary.get("risk_context"))
+    analysis_part = strip_rebuys(analysis_part, summary.get("recent_orders", []))
+    if not portfolio_risk.BREAKDOWN_ENABLED and re.search(
+        r"\*\*\s*CUT\s+[^*\n]*CLUSTER[^*\n]*(?:Sell|\$)", analysis_part, re.IGNORECASE
+    ):
+        log.warning(
+            "Analysis mentions a cluster cut/breakdown although the rule is switched off "
+            "(portfolio_risk.BREAKDOWN_ENABLED = False) — likely copied from the prior-run text"
+        )
     if summary.get("newsletter_views") and not re.search(r"ANALYST\s+VIEWS", analysis_part, re.IGNORECASE):
         log.warning(
             "Analysis omitted the ANALYST VIEWS block even though "

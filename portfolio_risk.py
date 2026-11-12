@@ -14,6 +14,10 @@ rather than left to its impression.
    followed by a lower price 40 sessions later in ~80% of cases. A portfolio-level
    trailing stop, by contrast, whipsawed badly (it gave up half or more of the
    return) — which is why this works per position and only flags, never sells.
+   RE-TESTED 2026-11-12 on a broader sample (16 holdings, entries every 10 sessions over
+   up to 5y, 1,283 alerts): selling at the alert LOST to holding by 11pp at 60 sessions,
+   22pp at 120 and 53pp at 250, and the move after an alert matched baseline — so it is
+   now advisory only (see CLAUDE.md "Re-test 2026-11-12").
 2. Benchmarks — portfolio vs QQQ (Nasdaq-100), SOXX (semiconductors) and SPY
    (S&P 500), plus beta, so "this is just sector drag" is checked against numbers.
 3. Correlation clusters — groups of holdings that actually move together,
@@ -31,6 +35,7 @@ simply omits what could not be computed.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date
 
 import numpy as np
@@ -78,6 +83,14 @@ CLUSTER_HIGH_WINDOW = 60  # sessions for the "below its recent high" figure
 # so the out-of-sample edge is unproven. The earlier finding that portfolio- and
 # sector-level *trailing stops* lose (see CLAUDE.md) still stands: this is a
 # breadth rule, not a stop.
+# Master switch for the cluster-breakdown SELL rule. OFF since 2026-11-12: Chris wants
+# decisions driven by individual stock performance, not cluster rules, and the rule
+# produced a proportional slice of every chip name regardless of how each was doing.
+# Clusters are still computed and shown as context; with this False no cluster is ever
+# flagged `breakdown`, so no cut, no cash hold, no buy block and no per-member tags
+# reach the prompt. Flip to True to restore the 2026-11-07 behaviour (plan_cut and the
+# $10 floor are kept for that).
+BREAKDOWN_ENABLED = False
 CLUSTER_MA_WINDOW = 50
 BREAKDOWN_MA_SHARE = 0.6  # share of a cluster's names below their own average
 BREAKDOWN_DRAWDOWN_PCT = 8.0  # cluster value this far under its 60-session high
@@ -90,6 +103,18 @@ BREAKDOWN_TARGET_PCT = CONCENTRATION_ALERT_PCT
 # sell nearly everything. If the cluster is still over target next session the
 # remainder is cut then.
 BREAKDOWN_MAX_CUT_SHARE = 0.5
+# Smallest partial sale worth placing. A sale under this is only acceptable as a
+# FULL exit of the position. Added 2026-11-12: with the cluster just over the 25%
+# line (26.6%) the proportional split produced ten trims of $0.51-$4.13 for a
+# $15.69 cut — the model copied them faithfully and the digest told a person to
+# trade fifty cents. The cut is now planned over the fewest/largest members that
+# can each take a >= this sale within the 50%-of-position rule.
+MIN_PARTIAL_TRADE_USD = 10.0
+# ...and a sale must not leave a fragment under this either — there is no point trading
+# one (holding a small position is fine; it is the *trade* that isn't worth placing): a
+# sale that would is a FULL exit. Under the 50%-of-position cap this holds
+# automatically for any position of 2x this or more, and positions under 2x this can
+# only be sold whole.
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -227,6 +252,71 @@ def _aligned_closes(symbols: list[str], histories: dict[str, pd.Series], min_len
     return pd.concat(frames, axis=1).ffill().dropna()
 
 
+def plan_cut(
+    equity_by_symbol: dict[str, float],
+    symbols: list[str],
+    cut_usd: float,
+    min_trade: float = MIN_PARTIAL_TRADE_USD,
+    max_share: float = BREAKDOWN_MAX_CUT_SHARE,
+) -> dict[str, float]:
+    """Per-member sales for a cluster cut. A PARTIAL sale is never under min_trade and
+    must leave at least min_trade (no point trading a fragment); anything that would
+    break either is a FULL exit, which is valid at any size, including under min_trade.
+
+    1. Partial sales, spread proportionally over the members that can take one
+       (>= min_trade and <= max_share of the position — i.e. equity >=
+       min_trade / max_share). The smallest of those is dropped until every share
+       clears min_trade; the partial total shrinks to what the rest can absorb.
+    2. If partials can't cover the cut, the shortfall is filled with FULL exits of
+       the smaller members (equity < min_trade / max_share), of any size. A partial of
+       one of them would be under the floor or leave a fragment, so it is sold whole.
+       A value equal to a member's whole equity means "sell all".
+
+    Being small doesn't make a position a hold — it makes its sale all-or-nothing.
+    Shares are floored to cents so none can land over its cap or under the floor."""
+    def cents(x: float) -> float:
+        return math.floor(x * 100 + 1e-9) / 100
+
+    equity = {s: equity_by_symbol[s] for s in symbols if equity_by_symbol.get(s, 0) > 0}
+    big = {s: e for s, e in equity.items() if e * max_share >= min_trade}
+    # Whole-exit candidates: too small for a partial (any size, incl. under min_trade).
+    small = {s: e for s, e in equity.items() if s not in big}
+
+    split: dict[str, float] = {}
+    keep = sorted(big, key=big.get, reverse=True)
+    while keep:
+        total = sum(big[s] for s in keep)
+        cut = min(cut_usd, max_share * total)
+        if cut < min_trade:
+            keep = []
+            break
+        if cents(cut * big[keep[-1]] / total) >= min_trade:
+            split = {s: cents(cut * big[s] / total) for s in keep}
+            break
+        keep.pop()
+
+    # Fill what the big members' partials couldn't cover with FULL exits of the small
+    # members. A partial of a small position would either be under the floor or leave a
+    # fragment under it, and a fragment isn't worth trading, so it is sold whole or
+    # not at all. The exit closest to the shortfall is chosen, so a small need
+    # doesn't trigger a large exit. Never past half the cluster in one session
+    # (BREAKDOWN_MAX_CUT_SHARE), the same ceiling the cut itself was capped at.
+    ceiling = max_share * sum(equity.values())
+    shortfall = cut_usd - sum(split.values())
+    while shortfall > 0.10 * cut_usd:
+        room = ceiling - sum(split.values())
+        options = {
+            s: e for s, e in small.items()
+            if s not in split and e <= shortfall * 1.5 and e <= room
+        }
+        if not options:
+            break
+        pick = min(options, key=lambda s: (abs(options[s] - shortfall), -options[s]))
+        split[pick] = cents(options[pick])
+        shortfall -= split[pick]
+    return split
+
+
 def compute_concentration(
     positions: list[dict], histories: dict[str, pd.Series], bench: dict[str, pd.Series] | None = None
 ) -> list[dict]:
@@ -260,7 +350,8 @@ def compute_concentration(
         n_below = int((closes[members].iloc[-1][valid] < avg[valid]).sum())
         below_share = n_below / len(valid) if len(valid) else 0.0
         broken = bool(
-            len(valid) >= 2
+            BREAKDOWN_ENABLED
+            and len(valid) >= 2
             and below_share >= BREAKDOWN_MA_SHARE
             and below_high <= -BREAKDOWN_DRAWDOWN_PCT
         )
@@ -272,12 +363,21 @@ def compute_concentration(
         cluster_equity = sum(equity[s] for s in members)
         w = BREAKDOWN_TARGET_PCT / 100
         cut_usd = 0.0
+        ideal_cut = 0.0
+        split: dict[str, float] = {}
         if broken:
-            cut_usd = max(0.0, (cluster_equity - w * total_equity) / (1 - w))
-            cut_usd = min(cut_usd, BREAKDOWN_MAX_CUT_SHARE * cluster_equity)
+            ideal_cut = max(0.0, (cluster_equity - w * total_equity) / (1 - w))
+            ideal_cut = min(ideal_cut, BREAKDOWN_MAX_CUT_SHARE * cluster_equity)
+            # What can actually be traded: sales of at least MIN_PARTIAL_TRADE_USD.
+            # cut_usd is the deliverable total so the guard, prompt and digest all
+            # agree with the split; ideal_cut keeps what the math wanted.
+            split = plan_cut(equity, list(members), ideal_cut)
+            cut_usd = sum(split.values())
         out.append({
             "breakdown": broken,
             "cut_usd": round(cut_usd, 2),
+            "ideal_cut_usd": round(ideal_cut, 2),
+            "split": split,
             "equity": round(cluster_equity, 2),
             "n_below_ma": n_below,
             "n_with_ma": int(len(valid)),
@@ -385,25 +485,15 @@ def breakdown_symbols(ctx: dict | None) -> dict[str, dict]:
     return {s: c for c in breakdown_clusters(ctx) for s in c["symbols"]}
 
 
-def breakdown_split(c: dict, equity_by_symbol: dict[str, float]) -> dict[str, float]:
-    """Per-member sale amounts for a cluster's cut, proportional to equity and
-    summing exactly to cut_usd.
+def breakdown_split(c: dict) -> dict[str, float]:
+    """Per-member sale amounts for a cluster's cut, summing exactly to cut_usd.
 
     The model was asked to size the individual trims itself and twice wrote a
     headline total ($174) over lines that added up to far less ($138, then $86) —
-    in a digest a person executes trades from. Python does the division; the model
-    copies the numbers. Proportional means no member exceeds half its equity
-    (the cut is capped at half the cluster)."""
-    members = {s: equity_by_symbol[s] for s in c["symbols"] if equity_by_symbol.get(s, 0) > 0}
-    total = sum(members.values())
-    if c["cut_usd"] <= 0 or total <= 0:
-        return {}
-    split = {s: round(c["cut_usd"] * e / total, 2) for s, e in members.items()}
-    drift = round(c["cut_usd"] - sum(split.values()), 2)  # rounding remainder -> largest member
-    if drift:
-        big = max(members, key=members.get)
-        split[big] = round(split[big] + drift, 2)
-    return split
+    in a digest a person executes trades from. Python does the division (see
+    plan_cut, which also enforces the MIN_PARTIAL_TRADE_USD floor and the
+    half-of-position cap); the model copies the numbers."""
+    return dict(c.get("split") or {})
 
 
 def breakdown_cluster_lines(c: dict) -> list[str]:
@@ -421,10 +511,89 @@ def breakdown_cluster_lines(c: dict) -> list[str]:
             f"cluster in one session; the aim is {BREAKDOWN_TARGET_PCT:.0f}% of equity). "
             "Proceeds are held as cash."
         )
+    elif c.get("ideal_cut_usd", 0) > 0:
+        lines.append(
+            f"No trade required: bringing the cluster to {BREAKDOWN_TARGET_PCT:.0f}% of equity would "
+            f"take about ${c['ideal_cut_usd']:.2f}, but that can't be done without a partial sale "
+            f"under ${MIN_PARTIAL_TRADE_USD:.0f} (only valid as a full exit) or an exit far larger "
+            "than the need. Do not recommend small partial trims. It stays closed to new buys and its proceeds/idle "
+            "cash are not redeployed into it."
+        )
     else:
         lines.append(
             f"No cut required: the cluster is already at or under {BREAKDOWN_TARGET_PCT:.0f}% of equity. "
             "It stays closed to new buys and its proceeds/idle cash are not redeployed into it."
+        )
+    return lines
+
+
+# ── 5. Dip candidates (the buy side) ─────────────────────────────────────────
+# A DIP is the numeric half of the BUYS dip standard; the thesis/news half stays with
+# the model. Computed here because left to itself the model scanned only unowned
+# momentum names, rejected them, and sat on idle cash while a held name 10% under its
+# average with RSI 41 was a textbook dip (2026-11-12 dry run 2) — the hold-everything
+# failure. Python lists them; the model must buy one or say which check each fails.
+DIP_MAX_RSI = 50.0
+DIP_HIGH_DRAWDOWN_PCT = 10.0   # or this far under the 60-session high
+DIP_SCALE_IN_PCT = 15.0        # more than this far under MA50: commit at most half the cash
+DIP_KNIFE_DAY_PCT = -3.0       # down this much today...
+DIP_KNIFE_VOLUME = 1.5         # ...on this multiple of normal volume = still accelerating
+
+
+def dip_candidates(
+    positions: list[dict],
+    histories: dict[str, pd.Series],
+    exclude: set[str] = frozenset(),
+) -> list[dict]:
+    """Held names meeting the numeric DIP definition, best first.
+
+    A dip is RSI below DIP_MAX_RSI AND either at/under its MA50 or DIP_HIGH_DRAWDOWN_PCT
+    under its 60-session high. `exclude` is for names that may not be bought now
+    (sold within the buy-back window, unfilled buy pending). status is one of
+    WAIT (still accelerating today: down >= DIP_KNIFE_DAY_PCT on >= DIP_KNIFE_VOLUME x
+    volume), SCALE_IN (> DIP_SCALE_IN_PCT under MA50) or CLEAN."""
+    out = []
+    for p in positions:
+        sym = p["symbol"]
+        ind = p.get("indicators") or {}
+        rsi, vs50 = ind.get("rsi"), ind.get("price_vs_ma50_pct")
+        if sym in exclude or rsi is None or vs50 is None:
+            continue
+        closes = histories.get(sym)
+        below_high = None
+        if closes is not None and len(closes) >= 2:
+            below_high = round(_pct(float(closes.iloc[-1]), float(closes.tail(CLUSTER_HIGH_WINDOW).max())), 1)
+        if rsi >= DIP_MAX_RSI or not (vs50 <= 0 or (below_high is not None and below_high <= -DIP_HIGH_DRAWDOWN_PCT)):
+            continue
+        today, vol = ind.get("pct_change_today"), ind.get("volume_ratio")
+        if today is not None and vol is not None and today <= DIP_KNIFE_DAY_PCT and vol >= DIP_KNIFE_VOLUME:
+            status = "WAIT"
+        elif vs50 <= -DIP_SCALE_IN_PCT:
+            status = "SCALE_IN"
+        else:
+            status = "CLEAN"
+        out.append({
+            "symbol": sym, "rsi": round(rsi, 1), "vs_ma50_pct": round(vs50, 1),
+            "below_high_pct": below_high, "today_pct": today, "volume_ratio": vol,
+            "return_pct": p.get("total_return_pct"), "status": status,
+        })
+    order = {"CLEAN": 0, "SCALE_IN": 1, "WAIT": 2}
+    return sorted(out, key=lambda d: (order[d["status"]], d["vs_ma50_pct"]))
+
+
+def dip_candidate_lines(cands: list[dict]) -> list[str]:
+    notes = {
+        "CLEAN": "passes the numeric dip test",
+        "SCALE_IN": f"more than {DIP_SCALE_IN_PCT:.0f}% under MA50 — commit at most about half the deployable cash",
+        "WAIT": "still accelerating today (down hard on heavy volume) — wait a session, do not buy today",
+    }
+    lines = []
+    for c in cands:
+        high = f", {abs(c['below_high_pct']):.1f}% under its 60-session high" if c["below_high_pct"] is not None else ""
+        today = f", today {c['today_pct']:+.2f}% on {c['volume_ratio']:.2f}x volume" if c["today_pct"] is not None and c["volume_ratio"] is not None else ""
+        lines.append(
+            f"  {c['symbol']:<7} RSI {c['rsi']}, {c['vs_ma50_pct']:+.1f}% vs MA50{high}{today}, "
+            f"{c['return_pct']:+.1f}% on cost — {notes[c['status']]}"
         )
     return lines
 
@@ -505,10 +674,10 @@ def risk_text_lines(ctx: dict | None, positions: list[dict]) -> list[str]:
         if g["status"] in ("alert", "gone") and s in held
     ]
     if protectable:
-        lines.append("Gain protection (positions that peaked >= "
+        lines.append("Gain giveback — ADVISORY, not a sell signal (positions that peaked >= "
                      f"{GIVEBACK_MIN_PEAK_GAIN_PCT:.0f}% above cost):")
         for s, g in sorted(protectable, key=lambda x: -(x[1]["given_back_pct"] or 0)):
-            tag = "ALERT" if g["status"] == "alert" else "gone "
+            tag = "note " if g["status"] == "alert" else "gone "
             lines.append(f"  [{tag}] {s}: {giveback_summary(s, g, held[s]['total_return_pct'])}")
     return lines
 

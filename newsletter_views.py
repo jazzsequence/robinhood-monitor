@@ -309,7 +309,7 @@ def held_catalyst_tags(extracted: list[dict], held: set[str], today: str) -> dic
     return {s: "; ".join(v) for s, v in tags.items()}
 
 
-def symbol_notes(extracted: list[dict], symbol: str, limit: int = 3) -> list[str]:
+def symbol_notes(extracted: list[dict], symbol: str, limit: int | None = None) -> list[str]:
     """
     Newsletter items that name `symbol`, as short lines for that position's block.
 
@@ -328,7 +328,7 @@ def symbol_notes(extracted: list[dict], symbol: str, limit: int = 3) -> list[str
             if symbol in v["subjects"]:
                 who = v["attributed_to"] or ("Sherwood" if v["source"] == "editorial" else v["source"])
                 notes.append(f"  Newsletter view ({ex['name']}, {who}): [{v['direction']}] {v['claim']}")
-    return notes[:limit]
+    return notes if limit is None else notes[:limit]
 
 
 # ── Prompt / digest rendering ─────────────────────────────────────────────────

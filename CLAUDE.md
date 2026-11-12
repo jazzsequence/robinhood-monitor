@@ -104,6 +104,7 @@ Python 3.11+ required (uses `float | None` union type syntax).
 | `CLUSTER_CORR_THRESHOLD` | `0.45` | (`portfolio_risk.py`) average-linkage cutoff for "moves together" |
 | `BREAKDOWN_MA_SHARE` / `BREAKDOWN_DRAWDOWN_PCT` | `0.6` / `8` | (`portfolio_risk.py`) cluster breakdown trigger: share of names under their own 50-session average, and % under the cluster's 60-session high — see Cluster Breakdown |
 | `BREAKDOWN_TARGET_PCT` / `BREAKDOWN_MAX_CUT_SHARE` | `25` / `0.5` | (`portfolio_risk.py`) a broken-down cluster is cut toward this share of equity, never by more than this fraction of the cluster per session |
+| `MIN_PARTIAL_TRADE_USD` | `10` | (`portfolio_risk.py`) smallest partial sale ever recommended; anything under it is only valid as a **full exit**. Also hard-coded as "$10" in the `POSITION-SIZE-AWARE TRIM SIZING` and `CLUSTER BREAKDOWN` prompt text — keep in step |
 | `CLUSTER_CUT_MIN_FRACTION` | `0.85` | (`portfolio_monitor.py`) trims summing to less than this share of the required cut are logged as under-delivered |
 | `ETHICAL_SCREEN_CRITERIA` | (see below) | Exclusion rubric applied by the ethical screen — not a user-curated symbol list |
 
@@ -445,6 +446,24 @@ as a chase), the same block requires the target to pass the *same* entry standar
 day or price-target headline isn't a reason, and a name rejected as stretched can't be bought in the
 same condition. Prompt-only; COST BASIS DISCIPLINE still blocks trimming underwater positions.
 
+## Returns First, Dip-Buying, Minimum Trade Size (2026-11-12 — supersedes the sell-side rules below where they conflict)
+
+Chris's stated goal: "increase returns … forward leaning — buying into the dip on worthwhile targets rather than selling when things get hard or dicey." Three changes, all in `CLAUDE_SYSTEM_PROMPT` / `portfolio_risk.py` / `portfolio_monitor.py`:
+
+1. **GAIN GIVEBACK is advisory.** The `GAIN GIVEBACK` rule no longer forces an exit-or-named-reason; the data is relabelled (`[giveback note, advisory …]`, `=== GAIN GIVEBACK ALERTS ===` carries an "advisory, not a sell signal" line, `Gain giveback (advisory)` in the risk text). Reason: the 5-year re-test (see Portfolio Risk Context) found selling at the alert lost to holding. `strip_noop_trim_lines()` no longer protects giveback hold-lines (the model needn't write them). `OPPORTUNITY COST CHECK` no longer makes an alerted position the default funding candidate; `EXITS FUND BUYS` no longer has the "default outside a CONCENTRATED cluster" clause.
+2. **`RETURNS FIRST` + `DIP-BUYING` in the prompt.** New principle paragraph (don't sell merely because a holding is down/volatile/dicey; sell only for a returns-tied reason). `BUYS` gains a dip standard: a DIP = at/below MA50 or ~10%+ under its recent high with RSI < ~50 (an extended name that's up sharply is a chase, not a dip); a WORTHWHILE TARGET has an evidenced reason to own it and is not a FALLING KNIFE (no company-specific adverse news, decline not still accelerating on heavy volume, one clause on why it is market/sector/valuation-driven); scale in (<= ~half of deployable cash) when >15% under MA50. It leads the "Prefer, in order" ladder. Cluster-breakdown cash-hold/buy-block remain only for when `BREAKDOWN_ENABLED` is flipped back on.
+3. **Micro cuts are blocked mechanically.** `strip_micro_cuts()` (post-parse, every kind of trim) drops any partial trim under `MIN_PARTIAL_TRADE_USD` ($10) or that would leave under $10, plus its reasoning line; full exits (verb EXIT, "sell all"/"full exit", or amount >= equity) are exempt at any size. It drops rather than converts to an exit (converting would sell *more*). It logs a warning naming each dropped trade and that BUYS capital math may still count its proceeds. Limitation: a bold cluster header ("CUT … — Sell $X across …") is not touched if all its members are dropped — moot while clusters are off.
+
+4. **`KNOWN CATALYST — TRIM INTO STRENGTH` (added the same day, after Chris's pushback).** The first draft of `RETURNS FIRST` listed only broken-thesis / company-specific news / overextension / better use of capital as sell reasons — which would have forbidden the sale Chris actually wanted before the 11-03 midterms. His grievance on 11-07 was NOT price weakness; it was that data centers were visibly unpopular going into the election, which would hit AI/chip names, and nothing was trimmed *while they were high, before the event*. The backtests above test reacting to weakness and say nothing about this. The prompt now allows (and `TRIM SIGNALS` lists) trimming part of a strong holding/group ahead of a dated or documented catalyst or headwind that this prompt evidences (election/policy/regulatory/earnings/sector theme in THIS WEEK'S CATALYSTS, ANALYST VIEWS or news), naming the event and source, sized by the normal rules, with dip-buying as the way back in. **Untested** (no way to replay the 11-02 prompt; it wasn't archived). **Structural limits:** the model can only act on catalysts present in the prompt — it is told not to invent them — and the `ANALYST VIEWS` block is capped at 5 lines, which on 11-04 dropped the BEARISH data-center item (see session_notes 2026-11-07). Not fixed.
+
+5. **Analyst views are a major input — not the only one — and are not capped (added the same day, then rebalanced).** Chris: "the analyst evaluation should be the primary source of information … why is it capped at 5 lines? that defeats the purpose of reading those", and "i don't want to manage a file where i put my own opinions into the mix — the agent needs to be able to figure that out." Then, after the first rewrite made the newsletters the *primary* source and price/RSI "secondary": "we shouldn't ONLY be using the sherwood analyst views as advice — the agent needs to make its own decisions based on patterns it observes, which includes that as a data source but is not limited to the newsletters." So: the `ANALYST VIEWS` rule covers EVERY view with no line limit, names the held names each bears on, and has the agent work out what ticker-less theme/policy/political views mean for holdings; but it is explicitly *one of the most important sources, only one* — price/volume/breadth/benchmarks/risk/news count too, the agent may reach conclusions the newsletters never state, and when data and a view disagree it says which it follows and why. `RETURNS FIRST` tells it to form its own read from all the evidence (including how its own earlier recommendations turned out), act on observed patterns, and name the evidence behind each decision — without inventing facts the prompt lacks. `CLAUDE_MAX_TOKENS` 5000 -> 8000 so a longer block can't truncate the TL;DR (written last); `newsletter_views.symbol_notes` lost its 3-note-per-position cap. **No standing-views file was built — deliberately.** The extractor already keeps ticker-less theme views (`subjects` like "AI capex" pass `validate_extraction`); the 5-line cap was the prompt's.
+6. **No round trips.** `REBUY_BLOCK_DAYS = 14`: a `=== RECENTLY SOLD — NO BUY-BACK ===` section lists symbols sold in the last 14 days (any size), the `NO ROUND TRIPS` rule forbids buying them back without a materially new, named reason (a price move or "it is a dip" is not one), and `strip_rebuys()` ENFORCES it post-parse: a BUY line for a recently sold symbol is dropped (with its reasoning line) unless the line contains the word "override" (the prompt asks for it plus the new reason); an override is kept but logged for a human to check. Enforced rather than just logged after dry run 5, where the model bought AMD three days after AMD was sold, on a +6% bounce, with only a price-action reason. Side effect: a dropped buy's cash simply isn't deployed and the model's own capital math may still count it. `SMALL POSITION CLEANUP` gained a consistency test: don't exit a name you would buy today as a dip; exit only when there's no thesis and nothing to wait for. Chris: selling at a loss is fine when exiting is the right move, but selling low only to rebuy on the bounce is "a stupid policy".
+7. **Dip candidates are computed in Python.** Dry run 2 held all its idle cash and made no trades because the model scanned only unowned momentum names and never considered GOOGL (-10% vs MA50, RSI 41) — the hold-everything failure Chris feared. `portfolio_risk.dip_candidates()` now lists held names with RSI < 50 and either at/under MA50 or >= 10% under their 60-session high (excluding recently sold and pending-buy symbols), flagged WAIT (down >= 3% today on >= 1.5x volume), SCALE_IN (> 15% under MA50) or CLEAN, in a `=== DIP CANDIDATES ===` prompt section; the BUYS rule says idle cash goes to the best one that passes the news/thesis checks and that holding cash means naming the check each listed candidate fails. Held names only — unowned screener dips are not listed.
+
+**Validated** by four live dry runs (writes stubbed), which differed a lot — run-to-run variance is real and was the point: run 1 exited LRCX/KLAC and bought GOOGL+AMZN; run 2 (before dip candidates were computed in Python) held everything and left the idle cash unspent; run 3 copied a stale cluster cut out of the prior-run text even though the rule was off (fixed with a prior-run NOTE + warning; the micro-cut guard stripped the trims but the orphan "CUT … CLUSTER" header survived, which is why the NOTE matters); run 5 formed its own read from breadth/volume/relative strength/retail flow/news (not just the newsletters) but bought back AMD (-> `strip_rebuys`); run 4 (all changes) covered all 8 analyst views, bought PANW+GOOGL from the dip list and deployed all cash, made no cluster cut. Not seen: a run where the KNOWN CATALYST rule actually fires — no strong holding sat near a documented headwind. Details of run 1: no micro cuts, no cluster cut, giveback treated as advisory, GOOGL bought as a dip (-10% under MA50, RSI 40) with the knife check argued, LRCX/KLAC full-exited under SMALL POSITION CLEANUP. Also verified `strip_micro_cuts` against the real 11-12 digest (all ten sub-$5 trims removed) and 7 edge cases.
+
+**Observed in that run, NOT changed (Chris's call):** (a) AMZN was bought as "dip-adjacent" at +5.7% over its MA50 / RSI 59 — not a dip by the stated definition; the deploy-all-idle-cash default won over the dip standard. (b) AMZN+GOOGL are a 35%-of-equity correlated cluster and the buys push it toward ~45%; with cluster rules off nothing weighs that. (c) `SMALL POSITION CLEANUP` still exits sub-$10 holdings even at a loss (LRCX -40% from cost, KLAC -20%) — selling beaten-down names, which cuts against the returns-first stance.
+
 ## Portfolio Risk Context (gain giveback, concentration, benchmarks)
 
 Added 2026-10-12 after a day when 16/20 positions fell, every one was "held — thesis intact", and
@@ -454,7 +473,7 @@ sell to fund a better buy, for a broken thesis, or for overextension — "sell b
 evaporating" was not a recognised reason. Everything below is computed in Python
 (`portfolio_risk.py`), same Python-tracked-state pattern as trim warnings; nothing is auto-sold.
 
-**Gain giveback (the sell trigger).** Per position: peak close since `opened_at` (Robinhood's
+**Gain giveback (formerly the sell trigger — ADVISORY since 2026-11-12, see section above).** Per position: peak close since `opened_at` (Robinhood's
 position `created_at`, so a pre-purchase spike can't count), `peak_gain` vs `avg_cost`, and what share
 of that open gain (`peak - cost`) has been surrendered. `status == "alert"` when peak gain
 >= `GIVEBACK_MIN_PEAK_GAIN_PCT` (20), giveback >= `GIVEBACK_ALERT_PCT` (33) **and the position is still
@@ -462,8 +481,7 @@ above cost**. Below cost it is `"gone"` (informational) — alerting there would
 loss, which `COST BASIS DISCIPLINE` separately restrains. Alerts get a tag on the position line, a
 `=== GAIN GIVEBACK ALERTS ===` section, and the `GAIN GIVEBACK` hard constraint: for each alert,
 TRIMS/EXITS must recommend an exit/trim or name a specific checkable reason to hold ("thesis intact" /
-"sector-wide pullback" are explicitly not reasons). A hold-despite-alert must be stated in
-TRIMS/EXITS, not only HOLDS (same block-order hazard as below). `OPPORTUNITY COST CHECK` makes the
+"sector-wide pullback" are explicitly not reasons). (Historical: a hold-despite-alert had to be stated in TRIMS/EXITS — no longer required.) `OPPORTUNITY COST CHECK` makes the
 alerted position the funding candidate by default.
 
 **Exits fund buys, not cash.** `EXITS FUND BUYS` requires giveback proceeds to be redeployed the same
@@ -491,6 +509,8 @@ re-entered late). A per-position giveback exit did better: price was lower 40 se
 together* is now a second sell trigger — see Cluster Breakdown below. The "context only" line above is what
 let a 45% chip cluster fall 35% with no sell recommended.)**
 
+**Re-test 2026-11-12 — the giveback rule did NOT hold up on a broader sample.** Same rule as coded (peak gain >=20%, >=33% given back, still above cost), run from a hypothetical entry every 10 sessions over up to 5y on the 16 current holdings (1,283 entries with an alert; entries overlap, so they are not independent; survivorship-biased — these are stocks Chris still holds, many of which multiplied). Selling at the alert vs holding to the horizon: **-11pp at 60 sessions, -22pp at 120, -53pp at 250**; selling beat holding in only 46% / 37% / 26% of entries, and it lost for 14 of 16 stocks (only AMZN and UNH gained). The 60-session move *after* an alert averaged +9.4% vs +9.7% for all stock-days, i.e. the alert carries no information about what comes next, and exiting to cash just forfeits the (large, survivor-inflated) drift. This conflicts with the +94% vs +89% 1y result in the table above, which was one window ending in a drawdown. Status: the rule is still a forced `MUST exit or name a reason` in the prompt; recommended to downgrade to advisory — awaiting Chris's decision.
+
 **Concentration — no hard-coded sector lists.** `correlation_clusters()` does average-linkage
 clustering (threshold 0.45) on ~6 months of daily returns. On this portfolio it recovered the real
 10-name semis group (47% of equity) plus GOOGL/AMZN, IONQ/RKLB, CRWD/PANW with no labels, so it
@@ -514,6 +534,10 @@ as **Portfolio Risk**. Not yet seen on a scheduled cron run — first validated 
 (34%) alerted, both were trimmed, and proceeds went to GOOGL/META outside the semis cluster.
 
 ## Cluster Breakdown (sell trigger for a sector falling together)
+
+> **DISABLED 2026-11-12** (`portfolio_risk.BREAKDOWN_ENABLED = False`). Chris: "i'm not interested in cluster rules, i'm interested in individual stock performance." It had been sending a proportional slice of every cluster member (ten trims of $0.51-$4.13 for a $15.69 cut) regardless of how each stock was doing. With the switch off, clusters are still computed and shown as risk context, but none is ever flagged, so no cut, cash hold, buy block or per-member tag reaches the prompt. Flip the constant to restore everything below; `plan_cut()` and the $10 floor are kept for that. The static CLUSTER BREAKDOWN text in `CLAUDE_SYSTEM_PROMPT` is conditional on the section appearing, so it is inert while off.
+>
+> **No per-stock replacement was built, on evidence.** Chris chose "replace with a per-stock trigger"; before building one the thresholds were backtested on the 16 current holdings (3y of daily closes; survivorship-biased because these are stocks he still holds, so read the comparison, not the absolutes). Flagging a stock that is >=10-20% under its own 50-day average AND >=20-30% under its own 60-session high, optionally with a falling 50-day average, was followed by a *better* 20-session return than average, not worse: +6.0% to +10.5% mean vs +3.7% for all stock-days, rising with the depth of the weakness; only 31-38% of flagged days fell further vs 42% unconditionally. Only MRVL and UNH kept falling after being flagged (-3.6%, -5.1%); IONQ, RKLB, TSM, PANW, NVDA, ARM bounced +8% to +20%. Same direction as the 1y trailing-stop result below. A forced sell-on-weakness rule would have sold into rebounds. Not built; awaiting Chris's call on what "individual stock performance" should mean as a sell input.
 
 Added 2026-11-07, after the portfolio went ~$1,060 → $860 (10-06 → 11-06) while the analysis said "hold" every
 day. Reading the archived digests (they live in Gmail **Trash**, which purges at ~30 days — see session_notes)
@@ -544,8 +568,8 @@ their own 50-session average AND the cluster's value is at least `BREAKDOWN_DRAW
   position trim rule, and stops a portfolio that is mostly one cluster being told to sell nearly everything. A
   cluster still over target next session is cut by the remainder; when it is at/under target `cut_usd` is 0 but
   the restrictions below stay on while the condition holds.
-- `breakdown_split()` — per-member sale amounts, proportional to equity, summing exactly to the cut. **Why the
-  model does not size the trims:** on two live dry runs it wrote a headline "Sell ~$174" over trim lines that added
+- `plan_cut()` (stored as the cluster's `split`; `breakdown_split(c)` just reads it) — per-member sales. **Chris's rule (2026-11-12): a partial sale must be >= `MIN_PARTIAL_TRADE_USD` ($10) AND leave >= $10 in the position (no point trading a fragment); anything else is a FULL exit, valid at any size.** This is about trades, not holdings: Chris was explicit that holding a position under $10 is fine. (1) Partial sales are spread proportionally over members that can take one (equity >= $20; the 50%-of-position cap then guarantees the $10 remainder), dropping the smallest until every share is >= $10. (2) If partials can't cover the cut, the shortfall is filled with whole-position exits of smaller members of **any size, including under $10** (Chris, 2026-11-12: only *partial* trims are floored; a full exit is fine at any size — a needed ~$8 cut sells all of a ~$7.57 KLAC), the one closest to the shortfall first, never past half the cluster. The "$20" is a *consequence* (10 sold + 10 left), not a threshold of its own — and being small doesn't make a position a hold, it makes its sale all-or-nothing. History: v1 had no floor (ten trims of $0.51–$4.13 for a $15.69 cut, two sessions running); v2 excluded members under $20 outright and presented "$20" as the rule; v3 let the $10 floor override the 50% cap for small positions (Chris: a sale that leaves < $10 should have been a full exit). `cut_usd` is the *deliverable* total (sum of the split, floored to cents); `ideal_cut_usd` keeps what the 25%-target math wanted; a split value equal to a member's equity is rendered `FULL EXIT, sell all`. The same rule is the `MINIMUM TRADE` paragraph of the prompt. Now: one MRVL sale of $15.69.
+  **Why the model does not size the trims:** on two live dry runs it wrote a headline "Sell ~$174" over trim lines that added
   up to $138 and then $86, and called $138 "within ~10%". The digest is what a person places trades from, so
   Python does the division and the model copies it (after that change: two runs, both exactly $173.94).
 - Members are tagged `CLUSTER BREAKDOWN — SELL-ELIGIBLE` and removed from ELIGIBLE FUNDING SOURCES. The tag takes
@@ -567,7 +591,7 @@ their own 50-session average AND the cluster's value is at least `BREAKDOWN_DRAW
   a human checks the reason. If these fire repeatedly the next step is a post-parse retry, not more prompt text.
 - Rendered in both digests inside **Portfolio Risk** (`** BREAKDOWN **` flag + the measurements + CUT REQUIRED),
   since that block is shared with the prompt. Saved to `last_analysis.json` under `risk_context.concentration`
-  (new keys: `breakdown`, `cut_usd`, `equity`, `n_below_ma`, `n_with_ma`).
+  (new keys: `breakdown`, `cut_usd`, `ideal_cut_usd`, `split`, `equity`, `n_below_ma`, `n_with_ma`).
 
 **Backtest** (2y of daily closes, the 10-name chip cluster, current share counts back-cast — survivorship flatters
 everything, so read the comparison, not the absolutes): buy-and-hold **+71% / worst drawdown -44%**; the stateless
@@ -627,7 +651,7 @@ How it reaches the analysis:
   within `CATALYST_TAG_DAYS` (4), a `[REPORTS EARNINGS …]` tag — next to the price/RSI data it is
   deciding on rather than in a section it has no reason to reread. This is what actually made the
   META trim cite the equity raise; the section alone did not.
-- Hard constraints in `CLAUDE_SYSTEM_PROMPT`: `ANALYST VIEWS` (an **ANALYST VIEWS** block of ≤5 lines
+- Hard constraints in `CLAUDE_SYSTEM_PROMPT`: `ANALYST VIEWS` (an **ANALYST VIEWS** block covering every view — the original ≤5-line cap was removed 2026-11-12, see "Returns First" item 5 —
   between `SINCE LAST SESSION` and `OPPORTUNITY COST CHECK`, each AGREE/DISAGREE/PARTLY against this
   prompt's data and ending `changes: <action>` / `changes: nothing`; hedging preserved; events on
   held symbols weighed in that position's reasoning) and `CATALYSTS` (any buy/add/trim of a symbol
@@ -656,8 +680,7 @@ symbol. That block is for trades. The prompt now says a restricted position is o
 the model rewords around the rule (`**HOLD COST — no trim**`, then plain-prose `No action on COST — …`),
 so `strip_noop_trim_lines()` enforces it after parsing: it drops no-action TRIM/EXIT/SELL and HOLD
 header lines from the block, and plain-prose lines naming a commitment-blocked symbol. It leaves
-alone symbols with a gain-giveback alert (a hold-despite-alert must stay written in this block,
-as `**HOLD X (giveback alert) — reason**`) and any bold EXIT/TRIM header. If that empties the block it
+alone members of a broken-down cluster (a declined cut is `**HOLD X (breakdown) — reason**`; gain giveback no longer needs a hold line since it became advisory) and any bold EXIT/TRIM header. If that empties the block it
 writes `No trims or exits today.`
 
 ## Exits Belong in TRIMS/EXITS (block-order hazard)
