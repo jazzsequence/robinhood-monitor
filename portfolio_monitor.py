@@ -92,6 +92,12 @@ SMALL_POSITION_THRESHOLD = 10  # equity ($) at/under which a position is a clean
 # same name back on the bounce is a round trip that only pays the spread (Chris, 2026-11-12:
 # "selling at a loss only to buy that back again when it bounces, that's a stupid policy").
 REBUY_BLOCK_DAYS = 14
+# ...but only while the name is NOT meaningfully cheaper than it was sold for. Buying back at
+# least this % below the most recent sale price is the opposite of a round trip — it improves on
+# the sale — so the block lifts. Chris, 2026-11-16: NVDA sold 11-09 at $178, was $160 on 11-16,
+# and the flat 14-day block hid it from the dip list. "The rebuy block should exclusively be
+# looking at price difference from sale to potential rebuy."
+REBUY_MIN_DISCOUNT_PCT = 3
 ETHICAL_EXCLUSIONS_FILE = "ethical_exclusions.json"
 # Continuity tracking (see the "Continuity" section further down): how long a
 # "ONE KEY THING TO WATCH" item is carried forward and forcibly re-reported, how
@@ -234,7 +240,10 @@ CLAUDE_SYSTEM_PROMPT = (
     "'=== THIS WEEK'S CATALYSTS ===' section) reports within days. Any BUY, add or trim of that "
     "symbol must acknowledge the event in its reasoning — earnings are binary risk and a buy "
     "into one is a different decision from a buy on a quiet week. This does not forbid acting; "
-    "it forbids acting as if the event were not there. Name the macro releases in the same "
+    "it forbids acting as if the event were not there. An upcoming report is NOT by itself a "
+    "reason to skip a buy that otherwise passes the dip standard — name the event and say why the "
+    "setup still works through it; a deeply oversold name into a print can be the better entry. "
+    "Name the macro releases in the same "
     "section (a Fed decision, PCE) when they bear on the tape you describe.\n\n"
     "NEWS INTEGRATION: The market news section appears at the top of the "
     "prompt — read it first and let it set the macro frame before evaluating individual positions. "
@@ -254,12 +263,15 @@ CLAUDE_SYSTEM_PROMPT = (
     "deterioration — treat them differently. A trim is warranted by broken fundamentals or a "
     "better redeployment opportunity, not by the size of today's move.\n\n"
     "NO ROUND TRIPS: If a '=== RECENTLY SOLD — NO BUY-BACK ===' section appears, do not BUY any "
-    "symbol it lists. Selling a name and buying it back within days — typically on the bounce — "
-    "pays the spread and gains nothing; it is a policy Chris explicitly rejects. The only "
-    "override is a materially NEW reason that arrived after the sale and that you can name "
-    "(a new catalyst, news, or a change in the thesis) — a lower or higher price is not one, "
-    "and neither is 'it is a dip'. To override, write the word 'override' in that BUY line with the new reason; a BUY of a "
-    "recently sold name without it is removed automatically. The mirror image "
+    "symbol it lists. Selling a name and buying it back at or near the sale price — typically on "
+    "the bounce — pays the spread and gains nothing; it is a policy Chris explicitly rejects. "
+    "The block is PRICE-based: a symbol appears there only while it trades within a few percent "
+    "of (or above) the price it was sold at. A name trading meaningfully BELOW its recent sale "
+    "price is not listed and is an ordinary buy candidate — buying it back cheaper is not a round "
+    "trip. For a listed name the only override is a materially NEW reason that arrived after the "
+    "sale and that you can name (a new catalyst, news, or a change in the thesis) — 'it is a dip' "
+    "is not one. To override, write the word 'override' in that BUY line with the new reason; a "
+    "BUY of a listed name without it is removed automatically. The mirror image "
     "binds too: do not recommend selling a name you would buy back today (see SMALL POSITION "
     "CLEANUP's consistency test).\n\n"
     "RECENT POSITIONS: Do not recommend selling positions bought < 7 days ago without a severe "
@@ -3342,16 +3354,19 @@ def build_prompt(summary: dict) -> str:
                 f"{o['date']} ({o['days_ago']}d ago){flag}"
             )
 
-    recently_sold = {}
-    for o in recent_orders:
-        if o["side"] == "sell" and o["days_ago"] <= REBUY_BLOCK_DAYS:
-            recently_sold[o["symbol"]] = min(o["days_ago"], recently_sold.get(o["symbol"], 999))
+    recently_sold = rebuy_blocks(recent_orders, _current_prices(summary))
     if recently_sold:
         lines += [
             "",
-            f"=== RECENTLY SOLD — NO BUY-BACK (sold within {REBUY_BLOCK_DAYS} days) ===",
+            f"=== RECENTLY SOLD — NO BUY-BACK (sold within {REBUY_BLOCK_DAYS} days, not yet "
+            f"{REBUY_MIN_DISCOUNT_PCT}%+ below the sale price) ===",
             "Do not BUY these (see the NO ROUND TRIPS rule): "
-            + ", ".join(f"{s} (sold {d}d ago)" for s, d in sorted(recently_sold.items(), key=lambda kv: kv[1])),
+            + ", ".join(
+                f"{s} (sold {b['days']}d ago at ${b['sold_price']:.2f}"
+                + (f", now ${b['now']:.2f}" if b["now"] is not None else ", current price unknown")
+                + ")"
+                for s, b in sorted(recently_sold.items(), key=lambda kv: kv[1]["days"])
+            ),
         ]
 
     # Held names that meet the numeric dip test (see portfolio_risk.dip_candidates).
@@ -3359,13 +3374,22 @@ def build_prompt(summary: dict) -> str:
         o["symbol"] for o in summary.get("pending_orders", []) if o["side"] == "buy"
     }
     dips = portfolio_risk.dip_candidates(summary["positions"], PRICE_HISTORY, dip_exclude)
-    if dips and summary.get("uncommitted_cash", summary["cash"]) > 0:
+    if dips:
+        # Shown regardless of cash: trimming a winner to fund a dip is the point of EXITS FUND BUYS
+        # (Chris, 2026-11-16: "dip list should not be hidden if we're trading ... sell winners to
+        # fund symbols likely to upswing"). It used to be gated on deployable cash > 0.
+        no_cash = summary.get("uncommitted_cash", summary["cash"]) <= 0
         lines += [
             "",
             "=== DIP CANDIDATES (computed in Python — held names that meet the numeric dip test) ===",
             "These meet the NUMERIC half of the DIP-BUYING standard. You still apply the worthwhile-"
             "target and falling-knife checks (news, thesis, catalysts) — see BUYS.",
-        ] + portfolio_risk.dip_candidate_lines(dips)
+        ] + ([
+            "Deployable cash is $0.00, so a buy here is funded by trimming a winner from ELIGIBLE "
+            "FUNDING SOURCES (EXITS FUND BUYS): in the OPPORTUNITY COST CHECK, weigh the best "
+            "CLEAN/SCALE_IN candidate below against the strongest eligible winner and pair them "
+            "in TRIMS/EXITS and BUYS if the dip is the better use of that capital.",
+        ] if no_cash else []) + portfolio_risk.dip_candidate_lines(dips)
 
     if trim_warnings:
         lines += ["", "=== TRIM COUNT WARNINGS ==="]
@@ -3629,10 +3653,45 @@ def _warn_if_cluster_cut_ignored(analysis: str, risk_context: dict | None) -> No
             )
 
 
+def _current_prices(summary: dict) -> dict[str, float]:
+    """Latest price per symbol: held positions first, then the stashed price history."""
+    prices = {}
+    for sym, closes in PRICE_HISTORY.items():
+        if closes is not None and len(closes):
+            prices[sym] = float(closes.iloc[-1])
+    prices.update({p["symbol"]: p["current_price"] for p in summary.get("positions", []) if p.get("current_price")})
+    return prices
+
+
+def rebuy_blocks(recent_orders: list[dict], prices: dict[str, float]) -> dict[str, dict]:
+    """Symbols that may not be bought back now, with why: {sym: {days, sold_price, now}}.
+
+    Sold within REBUY_BLOCK_DAYS AND not trading at least REBUY_MIN_DISCOUNT_PCT below the
+    lowest recent sale price. A name that has fallen well under what it was sold for is not a
+    round trip. Fails closed: an unknown current or sale price keeps the block.
+    """
+    sales: dict[str, dict] = {}
+    for o in recent_orders:
+        if o["side"] != "sell" or o["days_ago"] > REBUY_BLOCK_DAYS:
+            continue
+        e = sales.setdefault(o["symbol"], {"days": o["days_ago"], "sold_price": None})
+        e["days"] = min(e["days"], o["days_ago"])
+        if o.get("price"):
+            e["sold_price"] = o["price"] if e["sold_price"] is None else min(e["sold_price"], o["price"])
+    out = {}
+    for sym, e in sales.items():
+        now = prices.get(sym)
+        sold = e["sold_price"]
+        if now is not None and sold and now <= sold * (1 - REBUY_MIN_DISCOUNT_PCT / 100):
+            continue
+        out[sym] = {"days": e["days"], "sold_price": sold or 0.0, "now": now}
+    return out
+
+
 _BUY_LINE_RE = re.compile(r"^[\s\-*\u2022]*\*\*\s*BUY\s+([A-Z][A-Z.\-]{0,9})\b", re.IGNORECASE | re.MULTILINE)
 
 
-def strip_rebuys(analysis: str, recent_orders: list[dict]) -> str:
+def strip_rebuys(analysis: str, recent_orders: list[dict], prices: dict[str, float] | None = None) -> str:
     """Enforce NO ROUND TRIPS: drop a BUY of a symbol sold within REBUY_BLOCK_DAYS unless
     the line says it is an override.
 
@@ -3644,7 +3703,7 @@ def strip_rebuys(analysis: str, recent_orders: list[dict]) -> str:
     logged so a human can check the reason is real. The cash a dropped buy would have
     used is simply not deployed.
     """
-    sold = {o["symbol"] for o in recent_orders if o["side"] == "sell" and o["days_ago"] <= REBUY_BLOCK_DAYS}
+    sold = set(rebuy_blocks(recent_orders, prices or {}))
     if not sold:
         return analysis
     lines = analysis.split("\n")
@@ -3765,7 +3824,7 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
         analysis_part, {p["symbol"]: p["equity"] for p in summary.get("positions", [])}
     )
     _warn_if_cluster_cut_ignored(analysis_part, summary.get("risk_context"))
-    analysis_part = strip_rebuys(analysis_part, summary.get("recent_orders", []))
+    analysis_part = strip_rebuys(analysis_part, summary.get("recent_orders", []), _current_prices(summary))
     if not portfolio_risk.BREAKDOWN_ENABLED and re.search(
         r"\*\*\s*CUT\s+[^*\n]*CLUSTER[^*\n]*(?:Sell|\$)", analysis_part, re.IGNORECASE
     ):
