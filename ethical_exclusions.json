@@ -39,6 +39,10 @@
     "CEG": {
       "reason": "Criterion (3): Constellation Energy is primarily a fossil fuel extraction and nuclear power company with substantial coal and natural gas operations.",
       "added": "2026-11-09"
+    },
+    "BABA": {
+      "reason": "Alibaba has built and deployed mass-surveillance technology including facial recognition systems used by Chinese law enforcement and government authorities, meeting criterion (2).",
+      "added": "2026-11-23"
     }
   },
   "screened": [
@@ -52,6 +56,7 @@
     "ASML",
     "AVGO",
     "AXON",
+    "BABA",
     "CBRS",
     "CCI",
     "CEG",
