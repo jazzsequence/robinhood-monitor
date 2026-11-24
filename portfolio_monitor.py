@@ -35,6 +35,8 @@ import robin_stocks.robinhood as r
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+import macro_view
+import market_regime
 import newsletter_views
 import portfolio_risk
 
@@ -102,11 +104,15 @@ ETHICAL_EXCLUSIONS_FILE = "ethical_exclusions.json"
 # Continuity tracking (see the "Continuity" section further down): how long a
 # "ONE KEY THING TO WATCH" item is carried forward and forcibly re-reported, how
 # many can be open at once, and how many sessions of breadth history are kept.
-WATCH_ITEM_MAX_AGE_DAYS = 5
-WATCH_ITEM_MIN_RESOLVE_AGE_DAYS = 3  # a RESOLVED verdict on a younger item is ignored (one bounce isn't an answer)
+# 2026-11-24: 5 -> 15 / 3 -> 5 / 5 -> 20. The 5-day windows were the whole memory of the system and
+# made every morning a comparison against the last few sessions, in a market that was in a 6-week
+# drawdown (see market_regime.py). A watch item now lives long enough to be judged against a trend.
+WATCH_ITEM_MAX_AGE_DAYS = 15
+WATCH_ITEM_MIN_RESOLVE_AGE_DAYS = 5  # a RESOLVED verdict on a younger item is ignored (one bounce isn't an answer)
 WATCH_ITEM_MAX_OPEN = 3
 WATCH_ITEM_MAX_SYMBOLS = 8  # a sector-wide watch legitimately names most of a sector
-BREADTH_HISTORY_LEN = 5
+BREADTH_HISTORY_LEN = 20
+BREADTH_DETAIL_ROWS = 7  # rows printed in full in the prompt; the rest are summarised
 
 # ANALYSIS_FILE and PROTECTED_COMMITMENTS_FILE carry real dollar figures from
 # the user's account, so — unlike tickers.json/ethical_exclusions.json — they
@@ -527,10 +533,40 @@ CLAUDE_SYSTEM_PROMPT = (
     "script enforces this — a RESOLVED verdict on an item younger than "
     f"{WATCH_ITEM_MIN_RESOLVE_AGE_DAYS} days is ignored and the item stays open — so for a young "
     "item use STILL OPEN and say what the new session did.\n\n"
+    "MARKET REGIME — HARD CONSTRAINT: If a '=== MARKET REGIME ===' section appears, it — not the "
+    "last few sessions — is the backdrop for every decision. It is computed in Python from the "
+    "indexes, the VIX and the holdings. (1) Open the OPPORTUNITY COST CHECK with one sentence "
+    "stating its classification (UPTREND, CORRECTION or DOWNTREND) and the two or three figures "
+    "that justify it (an index's drawdown from its high, an index against its 200-day average, the "
+    "VIX against its 60-day average), plus what that means for this session's buying — inside "
+    "the OPPORTUNITY COST CHECK itself, not as a separate block. (2) A one-"
+    "session rally or drop inside a CORRECTION or DOWNTREND is noise unless it moves one of those "
+    "figures — an index reclaiming its 200-day average, the VIX falling back toward its average, "
+    "the portfolio making a higher low. Do not call a one-day rally a recovery, a relief rally "
+    "that has 'resolved' anything, or the turn; do not call a one-day drop a new development. "
+    "(3) 'Whipsaw', 'chop' and 'choppy' are allowed ONLY when the section's Tape character line "
+    "says CHOPPY. When it says DIRECTIONAL DECLINE, the big up days are bounces inside a decline "
+    "and you may not call the market chop or whipsaw, nor say a reversal 'confirms' a pattern of "
+    "chop; and a figure like 'third reversal in five sessions' must come from that section, not "
+    "from the prior run's wording or a newsletter's phrase. (4) A "
+    "day's gain is never by itself a reason to buy, and a day's loss is never by itself a reason "
+    "to wait or to sell: decide from the regime, the DIP CANDIDATES stabilization status and the "
+    "name's own thesis. (5) If the section carries a REGIME BUY CAP, obey it (see BUYS).\n\n"
+    "WEEKLY MACRO READ — HARD CONSTRAINT: If a '=== WEEKLY MACRO READ ===' section appears, it is "
+    "the 2-3 week arc distilled from the newsletters, and today's newsletter is its latest "
+    "installment, not a replacement. Place today's news against it — say which named theme it "
+    "extends or contradicts — rather than treating each morning's wrap as an independent "
+    "discovery, and weigh a theme that has run for weeks above a view that appeared yesterday. "
+    "Do not cite a theme, macro condition or dated event that the section does not contain, and "
+    "if it is marked as days old, say that it is dated. Its 'Phase' is the newsletters' own word "
+    "for the market; the MARKET REGIME classification is the measured one and is what governs the "
+    "REGIME BUY CAP — if the two read differently, state both rather than picking the milder.\n\n"
     "SESSION-OVER-SESSION CONTINUITY — HARD CONSTRAINT: The '=== MARKET BREADTH ===' section "
-    "below is computed in Python from the position list over the last several sessions, and the "
+    "below is computed in Python from the position list over the last twenty sessions (the most "
+    "recent in full, the earlier ones as a roll-up), and the "
     "PRIOR RUN ANALYSIS section is what was said last time. Read both before characterizing "
-    "today's market mood, and describe the mood relative to them rather than as if today were "
+    "today's market mood, and describe the mood relative to them — and to the MARKET REGIME — "
+    "rather than as if today were "
     "the first day you had looked. If today continues a condition already running for several "
     "sessions, say so and say which session of it this is — do not re-narrate a multi-day "
     "pullback, rotation, or rally as though it started this morning. If the mood has genuinely "
@@ -558,6 +594,21 @@ CLAUDE_SYSTEM_PROMPT = (
     "being exited for any reason, including SMALL POSITION CLEANUP. "
     "\"Nothing to trim\" next to "
     "an exit recommended elsewhere in the analysis is a contradiction.\n\n"
+    "REGIME BUY CAP — HARD CONSTRAINT: This portfolio is self-sustaining: buys are normally "
+    "funded by trimming a winner, which is a rotation, adds no exposure, and is NOT limited by "
+    "the cap. If the MARKET REGIME section carries a REGIME BUY CAP, it limits only NET NEW "
+    "MONEY — buy dollars beyond the proceeds of sales you write in TRIMS/EXITS this same session "
+    "(idle cash or a deposit). Net new money in a CORRECTION or DOWNTREND is the exception and "
+    "needs a very good, named reason to add; it goes in on a schedule, one tranche per N trading "
+    "sessions, and idle cash waiting is the strategy, not a missed opportunity. When the cap says "
+    "no tranche is due, total BUYS may not exceed that session's sale proceeds (any excess is "
+    "removed after you write it) — and say in one sentence when the next tranche is due. A "
+    "sale-funded buy still has to pass every other test (stabilized CLEAN or SCALE_IN dip, "
+    "worthwhile target, the OPPORTUNITY COST CHECK): the cap being silent about it does not make "
+    "it good, and in a DOWNTREND a rotation has to beat simply holding the winner. When a tranche "
+    "is due, you may add up to it in net new money to the best CLEAN or SCALE_IN dip candidate "
+    "that passes the worthwhile-target check; if none does, spend nothing and say so — an unspent "
+    "tranche stays due. In an UPTREND there is no cap and the normal deploy rules apply.\n\n"
     "BUYS: State total capital available (cash + trim proceeds) in one line. Then one bold action "
     "line per buy (e.g. **BUY MRVL — $35**) with one sentence of reasoning. "
     "Do not include a capital math summary — state each buy exactly once. "
@@ -570,7 +621,7 @@ CLAUDE_SYSTEM_PROMPT = (
     "(including a few dollars of leftover proceeds) is to deploy it into the best available "
     "opportunity this session. Holding cash is an exception that needs a specific, named reason "
     "(e.g. every candidate is overbought or news-damaged, or a pending order already "
-    "earmarks it, or a CLUSTER BREAKDOWN is active — see that rule) — 'it's only $7' and "
+    "earmarks it, or a CLUSTER BREAKDOWN is active — see that rule, or the REGIME BUY CAP below) — 'it's only $7' and "
     "'nothing is broken' are not reasons. If you hold cash, "
     "say which exception applies. Deploying is not a license to chase: the target of a small "
     "deployment must pass the SAME entry standard as any other buy. A one-session bounce, a "
@@ -583,18 +634,24 @@ CLAUDE_SYSTEM_PROMPT = (
     "worthwhile-target and falling-knife checks IS the default. You may not hold cash on the "
     "grounds that 'no unowned candidate clears the bar' while a CLEAN or SCALE_IN candidate is "
     "listed — to hold cash, name each listed candidate and the specific check it fails (adverse "
-    "news, no thesis, a catalyst that argues for waiting). A WAIT candidate is not bought today. "
+    "news, no thesis, a catalyst that argues for waiting), unless the REGIME BUY CAP is what "
+    "holds it. A WAIT_LOWS (still making new closing lows) or BOUNCE (one-day relief spike) "
+    "candidate is not bought, and neither status changes because today happened to be green or "
+    "red — a BUY line for one is removed after you write it unless it contains the word "
+    "'override' with a materially new, named reason (a green day is not one). "
     "DIP-BUYING IS THE PREFERRED ENTRY: a pullback in a worthwhile name is a reason to buy, "
     "not to sell. A DIP means price at or below its MA50, or roughly 10%+ under its recent "
     "high, with RSI below ~50 — a name that is up sharply and extended is a chase, not a dip. "
     "A WORTHWHILE TARGET has a live reason to own it that this prompt evidences (a catalyst, "
     "supportive news, a Sherwood or analyst view you can name, a sound thesis) and is NOT a "
     "FALLING KNIFE: (a) no company-specific adverse news or broken thesis in the news or "
-    "newsletter data; (b) the decline is not still accelerating today (not down roughly 3%+ on "
-    "heavy volume — if it is, say it waits a session); (c) you can say in one clause why the dip "
+    "newsletter data; (b) the name has stabilized — the DIP CANDIDATES list marks it CLEAN or "
+    "SCALE_IN, meaning no new closing low in the last 5 sessions and not a one-day relief spike; "
+    "a single up or down day does not establish or break that; (c) you can say in one clause why the dip "
     "is market-, sector- or valuation-driven rather than damage to the company. A name that "
     "fails the knife check is rejected explicitly. Scale in: where a name is more than ~15% "
-    "under its MA50, commit at most about half the deployable cash to it this session and say "
+    "under its MA50, commit at most about half of this session's budget (the REGIME BUY CAP "
+    "tranche, or the deployable cash when there is no cap) to it and say "
     "the rest goes to the next-best candidate or waits for stabilization. Prefer, "
     "in order: (1) a dip on a worthwhile target, held or unowned, that passes the standard "
     "above, (2) the best unowned candidate if it is a clean entry, (3) a funding-eligible or "
@@ -639,8 +696,11 @@ CLAUDE_SYSTEM_PROMPT = (
     "the news flow are doing today at the macro and sector level: risk-on or risk-off, which "
     "sectors are leading or breaking down, how broad the move is, what the headlines are "
     "fixated on, and whether this looks like a one-day wobble or the start of something "
-    "sustained. Read this from the market news, from the MARKET BREADTH series, and from the "
-    "breadth of moves across the whole position list — not from any single ticker. Place it "
+    "sustained (the regime figures, not the day's size, answer that). Read this from the MARKET REGIME section first (its classification and index "
+    "figures set the frame), then the WEEKLY MACRO READ and today's news, then the MARKET BREADTH "
+    "series — not from any single ticker and not from the size of today's move: one day is a "
+    "data point inside the regime, not the mood itself. Say where today sits in the regime "
+    "(extending it, stabilizing, or reversing it) rather than whether it was a good or bad day. Place it "
     "against the prior run's tl;dr: if this is a continuation, say so and say which session of "
     "it this is; if it has changed, name what changed. Do not describe a condition that has "
     "been running for days as if it were today's news, and do not recycle the prior tl;dr's "
@@ -2168,6 +2228,45 @@ def _newsletter_from_message(name: str, raw: bytes, sent: datetime,
     }, ""
 
 
+def _gather_newsletter_candidates(imap, name: str, sender: str, since: str,
+                                  per_mailbox: int) -> list[tuple[datetime, bytes]]:
+    """Every message from `sender` since `since` across NEWSLETTER_MAILBOXES, as (sent, raw).
+
+    The same issue usually sits in several mailboxes (All Mail holds the inbox copy too), so
+    results are de-duplicated on (sent, subject). `per_mailbox` keeps only the newest N per
+    mailbox — the daily fetch wants a handful, the 3-week archive wants them all."""
+    candidates: list[tuple[datetime, bytes]] = []
+    seen: set[tuple] = set()
+    for mailbox in NEWSLETTER_MAILBOXES:
+        try:
+            status, _ = imap.select(mailbox, readonly=True)
+            if status != "OK":
+                continue
+            status, data = imap.search(None, "FROM", f'"{sender}"', "SINCE", since)
+            if status != "OK" or not data or not data[0]:
+                continue
+            for num in data[0].split()[-per_mailbox:]:
+                status, fetched = imap.fetch(num, "(RFC822)")
+                if status != "OK" or not fetched or not fetched[0]:
+                    continue
+                raw = fetched[0][1]
+                if not isinstance(raw, bytes):
+                    continue
+                msg = email.message_from_bytes(raw)
+                sent = _message_sent_at(msg)
+                if sent is None:
+                    continue
+                key = (sent, _decode_subject(msg))
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append((sent, raw))
+        except Exception as e:
+            log.warning(f"{name}: mailbox {mailbox} unusable: {e}")
+            continue
+    return candidates
+
+
 def fetch_sherwood_newsletters(max_age_days: int | None = None) -> tuple[list[dict], list[str]]:
     """
     Return (issues, problems) for the configured Sherwood newsletters.
@@ -2195,28 +2294,7 @@ def fetch_sherwood_newsletters(max_age_days: int | None = None) -> tuple[list[di
                 # Candidates are gathered across mailboxes first, then tried
                 # newest-first, so a welcome email sitting on top of a real
                 # issue is skipped rather than ending the search.
-                candidates: list[tuple[datetime, bytes]] = []
-                for mailbox in NEWSLETTER_MAILBOXES:
-                    try:
-                        status, _ = imap.select(mailbox, readonly=True)
-                        if status != "OK":
-                            continue
-                        status, data = imap.search(None, "FROM", f'"{sender}"', "SINCE", since)
-                        if status != "OK" or not data or not data[0]:
-                            continue
-                        for num in data[0].split()[-8:]:
-                            status, fetched = imap.fetch(num, "(RFC822)")
-                            if status != "OK" or not fetched or not fetched[0]:
-                                continue
-                            raw = fetched[0][1]
-                            if not isinstance(raw, bytes):
-                                continue
-                            sent = _message_sent_at(email.message_from_bytes(raw))
-                            if sent is not None:
-                                candidates.append((sent, raw))
-                    except Exception as e:
-                        log.warning(f"{name}: mailbox {mailbox} unusable: {e}")
-                        continue
+                candidates = _gather_newsletter_candidates(imap, name, sender, since, per_mailbox=8)
 
                 if not candidates:
                     problems.append(f"{name}: no email from {sender} since {since}")
@@ -2247,6 +2325,39 @@ def fetch_sherwood_newsletters(max_age_days: int | None = None) -> tuple[list[di
         return [], [f"IMAP fetch failed ({type(e).__name__})"]
 
     issues.sort(key=lambda i: i["date"], reverse=True)
+    return issues, problems
+
+
+def fetch_newsletter_archive(days: int) -> tuple[list[dict], list[str]]:
+    """Every real issue of every configured newsletter from the last `days` days, oldest first.
+
+    Feeds the weekly macro read (macro_view.py). Same IMAP login, mailboxes and
+    subscription-mail filter as the daily fetch; one issue per (newsletter, date)."""
+    address = os.getenv("GMAIL_ADDRESS")
+    password = os.getenv("GMAIL_APP_PASSWORD")
+    if not address or not password:
+        return [], ["GMAIL_ADDRESS/GMAIL_APP_PASSWORD not set"]
+    since = (datetime.now(timezone.utc) - timedelta(days=days + 1)).strftime("%d-%b-%Y")
+    issues: list[dict] = []
+    problems: list[str] = []
+    try:
+        with imaplib.IMAP4_SSL(NEWSLETTER_IMAP_HOST) as imap:
+            imap.login(address, password)
+            for name, sender in SHERWOOD_NEWSLETTERS:
+                found: dict[str, dict] = {}
+                for sent, raw in _gather_newsletter_candidates(imap, name, sender, since, per_mailbox=days * 2):
+                    issue, _ = _newsletter_from_message(name, raw, sent, days)
+                    # Two real issues on one date: keep the longer (a re-send or a short special).
+                    if issue and (issue["date"] not in found or len(issue["text"]) > len(found[issue["date"]]["text"])):
+                        found[issue["date"]] = issue
+                if not found:
+                    problems.append(f"{name}: no usable issue in the last {days} days")
+                issues += list(found.values())
+    except Exception as e:
+        log.warning(f"Newsletter archive fetch failed ({type(e).__name__}): {e}")
+        return [], [f"IMAP archive fetch failed ({type(e).__name__})"]
+    issues.sort(key=lambda i: (i["date"], i["name"]))
+    log.info(f"Newsletter archive: {len(issues)} issues over {days} days")
     return issues, problems
 
 
@@ -2539,6 +2650,10 @@ def save_analysis(date: str, tldr: str, analysis: str, summary: dict | None = No
             "concentration": risk.get("concentration") or [],
             "benchmarks": risk.get("benchmarks"),
         }
+        # Regime + the session's buy cap, so an interactive MCP session sees the same backdrop
+        # the digest was written against.
+        payload["regime"] = summary.get("regime")
+        payload["buy_budget"] = summary.get("buy_budget")
         payload["momentum"] = [
             {
                 k: m.get(k)
@@ -2610,13 +2725,54 @@ def compute_breadth(positions: list[dict], today: str) -> dict:
     }
 
 
-def build_breadth_history(prior_analysis: dict | None, breadth: dict) -> list[dict]:
-    """Prior sessions' breadth plus today's, oldest first, capped at
-    BREADTH_HISTORY_LEN. A same-day rerun replaces its own earlier entry rather
-    than stacking a second one for the same date."""
-    history = list((prior_analysis or {}).get("breadth_history") or [])
-    history = [h for h in history if h.get("date") != breadth["date"]]
+def backfill_breadth(positions: list[dict], histories: dict[str, pd.Series], today: str,
+                     length: int = BREADTH_HISTORY_LEN) -> list[dict]:
+    """Breadth rows for recent sessions reconstructed from price history of the CURRENT holdings.
+
+    The stored series gains one row per run, so a 20-session window would take 20 mornings to
+    fill — and until then the analysis still sees only a handful of days. Rows are flagged
+    `backfilled`: they describe today's holdings in past sessions (not what was held then),
+    which is all the shape of the tape needs. Sessions on or after `today` (the session being
+    reported) are excluded: the live row for it is computed from the actual positions."""
+    closes = portfolio_risk._aligned_closes([p["symbol"] for p in positions], histories, 60)
+    if len(closes) < 52:
+        return []
+    rets = closes.pct_change() * 100
+    ma50 = closes.rolling(50).mean()
+    rows = []
+    for d in closes.index[-(length + 1):]:
+        key = d.date().isoformat()
+        if key >= today:
+            continue
+        r = rets.loc[d].dropna()
+        m = ma50.loc[d].dropna()
+        if r.empty:
+            continue
+        rows.append({
+            "date": key, "total": int(len(r)),
+            "up": int((r > 0).sum()), "down": int((r < 0).sum()),
+            "median_pct": round(float(r.median()), 2),
+            "above_ma50": int((closes.loc[d][m.index] > m).sum()), "with_ma50": int(len(m)),
+            "backfilled": True,
+        })
+    return rows
+
+
+def build_breadth_history(prior_analysis: dict | None, breadth: dict,
+                          backfill: list[dict] | None = None) -> list[dict]:
+    """Breadth for the last BREADTH_HISTORY_LEN sessions, oldest first, today's row last.
+
+    Prior sessions come from `backfill` (see backfill_breadth) when it is available, NOT from
+    the stored rows: a stored row is labelled with the date the run happened, so a pre-market
+    run files the previous session under today's date, and the stored rows would sit one
+    session off from the reconstructed ones (identical neighbouring rows in the 2026-11-24
+    dry run). The reconstruction is keyed by the session each close belongs to. Stored rows are
+    only the fallback when price history is unavailable. A same-day rerun replaces its own
+    row rather than stacking a second one."""
+    stored = list((prior_analysis or {}).get("breadth_history") or [])
+    history = [h for h in (backfill or stored) if h.get("date") != breadth["date"]]
     history.append(breadth)
+    history.sort(key=lambda h: h.get("date") or "")
     return history[-BREADTH_HISTORY_LEN:]
 
 
@@ -2889,19 +3045,35 @@ def watch_items_prompt_lines(
     return lines
 
 
+def _breadth_rollup(rows: list[dict]) -> str:
+    """One line summarising older sessions — enough to see the shape without 20 rows of text."""
+    ups = sum(1 for h in rows if (h.get("up") or 0) > (h.get("down") or 0))
+    downs = sum(1 for h in rows if (h.get("down") or 0) > (h.get("up") or 0))
+    big = [h for h in rows if h.get("median_pct") is not None and abs(h["median_pct"]) >= 3]
+    ma = [h["above_ma50"] / h["with_ma50"] for h in rows if h.get("with_ma50")]
+    return (
+        f"  earlier {len(rows)} sessions ({rows[0].get('date')} to {rows[-1].get('date')}): "
+        f"{ups} up-breadth / {downs} down-breadth; {len(big)} with a median move >= 3% either way"
+        + (f"; names above MA50 averaged {100 * sum(ma) / len(ma):.0f}%" if ma else "")
+    )
+
+
 def breadth_prompt_lines(history: list[dict]) -> list[str]:
     if not history:
         return []
     lines = [
         "",
-        "=== MARKET BREADTH — THIS PORTFOLIO, SESSION OVER SESSION ===",
-        "Computed in Python from the position list, one row per run. Use this — not a "
-        "fresh impression of today's headlines — to decide whether today's mood is a "
-        "continuation of the last few sessions or a genuine change (see "
-        "SESSION-OVER-SESSION CONTINUITY).",
+        f"=== MARKET BREADTH — THIS PORTFOLIO, LAST {len(history)} SESSIONS ===",
+        "Computed in Python from the position list, one row per run. Read it against the MARKET "
+        "REGIME section, not on its own: it decides whether today continues a run of sessions or "
+        "changes it (see SESSION-OVER-SESSION CONTINUITY); the regime decides what that means.",
     ]
-    for n, h in enumerate(history):
-        marker = "  ← today" if n == len(history) - 1 else ""
+    detail = history[-BREADTH_DETAIL_ROWS:]
+    older = history[:-BREADTH_DETAIL_ROWS]
+    if older:
+        lines.append(_breadth_rollup(older))
+    for n, h in enumerate(detail):
+        marker = "  ← today" if n == len(detail) - 1 else ""
         ma50 = (
             f"above MA50 {h['above_ma50']}/{h['with_ma50']}"
             if h.get("with_ma50") else "above MA50 n/a"
@@ -2909,7 +3081,11 @@ def breadth_prompt_lines(history: list[dict]) -> list[str]:
         lines.append(
             f"  {h.get('date', '?'):<12} up {h.get('up', 0)} / down {h.get('down', 0)} "
             f"of {h.get('total', 0)}   median {_fmt(h.get('median_pct'), '+.2f')}%   "
-            f"{ma50}{marker}"
+            f"{ma50}{marker}{'  (reconstructed)' if h.get('backfilled') else ''}"
+        )
+    if any(h.get("backfilled") for h in history):
+        lines.append(
+            "  (reconstructed = rebuilt from price history of today's holdings, not recorded on the day)"
         )
     streak = describe_breadth_streak(history)
     if streak:
@@ -2950,6 +3126,15 @@ def build_prompt(summary: dict) -> str:
             "of what the prior run already reported — check the prior run's date "
             "against today's date before treating a move as new."
         )
+
+    # The regime goes first: it is the frame for everything below (see MARKET REGIME rule).
+    regime_block = market_regime.regime_lines(summary.get("regime"))
+    if regime_block:
+        lines += [
+            "",
+            "=== MARKET REGIME (computed in Python — the backdrop for every decision below) ===",
+        ] + regime_block + market_regime.buy_budget_lines(summary.get("buy_budget"))
+    lines += macro_view.prompt_lines(summary.get("macro_view"), summary["date"])
 
     newsletters = summary.get("newsletters") or []
     if newsletters:
@@ -3075,6 +3260,16 @@ def build_prompt(summary: dict) -> str:
             "",
             f"=== PRIOR RUN ANALYSIS ({prior['date']}) ===",
             elapsed_note,
+            # The prior analyses were written before the regime existed and narrated a 6-week drawdown
+            # as "whipsaw/chop"; left unqualified that wording is copied forward (2026-11-24 dry run).
+            *(
+                [
+                    "NOTE: the prior analysis's characterization of the market (e.g. 'whipsaw', "
+                    "'chop', 'relief rally', 'third reversal') is not evidence and may predate the "
+                    "MARKET REGIME section. Re-derive the mood from the MARKET REGIME and WEEKLY "
+                    "MACRO READ sections; reuse the prior wording only where they support it.",
+                ] if summary.get("regime") else []
+            ),
             # Without this the model copied a cluster cut out of the prior text (2026-11-12
             # dry run 3: "requires another cut", a $15.66 header, no such section present).
             *(
@@ -3369,27 +3564,33 @@ def build_prompt(summary: dict) -> str:
             ),
         ]
 
-    # Held names that meet the numeric dip test (see portfolio_risk.dip_candidates).
+    # Held names that meet the numeric dip test (see market_regime.dip_candidates).
     dip_exclude = set(recently_sold) | {
         o["symbol"] for o in summary.get("pending_orders", []) if o["side"] == "buy"
     }
-    dips = portfolio_risk.dip_candidates(summary["positions"], PRICE_HISTORY, dip_exclude)
+    dips = market_regime.dip_candidates(summary["positions"], PRICE_HISTORY, dip_exclude)
+    # Read back by strip_unstable_dip_buys after the analysis is parsed.
+    summary["dip_statuses"] = {d["symbol"]: d["status"] for d in dips}
     if dips:
         # Shown regardless of cash: trimming a winner to fund a dip is the point of EXITS FUND BUYS
         # (Chris, 2026-11-16: "dip list should not be hidden if we're trading ... sell winners to
         # fund symbols likely to upswing"). It used to be gated on deployable cash > 0.
+        # Funding a dip by trimming a winner is a rotation, which the regime cap does not limit
+        # (it caps net new money only), so the hint stays on even when no tranche is due.
         no_cash = summary.get("uncommitted_cash", summary["cash"]) <= 0
         lines += [
             "",
             "=== DIP CANDIDATES (computed in Python — held names that meet the numeric dip test) ===",
-            "These meet the NUMERIC half of the DIP-BUYING standard. You still apply the worthwhile-"
-            "target and falling-knife checks (news, thesis, catalysts) — see BUYS.",
+            "These meet the NUMERIC half of the DIP-BUYING standard, including the multi-day "
+            "stabilization test (no new closing low in 5 sessions, not a one-day relief spike) — a "
+            "green or red day today does not change a status. You still apply the worthwhile-target "
+            "check (news, thesis, catalysts) — see BUYS. Only CLEAN and SCALE_IN names are buyable.",
         ] + ([
             "Deployable cash is $0.00, so a buy here is funded by trimming a winner from ELIGIBLE "
             "FUNDING SOURCES (EXITS FUND BUYS): in the OPPORTUNITY COST CHECK, weigh the best "
             "CLEAN/SCALE_IN candidate below against the strongest eligible winner and pair them "
             "in TRIMS/EXITS and BUYS if the dip is the better use of that capital.",
-        ] if no_cash else []) + portfolio_risk.dip_candidate_lines(dips)
+        ] if no_cash else []) + market_regime.dip_candidate_lines(dips)
 
     if trim_warnings:
         lines += ["", "=== TRIM COUNT WARNINGS ==="]
@@ -3444,6 +3645,24 @@ def build_prompt(summary: dict) -> str:
             )
             + "BUYS must hold the proceeds and any idle cash instead of deploying them, and no "
             "member of the broken cluster may be bought."
+        )
+    regime = summary.get("regime")
+    if regime:
+        budget = summary.get("buy_budget")
+        reminders.append(
+            f"The MARKET REGIME is {regime['label']}. Open the OPPORTUNITY COST CHECK with one sentence "
+            "naming it and the figures behind it, and judge today's move against it — a one-day "
+            "rally or drop is noise unless a regime figure changed."
+            + (
+                f" The REGIME BUY CAP limits NET NEW MONEY (buys beyond same-session sale proceeds) to "
+                f"${budget['budget_usd']:.2f}"
+                + (f" (no tranche due until {budget['next_due']}: BUYS may not exceed what your TRIMS/EXITS fund)." if not budget["due"] else ".")
+                if budget else ""
+            )
+        )
+    if summary.get("macro_view"):
+        reminders.append(
+            "A WEEKLY MACRO READ is above: say which of its themes today's news extends or contradicts."
         )
     if reminders:
         lines += ["", "=== BEFORE YOU WRITE ==="] + reminders
@@ -3607,6 +3826,24 @@ def _trims_block(analysis: str) -> str:
     return "\n".join(body)
 
 
+_CHOP_RE = re.compile(r"\b(whipsaw\w*|chop|choppy)\b", re.IGNORECASE)
+
+
+def _warn_if_chop_in_a_decline(analysis: str, tldr: str, regime: dict | None) -> None:
+    """Log (never patch) when the narrative says chop/whipsaw although the measured tape is a
+    directional decline — the exact mischaracterization of 2026-11-24. If this fires repeatedly
+    the next step is a post-parse retry, not more prompt text."""
+    character = ((regime or {}).get("tape") or {}).get("character") or ""
+    if not character.startswith("DIRECTIONAL"):
+        return
+    hits = sorted({m.group(1).lower() for m in _CHOP_RE.finditer(f"{tldr}\n{analysis}")})
+    if hits:
+        log.warning(
+            f"Narrative uses {hits} although the measured tape is {character} "
+            f"({regime['label']}) — the market mood is being under-described"
+        )
+
+
 def _warn_if_cluster_cut_ignored(analysis: str, risk_context: dict | None) -> None:
     """Log when a required CLUSTER BREAKDOWN cut never reached TRIMS/EXITS.
 
@@ -3691,6 +3928,48 @@ def rebuy_blocks(recent_orders: list[dict], prices: dict[str, float]) -> dict[st
 _BUY_LINE_RE = re.compile(r"^[\s\-*\u2022]*\*\*\s*BUY\s+([A-Z][A-Z.\-]{0,9})\b", re.IGNORECASE | re.MULTILINE)
 
 
+def _buys_block_bounds(lines: list[str]) -> tuple[int, int] | None:
+    """(index of the BUYS header, index one past the block) or None when there is no BUYS block."""
+    start = next((i for i, ln in enumerate(lines) if re.match(r"^[\s#*]*BUYS\b", ln, re.IGNORECASE)), None)
+    if start is None:
+        return None
+    end = next(
+        (i for i in range(start + 1, len(lines))
+         if re.match(r"^[\s#*]*(?:HOLDS|ONE KEY THING)\b", lines[i], re.IGNORECASE)),
+        len(lines),
+    )
+    return start, end
+
+
+def _strip_buy_lines(analysis: str, should_drop) -> tuple[str, list[str]]:
+    """Drop BUY action lines (and their reasoning lines) from the BUYS block where
+    `should_drop(symbol, line)` is true. Returns (new analysis, dropped symbols)."""
+    lines = analysis.split("\n")
+    bounds = _buys_block_bounds(lines)
+    if bounds is None:
+        return analysis, []
+    start, end = bounds
+    out, dropped, i = [], [], start + 1
+    while i < end:
+        ln = lines[i]
+        m = _BUY_LINE_RE.match(ln)
+        sym = m.group(1).upper() if m else None
+        if sym and should_drop(sym, ln):
+            dropped.append(sym)
+            i += 1
+            while (
+                i < end and lines[i].strip()
+                and not re.match(r"^\s*[-*\u2022]", lines[i])
+            ):
+                i += 1
+            continue
+        out.append(ln)
+        i += 1
+    if not dropped:
+        return analysis, []
+    return "\n".join(lines[:start + 1] + out + lines[end:]), dropped
+
+
 def strip_rebuys(analysis: str, recent_orders: list[dict], prices: dict[str, float] | None = None) -> str:
     """Enforce NO ROUND TRIPS: drop a BUY of a symbol sold within REBUY_BLOCK_DAYS unless
     the line says it is an override.
@@ -3706,43 +3985,149 @@ def strip_rebuys(analysis: str, recent_orders: list[dict], prices: dict[str, flo
     sold = set(rebuy_blocks(recent_orders, prices or {}))
     if not sold:
         return analysis
-    lines = analysis.split("\n")
-    start = next((i for i, ln in enumerate(lines) if re.match(r"^[\s#*]*BUYS\b", ln, re.IGNORECASE)), None)
-    if start is None:
-        return analysis
-    end = next(
-        (i for i in range(start + 1, len(lines))
-         if re.match(r"^[\s#*]*(?:HOLDS|ONE KEY THING)\b", lines[i], re.IGNORECASE)),
-        len(lines),
-    )
-    out, dropped, overridden, i = [], [], [], start + 1
-    while i < end:
-        ln = lines[i]
-        m = _BUY_LINE_RE.match(ln)
-        sym = m.group(1).upper() if m else None
-        if sym in sold:
-            if re.search(r"override", ln, re.IGNORECASE):
-                overridden.append(sym)
-            else:
-                dropped.append(sym)
-                i += 1
-                while (
-                    i < end and lines[i].strip()
-                    and not re.match(r"^\s*[-*\u2022]", lines[i])
-                ):
-                    i += 1
-                continue
-        out.append(ln)
-        i += 1
+    overridden: list[str] = []
+
+    def should_drop(sym: str, line: str) -> bool:
+        if sym not in sold:
+            return False
+        if re.search(r"override", line, re.IGNORECASE):
+            overridden.append(sym)
+            return False
+        return True
+
+    result, dropped = _strip_buy_lines(analysis, should_drop)
     if overridden:
         log.warning(f"BUY of recently-sold {sorted(set(overridden))} kept as a stated override — check the reason is new")
-    if not dropped:
+    if dropped:
+        log.warning(
+            f"Dropped BUY of symbol(s) sold within {REBUY_BLOCK_DAYS} days with no stated override: "
+            f"{sorted(set(dropped))} (NO ROUND TRIPS) — the BUYS capital math may still count them"
+        )
+    return result
+
+
+_UNSTABLE_DIP = ("WAIT_LOWS", "BOUNCE")
+
+
+def strip_unstable_dip_buys(analysis: str, dip_statuses: dict[str, str] | None) -> str:
+    """Enforce the stabilization test: drop a BUY of a held dip candidate still marked WAIT_LOWS
+    (making new closing lows) or BOUNCE (a one-day relief spike), unless the line says "override".
+
+    The status is Python-computed from price history precisely so a green or red day cannot
+    change it; a dry run (2026-11-24) had the model describe GOOGL as "passing" the dip test
+    while the list marked it WAIT_LOWS. Same drop-with-reasoning-line mechanics and the same
+    override escape as strip_rebuys; an override is kept but logged."""
+    blocked = {s: st for s, st in (dip_statuses or {}).items() if st in _UNSTABLE_DIP}
+    if not blocked:
         return analysis
-    log.warning(
-        f"Dropped BUY of symbol(s) sold within {REBUY_BLOCK_DAYS} days with no stated override: "
-        f"{sorted(set(dropped))} (NO ROUND TRIPS) — the BUYS capital math may still count them"
-    )
-    return "\n".join(lines[:start + 1] + out + lines[end:])
+    overridden: list[str] = []
+
+    def should_drop(sym: str, line: str) -> bool:
+        if sym not in blocked:
+            return False
+        if re.search(r"override", line, re.IGNORECASE):
+            overridden.append(sym)
+            return False
+        return True
+
+    result, dropped = _strip_buy_lines(analysis, should_drop)
+    if overridden:
+        log.warning(f"BUY of {sorted(set(overridden))} kept as a stated override of its dip stabilization status — check the reason")
+    if dropped:
+        log.warning(
+            "Dropped BUY of " + ", ".join(f"{s} ({blocked[s]})" for s in sorted(set(dropped)))
+            + " — not stabilized per DIP CANDIDATES; the BUYS capital math may still count them"
+        )
+    return result
+
+
+_BUY_AMOUNT_RE = re.compile(
+    r"^[\s\-*\u2022]*\*\*\s*BUY\s+[A-Z][A-Z.\-]{0,9}\b[^$\n]*\$\s*([\d,]+(?:\.\d+)?)", re.IGNORECASE
+)
+
+
+def _sale_proceeds(analysis: str, equity_by_symbol: dict[str, float]) -> float:
+    """Dollars of sales written in TRIMS/EXITS (an amount is capped at the position's equity).
+
+    Call it AFTER strip_micro_cuts: a trim that was dropped as a micro cut funds nothing."""
+    total = 0.0
+    for ln in _trims_block(analysis).splitlines():
+        m = _ACTION_LINE_RE.match(ln)
+        if not m:
+            continue
+        sym, amount = m.group(2).upper(), float(m.group(3).replace(",", ""))
+        equity = equity_by_symbol.get(sym)
+        total += min(amount, equity) if equity is not None else amount
+    return round(total, 2)
+
+
+def strip_regime_buys(
+    analysis: str, budget: dict | None, equity_by_symbol: dict[str, float] | None = None
+) -> str:
+    """Enforce the REGIME BUY CAP on NET NEW MONEY: buys beyond what same-session sales fund.
+
+    This portfolio is self-sustaining (Chris, 2026-11-24): buys are normally funded by trimming a
+    winner, which is a rotation and adds no exposure, so a sale-funded buy is not capped here.
+    Only dollars that did NOT come from sales written in this analysis — idle cash or fresh
+    deposits — count against the cap. allowed = same-session sale proceeds + budget_usd (the
+    tranche when one is due, else 0).
+
+    No tranche due: BUY lines are dropped, in order, once they would push total buys past the
+    sale proceeds (no override word — the schedule is the point, and "this one is different" is
+    how a daily buy habit comes back). Tranche due: an overspend is only logged, because
+    rewriting dollar amounts in prose is guesswork (same call as _warn_if_cluster_cut_ignored).
+    A dropped buy can leave its funding trim in TRIMS/EXITS; that is logged."""
+    if not budget:
+        return analysis
+    proceeds = _sale_proceeds(analysis, equity_by_symbol or {})
+    allowed = proceeds + budget["budget_usd"]
+    tol = 0.5  # rounding slack on dollar amounts the model wrote
+
+    if not budget["due"]:
+        spent = 0.0
+        no_amount: list[str] = []
+
+        def over_cap(sym: str, line: str) -> bool:
+            nonlocal spent
+            m = _BUY_AMOUNT_RE.match(line)
+            if not m:
+                # Can't price it: with no sales to fund it, it is net new money and goes;
+                # with sales on the page, keep it and log it for a human.
+                if proceeds <= 0:
+                    return True
+                no_amount.append(sym)
+                return False
+            amt = float(m.group(1).replace(",", ""))
+            if spent + amt <= allowed + tol:
+                spent += amt
+                return False
+            return True
+
+        result, dropped = _strip_buy_lines(analysis, over_cap)
+        if dropped:
+            log.warning(
+                f"Dropped BUY of {sorted(set(dropped))}: REGIME BUY CAP ({budget['regime']}) — no tranche is "
+                f"due until {budget['next_due']}, and only ${proceeds:.2f} of same-session sales fund buys. "
+                "Any trim written to fund a dropped buy is still in TRIMS/EXITS"
+            )
+        if no_amount:
+            log.warning(f"BUY of {sorted(set(no_amount))} has no parseable $ amount; cap not checked")
+        return result
+
+    bounds = _buys_block_bounds(analysis.split("\n"))
+    if bounds:
+        lines = analysis.split("\n")
+        total = sum(
+            float(m.group(1).replace(",", ""))
+            for ln in lines[bounds[0] + 1:bounds[1]]
+            if (m := _BUY_AMOUNT_RE.match(ln))
+        )
+        if total > allowed * 1.1 + tol:
+            log.warning(
+                f"BUYS total ${total:.2f} exceeds ${allowed:.2f} (${proceeds:.2f} same-session sales + the "
+                f"${budget['budget_usd']:.2f} {budget['regime']} tranche) — not rewritten; check the digest before trading"
+            )
+    return analysis
 
 
 def get_claude_analysis(summary: dict) -> tuple[str, str]:
@@ -3825,6 +4210,11 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
     )
     _warn_if_cluster_cut_ignored(analysis_part, summary.get("risk_context"))
     analysis_part = strip_rebuys(analysis_part, summary.get("recent_orders", []), _current_prices(summary))
+    analysis_part = strip_unstable_dip_buys(analysis_part, summary.get("dip_statuses"))
+    analysis_part = strip_regime_buys(
+        analysis_part, summary.get("buy_budget"), {p["symbol"]: p["equity"] for p in summary.get("positions", [])}
+    )
+    _warn_if_chop_in_a_decline(analysis_part, tldr, summary.get("regime"))
     if not portfolio_risk.BREAKDOWN_ENABLED and re.search(
         r"\*\*\s*CUT\s+[^*\n]*CLUSTER[^*\n]*(?:Sell|\$)", analysis_part, re.IGNORECASE
     ):
@@ -3923,7 +4313,10 @@ def format_digest(summary: dict, analysis: str) -> str:
                 f"Breadth today: up {b.get('up', 0)} / down {b.get('down', 0)} of "
                 f"{b.get('total', 0)} | median {_fmt(b.get('median_pct'), '+.2f')}% | {ma50}"
             )
-            for h in breadth_history[:-1]:
+            older = breadth_history[:-BREADTH_DETAIL_ROWS]
+            if older:
+                lines.append(_breadth_rollup(older))
+            for h in breadth_history[-BREADTH_DETAIL_ROWS:-1]:
                 lines.append(
                     f"  {h.get('date', '?')}: up {h.get('up', 0)} / down {h.get('down', 0)} "
                     f"of {h.get('total', 0)}, median {_fmt(h.get('median_pct'), '+.2f')}%"
@@ -3950,6 +4343,13 @@ def format_digest(summary: dict, analysis: str) -> str:
                     f"vs MA50 {_fmt(then.get('price_vs_ma50_pct'), '+.1f')}% → "
                     f"{_fmt(now.get('price_vs_ma50_pct'), '+.1f')}%"
                 )
+
+    regime_lines = market_regime.regime_lines(summary.get("regime"))
+    if regime_lines:
+        lines += ["", "MARKET REGIME", sep] + regime_lines + market_regime.buy_budget_lines(summary.get("buy_budget"))
+    macro_lines = macro_view.plain_lines(summary.get("macro_view"), summary["date"])
+    if macro_lines:
+        lines += [""] + macro_lines
 
     risk_lines = portfolio_risk.risk_text_lines(summary.get("risk_context"), summary["positions"])
     if risk_lines:
@@ -4468,6 +4868,15 @@ def format_digest_html(summary: dict, analysis: str) -> str:
         + "</pre>"
     ) if risk_text else ""
 
+    regime_text = market_regime.regime_lines(summary.get("regime")) + market_regime.buy_budget_lines(summary.get("buy_budget"))
+    regime_content = (
+        '<pre style="margin:0;font-size:12px;line-height:1.5;color:#334155;'
+        'font-family:Menlo,Consolas,monospace;white-space:pre-wrap;">'
+        + _h("\n".join(regime_text))
+        + "</pre>"
+        + macro_view.html_block(summary.get("macro_view"), summary["date"], _h)
+    ) if regime_text else macro_view.html_block(summary.get("macro_view"), summary["date"], _h)
+
     # ── Analysis block ───────────────────────────────────────────────────────
     analysis_html = _md_to_html(analysis)
 
@@ -4502,8 +4911,10 @@ def format_digest_html(summary: dict, analysis: str) -> str:
         prior_rows = " &nbsp;·&nbsp; ".join(
             f"{_h(h.get('date', '?'))}: {h.get('up', 0)}↑/{h.get('down', 0)}↓ "
             f"({_fmt(h.get('median_pct'), '+.2f')}%)"
-            for h in breadth_history[:-1]
+            for h in breadth_history[-BREADTH_DETAIL_ROWS:-1]
         )
+        if len(breadth_history) > BREADTH_DETAIL_ROWS:
+            prior_rows = _h(_breadth_rollup(breadth_history[:-BREADTH_DETAIL_ROWS]).strip()) + " &nbsp;·&nbsp; " + prior_rows
         streak = describe_breadth_streak(breadth_history)
         trend_content += (
             '<p style="margin:0 0 4px;font-size:13px;color:#0f172a;">'
@@ -4588,6 +4999,7 @@ def format_digest_html(summary: dict, analysis: str) -> str:
         tldr_block
         + (_section("Trend Tracker", trend_content)
            if (watch_items or len(breadth_history) > 1) else "")
+        + (_section("Market Regime", regime_content) if regime_content else "")
         + (_section("Pending Orders", pending_content) if pending_orders else "")
         + (_section("Portfolio Risk", risk_content) if risk_content else "")
         + _section("Current Positions", _table(pos_header, pos_rows))
@@ -4951,6 +5363,19 @@ def main():
         log.warning(f"Risk context failed: {e}")
         risk_context = None
 
+    # 6c. Market regime (index drawdowns, VIX, holdings under their averages, 20-session tape).
+    # Non-critical: without it the prompt has no regime block and the buy-tranche cap is off.
+    regime = None
+    try:
+        regime = market_regime.compute_regime(positions, PRICE_HISTORY, market_regime.fetch_regime_history())
+        if regime:
+            log.info(
+                f"Market regime: {regime['label']} (score {regime['score']}/{regime['max_score']}): "
+                + "; ".join(regime["reasons"])
+            )
+    except Exception as e:
+        log.warning(f"Market regime failed: {e}")
+
     # 7. Build summary
     total_equity = sum(p["equity"] for p in positions)
     total_value = round(total_equity + cash, 2)
@@ -4962,8 +5387,19 @@ def main():
     # as today's discovery; the watch items are what prior runs said they would
     # watch, which the prompt now forces to be reported on with real then→now
     # numbers instead of quietly dropped.
-    breadth = compute_breadth(positions, today)
-    breadth_history = build_breadth_history(prior_analysis, breadth)
+    # Keyed by the session the closes belong to, not the run date: a 6am run reports the previous
+    # session (see the is_stale note in build_prompt).
+    session_date = max(
+        (PRICE_HISTORY[p["symbol"]].index[-1].date().isoformat() for p in positions if p["symbol"] in PRICE_HISTORY),
+        default=today,
+    )
+    breadth = compute_breadth(positions, session_date)
+    try:
+        breadth_backfill = backfill_breadth(positions, PRICE_HISTORY, session_date)
+    except Exception as e:
+        log.warning(f"Breadth backfill failed: {e}")
+        breadth_backfill = []
+    breadth_history = build_breadth_history(prior_analysis, breadth, breadth_backfill)
     open_watch_items = carry_forward_watch_items(prior_analysis, today)
     log.info(
         f"Breadth: up {breadth['up']} / down {breadth['down']} of {breadth['total']}, "
@@ -4998,7 +5434,21 @@ def main():
         "breadth_history": breadth_history,
         "watch_items": open_watch_items,
         "risk_context": risk_context,
+        "regime": regime,
     }
+    try:
+        summary["buy_budget"] = market_regime.buy_budget(
+            regime, total_value, recent_orders, pending_orders, today
+        )
+        if summary["buy_budget"]:
+            b = summary["buy_budget"]
+            log.info(
+                f"Regime buy cap: {b['regime']} tranche ${b['tranche_usd']:.2f} every {b['spacing']} sessions; "
+                f"last buy {b['last_buy']} -> {'DUE' if b['due'] else 'not due until ' + str(b['next_due'])}"
+            )
+    except Exception as e:
+        log.warning(f"Regime buy budget failed: {e}")
+        summary["buy_budget"] = None
 
     # 7b. Resolve protected-symbol reinvestment commitments against real order history
     all_commitments: list[dict] = []
@@ -5034,6 +5484,14 @@ def main():
         summary["newsletters"], summary["newsletter_problems"] = [], [
             f"fetch raised {type(e).__name__}: {e}"
         ]
+
+    # Weekly macro read: the 2-3 week arc behind today's issue. Cached for a week, so this is
+    # usually a file read; non-critical (a missing read just omits the section).
+    try:
+        summary["macro_view"] = macro_view.ensure(Anthropic(), CLAUDE_MODEL, fetch_newsletter_archive, today)
+    except Exception as e:
+        log.warning(f"Macro read failed: {e}")
+        summary["macro_view"] = None
 
     summary["newsletter_views"] = []
     if summary["newsletters"]:

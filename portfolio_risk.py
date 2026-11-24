@@ -527,75 +527,8 @@ def breakdown_cluster_lines(c: dict) -> list[str]:
     return lines
 
 
-# ── 5. Dip candidates (the buy side) ─────────────────────────────────────────
-# A DIP is the numeric half of the BUYS dip standard; the thesis/news half stays with
-# the model. Computed here because left to itself the model scanned only unowned
-# momentum names, rejected them, and sat on idle cash while a held name 10% under its
-# average with RSI 41 was a textbook dip (2026-11-12 dry run 2) — the hold-everything
-# failure. Python lists them; the model must buy one or say which check each fails.
-DIP_MAX_RSI = 50.0
-DIP_HIGH_DRAWDOWN_PCT = 10.0   # or this far under the 60-session high
-DIP_SCALE_IN_PCT = 15.0        # more than this far under MA50: commit at most half the cash
-DIP_KNIFE_DAY_PCT = -3.0       # down this much today...
-DIP_KNIFE_VOLUME = 1.5         # ...on this multiple of normal volume = still accelerating
-
-
-def dip_candidates(
-    positions: list[dict],
-    histories: dict[str, pd.Series],
-    exclude: set[str] = frozenset(),
-) -> list[dict]:
-    """Held names meeting the numeric DIP definition, best first.
-
-    A dip is RSI below DIP_MAX_RSI AND either at/under its MA50 or DIP_HIGH_DRAWDOWN_PCT
-    under its 60-session high. `exclude` is for names that may not be bought now
-    (sold within the buy-back window, unfilled buy pending). status is one of
-    WAIT (still accelerating today: down >= DIP_KNIFE_DAY_PCT on >= DIP_KNIFE_VOLUME x
-    volume), SCALE_IN (> DIP_SCALE_IN_PCT under MA50) or CLEAN."""
-    out = []
-    for p in positions:
-        sym = p["symbol"]
-        ind = p.get("indicators") or {}
-        rsi, vs50 = ind.get("rsi"), ind.get("price_vs_ma50_pct")
-        if sym in exclude or rsi is None or vs50 is None:
-            continue
-        closes = histories.get(sym)
-        below_high = None
-        if closes is not None and len(closes) >= 2:
-            below_high = round(_pct(float(closes.iloc[-1]), float(closes.tail(CLUSTER_HIGH_WINDOW).max())), 1)
-        if rsi >= DIP_MAX_RSI or not (vs50 <= 0 or (below_high is not None and below_high <= -DIP_HIGH_DRAWDOWN_PCT)):
-            continue
-        today, vol = ind.get("pct_change_today"), ind.get("volume_ratio")
-        if today is not None and vol is not None and today <= DIP_KNIFE_DAY_PCT and vol >= DIP_KNIFE_VOLUME:
-            status = "WAIT"
-        elif vs50 <= -DIP_SCALE_IN_PCT:
-            status = "SCALE_IN"
-        else:
-            status = "CLEAN"
-        out.append({
-            "symbol": sym, "rsi": round(rsi, 1), "vs_ma50_pct": round(vs50, 1),
-            "below_high_pct": below_high, "today_pct": today, "volume_ratio": vol,
-            "return_pct": p.get("total_return_pct"), "status": status,
-        })
-    order = {"CLEAN": 0, "SCALE_IN": 1, "WAIT": 2}
-    return sorted(out, key=lambda d: (order[d["status"]], d["vs_ma50_pct"]))
-
-
-def dip_candidate_lines(cands: list[dict]) -> list[str]:
-    notes = {
-        "CLEAN": "passes the numeric dip test",
-        "SCALE_IN": f"more than {DIP_SCALE_IN_PCT:.0f}% under MA50 — commit at most about half the deployable cash",
-        "WAIT": "still accelerating today (down hard on heavy volume) — wait a session, do not buy today",
-    }
-    lines = []
-    for c in cands:
-        high = f", {abs(c['below_high_pct']):.1f}% under its 60-session high" if c["below_high_pct"] is not None else ""
-        today = f", today {c['today_pct']:+.2f}% on {c['volume_ratio']:.2f}x volume" if c["today_pct"] is not None and c["volume_ratio"] is not None else ""
-        lines.append(
-            f"  {c['symbol']:<7} RSI {c['rsi']}, {c['vs_ma50_pct']:+.1f}% vs MA50{high}{today}, "
-            f"{c['return_pct']:+.1f}% on cost — {notes[c['status']]}"
-        )
-    return lines
+# Dip candidates (the buy side) live in market_regime.py — they need the multi-day stabilization
+# test, and this module is already past the point where it should be split.
 
 
 def giveback_summary(symbol: str, g: dict, return_pct: float) -> str:
