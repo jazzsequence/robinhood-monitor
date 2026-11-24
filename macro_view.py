@@ -35,6 +35,7 @@ MACRO_FILE = "macro_view.json"          # gitignored; market commentary, regener
 MACRO_WINDOW_DAYS = 21
 MACRO_MAX_AGE_DAYS = 7                  # regenerate after this
 PER_ISSUE_CHARS = 3500                  # the market wrap + takeaway sit at the top of each issue
+MACRO_EFFORT = "low"
 MACRO_MAX_TOKENS = 4000
 MIN_ISSUES = 4                          # fewer than this is not an arc
 
@@ -142,11 +143,11 @@ def generate(client, model: str, issues: list[dict], today: str) -> dict | None:
         message = client.messages.create(
             model=model,
             max_tokens=MACRO_MAX_TOKENS,
-            thinking={"type": "disabled"},
+            output_config={"effort": MACRO_EFFORT},  # no `thinking` param — see newsletter_views.extract_issue
             system=MACRO_SYSTEM,
             messages=[{"role": "user", "content": f"TODAY: {today}\nISSUES ({len(issues)}), oldest first:\n\n{corpus}"}],
         )
-        data = newsletter_views._parse_json(message.content[0].text)
+        data = newsletter_views._parse_json(newsletter_views.response_text(message))
         if data is None:
             log.warning("Macro read: model returned unparseable JSON")
             return None

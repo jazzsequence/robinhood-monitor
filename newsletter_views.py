@@ -4,8 +4,8 @@ Analyst views and scheduled catalysts extracted from the Sherwood newsletters.
 The newsletters are the one source here that carries *analysis* — Sherwood's own
 read of the market, the strategists and firms it quotes, Robinhood retail-flow
 data, and (in Snacks) the week's earnings calendar. Handing the model the raw
-issue text was not enough: the analysis call runs with thinking disabled and
-treats a wall of prose as background colour. On 2026-10-26 it ignored the issue's
+issue text was not enough: the analysis call (then run with thinking disabled)
+treated a wall of prose as background colour. On 2026-10-26 it ignored the issue's
 lead item (Meta's $95B equity raise, while trimming META) and never mentioned that
 four held names report earnings within three sessions, because the calendar sat at
 the tail of an issue the old 5,000-char cap had already cut off.
@@ -40,6 +40,7 @@ CATALYST_KINDS = ("earnings", "macro", "other")
 CATALYST_TAG_DAYS = 4
 # Catalysts further out than this are noise for a daily digest.
 CATALYST_HORIZON_DAYS = 10
+EXTRACTION_EFFORT = "low"
 EXTRACTION_MAX_TOKENS = 8000
 
 EXTRACTION_SYSTEM = """You extract the ANALYTICAL CONTENT of a market newsletter for a portfolio analyst who trades a small, aggressive-growth account. Output one JSON object and nothing else.
@@ -86,6 +87,14 @@ def quote_in_text(quote: str, text: str) -> bool:
     """True when `quote` is a contiguous span of `text`, ignoring whitespace and case."""
     q = _squash(quote or "")
     return len(q) >= 12 and q in _squash(text)
+
+
+def response_text(message) -> str:
+    """Text of a Messages response: the first `text` block, or "" if there is none.
+
+    With adaptive thinking on, content[0] is a `thinking` block (empty text when display is
+    omitted), so content[0].text raises. Callers that parse JSON/prose must read the text block."""
+    return next((b.text for b in message.content if getattr(b, "type", None) == "text"), "")
 
 
 def _parse_json(raw: str) -> dict | None:
@@ -201,7 +210,9 @@ def extract_issue(client, model: str, issue: dict, universe: list[str]) -> dict 
         message = client.messages.create(
             model=model,
             max_tokens=EXTRACTION_MAX_TOKENS,
-            thinking={"type": "disabled"},
+            # No `thinking` param: claude-sonnet-5-5 rejects {"type": "disabled"} (400) and runs adaptive
+            # when it is omitted. Extraction is structured work, so keep effort low.
+            output_config={"effort": EXTRACTION_EFFORT},
             system=EXTRACTION_SYSTEM,
             messages=[{
                 "role": "user",
@@ -212,7 +223,7 @@ def extract_issue(client, model: str, issue: dict, universe: list[str]) -> dict 
                 ),
             }],
         )
-        data = _parse_json(message.content[0].text)
+        data = _parse_json(response_text(message))
         if data is None:
             log.warning(f"{issue['name']}: view extraction returned unparseable JSON")
             return None

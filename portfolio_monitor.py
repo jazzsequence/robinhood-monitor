@@ -122,8 +122,11 @@ BREADTH_DETAIL_ROWS = 7  # rows printed in full in the prompt; the rest are summ
 SYNC_DIR = os.path.expanduser("~/Dropbox/robinhood-monitor")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CLAUDE_MODEL = "claude-sonnet-5"
-CLAUDE_MAX_TOKENS = 8000
+CLAUDE_MODEL = "claude-sonnet-5-5"
+# Thinking tokens count toward max_tokens, and the TL;DR is written last, so a budget the thinking
+# eats loses the TL;DR. 16000 keeps a non-streaming request under the SDK's timeout guard.
+CLAUDE_MAX_TOKENS = 16000
+CLAUDE_ANALYSIS_EFFORT = "high"
 CLAUDE_SYSTEM_PROMPT = (
     "You are a female stock trading advisor for a high-risk-tolerance retail investor "
     "interested in making ethically responsible investment choices "
@@ -2696,7 +2699,7 @@ def save_analysis(date: str, tldr: str, analysis: str, summary: dict | None = No
 # it were that morning's discovery, and each ending with a "watch whether this
 # is a one-day wobble or something broader" line that the next run never
 # followed up on. Both halves are unfixable by prompt wording alone — with
-# thinking disabled the model sees one day's snapshot plus the prior run's prose
+# thinking disabled (as it was then) the model saw one day's snapshot plus the prior run's prose
 # and has no measured record of what the thing it flagged actually did.
 #
 # Both ride on last_analysis.json rather than a new file: it is already
@@ -4137,16 +4140,18 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
     message = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=CLAUDE_MAX_TOKENS,
-        thinking={"type": "disabled"},
+        # Adaptive thinking is on by omission: claude-sonnet-5-5 returns a 400 for {"type": "disabled"}.
+        output_config={"effort": CLAUDE_ANALYSIS_EFFORT},
         system=CLAUDE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
     # The TL;DR is generated *after* the analysis blocks (see CLAUDE_SYSTEM_PROMPT) so
     # it summarizes recommendations the model has already committed to, rather than a
-    # theme it guessed at before reasoning about any of them — thinking is disabled, so
-    # a TL;DR emitted first is literally the model's first tokens on the portfolio, and
-    # it used to routinely tell a different story than the advice below it.
-    raw = message.content[0].text.strip()
+    # theme it guessed at before reasoning about any of them. (Written when thinking was
+    # disabled, so a TL;DR emitted first was literally the model's first tokens on the
+    # portfolio and routinely told a different story than the advice below it; with adaptive
+    # thinking the model can reason first, but the ordering is kept — it costs nothing.)
+    raw = newsletter_views.response_text(message).strip()
     # Drop a trailing separator the model sometimes appends after the TL;DR; left in
     # place it would make the rsplit below hand back an empty TL;DR.
     raw = re.sub(r"\n-{3,}[ \t]*$", "", raw).strip()

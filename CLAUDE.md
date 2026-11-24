@@ -85,8 +85,9 @@ Python 3.11+ required (uses `float | None` union type syntax).
 | `MIN_SCREENER_TICKERS` | `25` | Minimum watchlist size |
 | `MAX_SCREENER_TICKERS` | `40` | Hard cap on watchlist size |
 | `WATCHLIST_MIN_SCORE` | `15` | Minimum momentum score to surface a Robinhood watchlist ticker |
-| `CLAUDE_MODEL` | `claude-sonnet-5` | Model for portfolio analysis (thinking explicitly disabled — see below) |
-| `CLAUDE_MAX_TOKENS` | `5000` | Max response length for analysis (the TL;DR is written last, so truncation loses it) |
+| `CLAUDE_MODEL` | `claude-sonnet-5-5` | Model for the analysis, newsletter extraction and macro read. Adaptive thinking is ON by omission of the `thinking` param (5-5 returns a 400 for `{"type": "disabled"}`) — see Model & Thinking (2026-11-24) |
+| `CLAUDE_ANALYSIS_EFFORT` | `high` | `output_config.effort` for the analysis call; extraction and the macro read use `low` (`EXTRACTION_EFFORT`, `MACRO_EFFORT`) |
+| `CLAUDE_MAX_TOKENS` | `16000` | Max response length for analysis, **including thinking tokens** (the TL;DR is written last, so truncation loses it) |
 | `RSI_PERIOD` | `14` | RSI calculation window |
 | `MOMENTUM_TOP_N` | `10` | Max momentum candidates returned |
 | `USER_WATCHLISTS` | `{"My First List", "Gaming", "Tech"}` | Your watchlists (highest priority) |
@@ -190,7 +191,8 @@ in order:
    is a hold; one real catalyst breaking is why the single buy goes where it goes.
 
 The ordering is what makes job 2 possible, and it is not an implementation detail. The analysis call
-runs with `thinking={"type": "disabled"}`, so whatever the model emits first *is* its first reasoning
+ran with `thinking={"type": "disabled"}` when this was written (adaptive thinking was turned on 2026-11-24 —
+see Model & Thinking; the ordering is kept), so whatever the model emits first *is* its first reasoning
 about the portfolio. The original prompt said "First, write 2-3 sentences framed as a tl;dr…" and
 framed it as "not a trade recommendation, but the broader context" — so it was written before any
 trim/buy/hold decision existed *and* was pushed away from the advice, and it routinely narrated a
@@ -217,7 +219,7 @@ The digest used to have no memory of its own narrative. Several consecutive runs
 near-identical TL;DR about the same chip-sector pullback, each written as if that morning had
 discovered it, and each closing with a "watch whether this is a one-day wobble or something
 broader" line that the next run never followed up on. Both halves are structurally unfixable by
-prompt wording alone: with `thinking={"type": "disabled"}` the model sees one day's snapshot plus
+prompt wording alone: with thinking disabled (as it was then) the model saw one day's snapshot plus
 the prior run's prose, and has no measured record of what the thing it flagged actually did.
 
 So this is the third place in the codebase using the **Python-tracked state, not model
@@ -489,6 +491,18 @@ Built (all Python-measured, same pattern as trim warnings; thresholds are mine, 
 
 **Live dry runs (4, writes stubbed):** (a) cap at $0 (real state): no BUYS, regime stated in the OPPORTUNITY COST CHECK, DIRECTIONAL DECLINE named; (b) tranche forced due: every candidate WAIT_LOWS, model held the tranche and named why; (c) breadth table correct after the session-date fix. **Not fixed / residual:** the model still sometimes calls the tape "chop"/"whipsaw" and echoes a newsletter's "third reversal in five sessions" framing despite the rule — `_warn_if_chop_in_a_decline()` logs it (blunt: it also trips on "not chop" and stock-level "whipsaw"). If it persists the next step is a post-parse retry, not more prompt text. A tranche-due run where a CLEAN/SCALE_IN name exists (does it buy it, within the cap?) has **not been seen** — every dip candidate was WAIT_LOWS on 11-24. The new constants and the DOWNTREND label have only seen one regime.
 
+## Model & Thinking (2026-11-24)
+
+`CLAUDE_MODEL` went `claude-sonnet-5` → `claude-sonnet-5-5` and the three Sonnet calls (analysis, `newsletter_views.extract_issue`, `macro_view.generate`) no longer send `thinking`. **Why omit rather than disable:** on 5-5 `{"type": "disabled"}` returns a 400 (the alternative `{"type": "between_tools"}` keeps thinking off at effort ≤ high); omitting it runs adaptive thinking. Effort is set explicitly through `output_config` — `high` for the analysis (`CLAUDE_ANALYSIS_EFFORT`), `low` for the structured extractions, where no thinking block appeared. The Haiku 4.5 calls are unchanged.
+
+Consequences to know about:
+- **Parse the text block, not `content[0]`.** With thinking on, `content[0]` is a `thinking` block. `newsletter_views.response_text()` returns the first `text` block and is used by all three calls; the Haiku calls (no thinking) still read `content[0]`.
+- **`CLAUDE_MAX_TOKENS` 8000 → 16000** because thinking tokens count toward it and the TL;DR is written last.
+- **Cost / latency** (one live dry run, usage logged): analysis 46.2K input + 10.1K output tokens (output includes thinking, roughly 6-7K by estimate) ≈ $0.19; two extractions ≈ $0.05; ≈ $0.25 per run, ≈ $5.40/month at ~21.7 runs, ~$6 with the Haiku calls and the weekly macro read (both estimated, not logged). A `claude-sonnet-5` no-thinking baseline was never logged; estimated ≈ $0.17/run, so thinking + 5-5 add ≈ $0.07/run (~$1.50/month). Analysis latency rose ~25 s.
+- **Format:** the section skeleton and digest section headers were identical to the 5-0 run, but prose drifted (bold lead-ins in ANALYST VIEWS, a few extra lines). 5-5 had changed the email format before on a previous bump — if the digest looks off, compare against a 5-0 dry run.
+- **Why:** Chris asked whether enabling thinking would fix the model echoing newsletter framing ("chop", "whipsaw", "third reversal") in a measured decline. One run had no such wording and one used only "not chop" (the log guard `_warn_if_chop_in_a_decline` fires on that — a known false positive), so it looks better but two runs prove nothing.
+- **Not done:** Anthropic recommends server-side `fallbacks` for 5-5 refusals; not wired in.
+
 ## Portfolio Risk Context (gain giveback, concentration, benchmarks)
 
 Added 2026-10-12 after a day when 16/20 positions fell, every one was "held — thesis intact", and
@@ -650,7 +664,7 @@ GOOGL, MSFT and KLAC report Wednesday and AMZN Thursday (the calendar had been t
 Matching tickers to paragraphs was rejected: it is sentiment-blind, and the useful content is the
 view, not the mention.
 
-`newsletter_views.extract_all()` runs one Sonnet call per issue (parallel, thinking disabled, fails soft —
+`newsletter_views.extract_all()` runs one Sonnet call per issue (parallel, effort `low`, no thinking observed, fails soft —
 the raw issue still reaches the analysis) and returns `views` (`editorial` / `third_party` /
 `retail_flow`, each with direction, horizon, claim, reasoning, an invalidation condition only if the
 text states one, and a **verbatim quote**), `events` (material facts: offerings, guidance, deals),
