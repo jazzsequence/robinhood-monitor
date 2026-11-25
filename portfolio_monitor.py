@@ -127,6 +127,15 @@ CLAUDE_MODEL = "claude-sonnet-5-5"
 # eats loses the TL;DR. 16000 keeps a non-streaming request under the SDK's timeout guard.
 CLAUDE_MAX_TOKENS = 16000
 CLAUDE_ANALYSIS_EFFORT = "high"
+# The digest email is a short decision memo by default: TL;DR, pending orders, the positions
+# table and the analysis. Everything else the agent is *given* (regime, trend tracker, risk,
+# indicator and momentum tables, watchlist changes, newsletter text, ticker news) is input for
+# its reasoning, not output the reader needs. DIGEST_FULL=1 in .env restores the long email.
+# The data is still saved to last_analysis.json / news.json either way.
+def digest_full() -> bool:
+    return os.getenv("DIGEST_FULL", "").strip().lower() in {"1", "true", "yes"}
+
+
 CLAUDE_SYSTEM_PROMPT = (
     "You are a female stock trading advisor for a high-risk-tolerance retail investor "
     "interested in making ethically responsible investment choices "
@@ -227,14 +236,15 @@ CLAUDE_SYSTEM_PROMPT = (
     "views about a theme, a policy, a political event or the market that name no ticker at all "
     "(decide which holdings it bears on and what follows from it). A documented view does not "
     "override what the data shows: when the two disagree, say which you are following and why. "
-    "Open the "
-    "analysis (after SINCE LAST SESSION, before OPPORTUNITY COST CHECK) with an **ANALYST VIEWS** "
-    "block that covers EVERY view in the section — there is NO line limit. Group views only where "
-    "they say the same thing about the same subject, and never leave one out because the block is "
-    "getting long. Each entry states who said it and what, then AGREE / DISAGREE / PARTLY "
-    "measured against the data in THIS prompt (a specific price, RSI, MA50, breadth or cluster "
-    "figure), then which held names it bears on, then 'changes: <the specific action>' or "
-    "'changes: nothing'. A bearish or cautionary view that bears on holdings that are strong or "
+    "Weigh EVERY view in the section — there is NO limit on how many you consider — "
+    "measuring each AGREE / DISAGREE / PARTLY against the data in THIS prompt (a specific "
+    "price, RSI, MA50, breadth or cluster figure) and working out which held names it bears on. "
+    "That weighing happens in your reasoning; do NOT write an ANALYST VIEWS block or recap the "
+    "views in the output — the reader gets the newsletters separately and has no use for a "
+    "second copy. A view surfaces in the output only where it changes or decides an action: "
+    "name it, attributed, in that trade's one-sentence reasoning (or in the OPPORTUNITY COST "
+    "CHECK / TL;DR when it is the reason nothing is being done). A view you weighed and that "
+    "changed nothing is not written up. A bearish or cautionary view that bears on holdings that are strong or "
     "extended is a reason to trim into strength before the event (see KNOWN CATALYST in RETURNS "
     "FIRST); a bullish view on a name that is pulling back is a reason to buy the dip (see BUYS). "
     "Disagreeing with a view is fine; ignoring one that bears on a position you act on is not. "
@@ -509,7 +519,11 @@ CLAUDE_SYSTEM_PROMPT = (
     "explicitly and treat that as this session's actual reason to ride it out — a weak field is "
     "an answer, not a skipped check. If a CLUSTER BREAKDOWN section is present the check is "
     "still answered, but no member of the broken cluster can be the candidate and the cut's "
-    "proceeds are not funding for it (they are held as cash).\n\n"
+    "proceeds are not funding for it (they are held as cash). "
+    "WRITE IT SHORT: the regime in one clause, the best candidate and why it does or does not "
+    "qualify, the funding source, and a one-line answer — at most about five lines. Do not list "
+    "every candidate, re-explain why held names are held, or restate figures already in the "
+    "TL;DR.\n\n"
     "WATCH ITEM FOLLOW-THROUGH — HARD CONSTRAINT: If an '=== OPEN WATCH ITEMS ===' section "
     "appears in the data below, each numbered item is something a prior run flagged as the one "
     "thing to watch, and the script has been tracking it ever since. Every item comes with "
@@ -526,7 +540,8 @@ CLAUDE_SYSTEM_PROMPT = (
     "tracked numbers have moved consistently in one direction over that span, that IS the "
     "answer — mark it RESOLVED or ESCALATED and say what the data decided. Repeating 'too early "
     "to tell' for days about numbers that have been trending the whole time is the specific "
-    "failure this rule exists to prevent. Never silently drop an item.\n"
+    "failure this rule exists to prevent. Never silently drop an item. Keep each item to two "
+    "sentences: the then-to-now figures that decide it, then the verdict.\n"
     "The verdicts are load-bearing: the script stops tracking an item you mark RESOLVED or "
     "ESCALATED, and brings a STILL OPEN one back on the next run with updated numbers. So do "
     "not mark something resolved to stop hearing about it — if the data is genuinely still "
@@ -578,9 +593,19 @@ CLAUDE_SYSTEM_PROMPT = (
     "your recommendations are materially the same as the prior run's, do not dress them up as a "
     "fresh read: state plainly that nothing has changed enough to act on, and name the "
     "condition that would change it.\n\n"
+    "OUTPUT IS NOT INPUT: everything in this prompt (regime figures, breadth, benchmarks, "
+    "risk context, newsletters, macro read, per-position data) is for YOU to reason from. The "
+    "digest is a short decision memo that someone reads in a couple of minutes, next to a "
+    "positions table that already shows every holding's price, return and equity. Do not "
+    "restate, recap or re-derive input data to show your work: no regime figures beyond the "
+    "one clause the OPPORTUNITY COST CHECK asks for, no per-view or per-position walkthroughs, "
+    "no list of checks you ran, no figure that does not change what the reader does. Cite a "
+    "number only when it is the reason for a specific action or non-action. Length is "
+    "capped: the whole analysis, excluding the TL;DR, should be well under 400 words on a day "
+    "with no trades and scale with the number of trades, not with the amount of input.\n\n"
     "Write the analysis in blocks, in this order: SINCE LAST SESSION (only when an OPEN WATCH "
-    "ITEMS section appears below), ANALYST VIEWS (only when an ANALYST VIEWS section appears "
-    "below), OPPORTUNITY COST CHECK, TRIMS/EXITS, BUYS, HOLDS. "
+    "ITEMS section appears below), OPPORTUNITY COST CHECK, TRIMS/EXITS, BUYS, HOLDS "
+    "(exceptions only), then ONE KEY THING TO WATCH TODAY. "
     "Do not use --- as dividers between blocks. "
     "Avoid trading jargon — write plainly for someone who trades casually but is not an expert.\n\n"
     "TRIMS/EXITS: Only list positions actually being trimmed or exited — one bold action line "
@@ -593,8 +618,9 @@ CLAUDE_SYSTEM_PROMPT = (
     "restricted position, is simply a hold: one line in HOLDS, nothing here. The one exception is "
     "the cut required by a CLUSTER BREAKDOWN section (see that rule), which is always written "
     "here. "
-    "If nothing to trim, say so in one sentence — but only after checking that no position is "
-    "being exited for any reason, including SMALL POSITION CLEANUP. "
+    "If nothing to trim, say 'Nothing to trim or exit.' and stop — but only after checking that no "
+    "position is being exited for any reason, including SMALL POSITION CLEANUP. Do not list the "
+    "checks you ran or the positions you looked at. "
     "\"Nothing to trim\" next to "
     "an exit recommended elsewhere in the analysis is a contradiction.\n\n"
     "REGIME BUY CAP — HARD CONSTRAINT: This portfolio is self-sustaining: buys are normally "
@@ -666,8 +692,13 @@ CLAUDE_SYSTEM_PROMPT = (
     "reasonable trim, everything else restricted or a loser), do not just say 'no buys today' — "
     "say explicitly that the opportunity is worth funding with outside cash (a deposit) even "
     "though nothing internal can fund it, and name the ticker and why.\n\n"
-    "HOLDS: List each held position on its own line with a brief reason. "
-    "Do not group positions into categories. HOLDS lists only positions being kept: a position "
+    "HOLDS: EXCEPTIONS ONLY. The positions table already lists every holding, so do NOT write a "
+    "line per position and do not say 'thesis intact' about the rest. List a position only "
+    "when keeping it is a non-obvious call the reader would otherwise question — a "
+    "[SMALL POSITION] kept instead of exited, a protected or warning-blocked position that "
+    "looks like it should be trimmed, a dip candidate you chose not to buy, a position the "
+    "news is moving against — one short line each, at most about five, plus a single closing "
+    "sentence 'All other positions: hold.' HOLDS lists only positions being kept: a position "
     "being trimmed or exited appears in TRIMS/EXITS and not here, and HOLDS must never introduce "
     "a sell, exit, or trim that TRIMS/EXITS does not already contain.\n\n"
     "End the analysis with **ONE KEY THING TO WATCH TODAY:** followed by one sentence "
@@ -692,9 +723,10 @@ CLAUDE_SYSTEM_PROMPT = (
     "Use specific BUY, SELL, TRIM, or HOLD language. Be concise — lead with the decision, "
     "one sentence of reasoning per position. Do not output systematic check tables or grids.\n\n"
     "TL;DR — WRITTEN LAST, ON PURPOSE: After the analysis is complete, output a line "
-    "containing exactly --- and then write a 3-4 sentence tl;dr. Write it only after the "
-    "TRIMS/EXITS, BUYS, and HOLDS blocks already exist above it, because it has to be "
-    "consistent with them.\n"
+    "containing exactly --- and then write a 3-4 sentence tl;dr (about 90 words at most). Write "
+    "it only after the TRIMS/EXITS, BUYS, and HOLDS blocks already exist above it, because it "
+    "has to be consistent with them. It is the part of the email most readers will read, so "
+    "it ALWAYS gets written, even when the analysis above it was long.\n"
     "It does two jobs, in this order. FIRST, read the broad market mood — what the tape and "
     "the news flow are doing today at the macro and sector level: risk-on or risk-off, which "
     "sectors are leading or breaking down, how broad the move is, what the headlines are "
@@ -727,9 +759,10 @@ CLAUDE_SYSTEM_PROMPT = (
     "last session, you must name the specific, checkable trigger that would turn it into an "
     "action — and that trigger belongs in ONE KEY THING TO WATCH TODAY so the next run measures "
     "it. A vague 'this could change the calculus' with nothing tracking it is a failure. "
-    "Do not simply restate the action lines. Write it "
-    "plainly and humanistically, as the one paragraph someone would read if they read nothing "
-    "else."
+    "Put the bottom line in plain words — the trades to make today, or 'no trades' and the "
+    "one reason — as its own sentence, but do not copy the action lines or their dollar "
+    "reasoning. Write it plainly and humanistically, as the one paragraph someone would read "
+    "if they read nothing else."
 )
 
 # robin_stocks stores pickles in ~/.tokens/robinhood<name>.pickle regardless of path
@@ -3629,9 +3662,9 @@ def build_prompt(summary: dict) -> str:
     reminders = []
     if summary.get("newsletter_views"):
         reminders.append(
-            "The newsletters' analysis is in the ANALYST VIEWS section above. Your analysis MUST "
-            "contain an **ANALYST VIEWS** block covering EVERY view listed, no line limit (agree/disagree against this prompt's data, "
-            "ending 'changes: <action>' or 'changes: nothing') ahead of OPPORTUNITY COST CHECK. "
+            "The newsletters' analysis is in the ANALYST VIEWS section above. Weigh EVERY view in "
+            "your reasoning, but do NOT write an ANALYST VIEWS block — a view appears in the output "
+            "only where it changes or decides an action. "
             "Any position with a 'Newsletter event' line gets that event weighed in its own "
             "trim/buy/hold reasoning, and a position tagged [REPORTS EARNINGS …] gets the "
             "earnings named in any buy or trim of it."
@@ -3667,8 +3700,13 @@ def build_prompt(summary: dict) -> str:
         reminders.append(
             "A WEEKLY MACRO READ is above: say which of its themes today's news extends or contradicts."
         )
-    if reminders:
-        lines += ["", "=== BEFORE YOU WRITE ==="] + reminders
+    # Unconditional, so the section always exists: the output is a short decision memo, not a
+    # report on the inputs, and the TL;DR is written last so a runaway response loses it.
+    reminders.append(
+        "Keep the output short (see OUTPUT IS NOT INPUT): no recap of input data, HOLDS lists "
+        "exceptions only, and the TL;DR must always be written."
+    )
+    lines += ["", "=== BEFORE YOU WRITE ==="] + reminders
     return "\n".join(lines)
 
 
@@ -4151,6 +4189,17 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
     # disabled, so a TL;DR emitted first was literally the model's first tokens on the
     # portfolio and routinely told a different story than the advice below it; with adaptive
     # thinking the model can reason first, but the ordering is kept — it costs nothing.)
+    usage = getattr(message, "usage", None)
+    log.info(
+        f"Analysis response: stop_reason={getattr(message, 'stop_reason', '?')}, "
+        f"input_tokens={getattr(usage, 'input_tokens', '?')}, output_tokens={getattr(usage, 'output_tokens', '?')} "
+        f"(output includes thinking; budget {CLAUDE_MAX_TOKENS})"
+    )
+    if getattr(message, "stop_reason", None) == "max_tokens":
+        log.error(
+            "Analysis hit max_tokens and is cut off mid-response — the TL;DR (written last) and the "
+            "watch item are lost; falling back to a separate TL;DR call"
+        )
     raw = newsletter_views.response_text(message).strip()
     # Drop a trailing separator the model sometimes appends after the TL;DR; left in
     # place it would make the rsplit below hand back an empty TL;DR.
@@ -4227,13 +4276,41 @@ def get_claude_analysis(summary: dict) -> tuple[str, str]:
             "Analysis mentions a cluster cut/breakdown although the rule is switched off "
             "(portfolio_risk.BREAKDOWN_ENABLED = False) — likely copied from the prior-run text"
         )
-    if summary.get("newsletter_views") and not re.search(r"ANALYST\s+VIEWS", analysis_part, re.IGNORECASE):
-        log.warning(
-            "Analysis omitted the ANALYST VIEWS block even though "
-            f"{sum(len(v['views']) for v in summary['newsletter_views'])} newsletter views were supplied"
-        )
+    if not tldr:
+        log.warning("Analysis carried no TL;DR — generating one from the analysis text")
+        tldr = _fallback_tldr(analysis_part, summary)
 
     return tldr, analysis_part
+
+
+def _fallback_tldr(analysis: str, summary: dict) -> str:
+    """
+    Write a TL;DR from a finished (or truncated) analysis when the main call didn't deliver one.
+
+    The TL;DR is generated last on purpose, so a response that runs out of tokens in the middle
+    of HOLDS (2026-11-25: adaptive thinking ate most of the 16000 budget) loses exactly the part
+    most readers read. A separate low-effort call over the analysis text is cheap (~2k tokens) and
+    cannot be truncated by the main response's thinking. Fails soft: returns "" on any error.
+    """
+    try:
+        regime = (summary.get("regime") or {}).get("label")
+        message = Anthropic().messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1500,
+            output_config={"effort": newsletter_views.EXTRACTION_EFFORT},
+            messages=[{"role": "user", "content": (
+                "Below is today's portfolio analysis (it may be cut off at the end). Write a TL;DR of "
+                "3-4 sentences, 90 words at most, in plain language: the market mood"
+                + (f" (the measured regime is {regime})" if regime else "")
+                + ", then the trades to make today or 'no trades' with the one reason. Use only what "
+                "the analysis says; do not add facts or restate its dollar reasoning. Output the "
+                "TL;DR text only.\n\n" + analysis
+            )}],
+        )
+        return newsletter_views.response_text(message).strip()
+    except Exception as e:  # noqa: BLE001 — non-critical, the digest just goes without
+        log.error(f"Fallback TL;DR failed: {e}")
+        return ""
 
 
 # ── Email digest ──────────────────────────────────────────────────────────────
@@ -4260,8 +4337,9 @@ def format_digest(summary: dict, analysis: str) -> str:
         SEP,
     ]
 
+    full = digest_full()
     newsletters = summary.get("newsletters") or []
-    if newsletters:
+    if newsletters and full:
         lines += ["", "MARKET NEWS — SHERWOOD NEWSLETTERS", sep]
         for n in newsletters:
             lines.append(f"{n['name']} ({n['date']}): {n['subject']}")
@@ -4272,27 +4350,33 @@ def format_digest(summary: dict, analysis: str) -> str:
             summary.get("newsletter_views") or [], _held_symbols(summary), summary["date"]
         )
 
+    # The two input-health sections worth showing even in the short digest. In the short one
+    # they go after the analysis so the TL;DR stays first.
+    status_lines: list[str] = []
     news_problems = summary.get("news_problems") or []
     if not newsletters and not summary.get("sherwood_news") and news_problems:
-        lines += [
+        status_lines += [
             "",
             "!! MARKET NEWS UNAVAILABLE",
             sep,
             f"No feed returned an article newer than {NEWS_MAX_AGE_DAYS} days. "
             "Today's analysis had no macro news to work from:",
         ]
-        lines += [f"  - {p}" for p in news_problems]
+        status_lines += [f"  - {p}" for p in news_problems]
 
     pending_orders = summary.get("pending_orders", [])
+    pending_lines: list[str] = []
     if pending_orders:
-        lines += ["", "PENDING ORDERS (placed, not yet filled)", sep]
+        pending_lines += ["", "PENDING ORDERS (placed, not yet filled)", sep]
         for o in pending_orders:
             qty_str = f"{o['quantity']:.4f} sh" if o["quantity"] else "fractional"
             notional_str = f"${o['notional']:.2f}" if o["notional"] is not None else "—"
-            lines.append(
+            pending_lines.append(
                 f"{o['side'].upper():<4} {o['symbol']:<8} {qty_str:>14} {notional_str:>10}  "
                 f"placed {o['date']} ({o['state']})"
             )
+    if full:
+        lines += status_lines + pending_lines
 
     if tldr:
         lines += [
@@ -4302,6 +4386,25 @@ def format_digest(summary: dict, analysis: str) -> str:
             tldr,
             "",
         ]
+
+    position_lines = [
+        "",
+        "CURRENT POSITIONS",
+        sep,
+        f"{'Symbol':<8} {'Shares':>10} {'Price':>10} {'Avg Cost':>10} "
+        f"{'Return%':>9} {'Equity':>10}",
+        sep,
+    ] + [
+        f"{pos['symbol']:<8} {pos['shares']:>10.4f} "
+        f"{pos['current_price']:>10.4f} {pos['avg_cost']:>10.4f} "
+        f"{pos['total_return_pct']:>8.1f}% {pos['equity']:>10.2f}"
+        for pos in summary["positions"]
+    ]
+
+    if not full:
+        lines += ["", SEP, "ANALYSIS", SEP, "", analysis] + pending_lines + position_lines
+        lines += status_lines + ["", SEP, f"Sent from {summary.get('hostname', 'unknown')}"]
+        return "\n".join(lines)
 
     watch_items = summary.get("watch_items") or []
     breadth_history = summary.get("breadth_history") or []
@@ -4360,21 +4463,7 @@ def format_digest(summary: dict, analysis: str) -> str:
     if risk_lines:
         lines += ["", "PORTFOLIO RISK", sep] + risk_lines
 
-    lines += [
-        "",
-        "CURRENT POSITIONS",
-        sep,
-        f"{'Symbol':<8} {'Shares':>10} {'Price':>10} {'Avg Cost':>10} "
-        f"{'Return%':>9} {'Equity':>10}",
-        sep,
-    ]
-
-    for pos in summary["positions"]:
-        lines.append(
-            f"{pos['symbol']:<8} {pos['shares']:>10.4f} "
-            f"{pos['current_price']:>10.4f} {pos['avg_cost']:>10.4f} "
-            f"{pos['total_return_pct']:>8.1f}% {pos['equity']:>10.2f}"
-        )
+    lines += position_lines
 
     lines += ["", "TECHNICAL INDICATORS", sep]
     for pos in summary["positions"]:
@@ -4751,6 +4840,7 @@ def format_digest_html(summary: dict, analysis: str) -> str:
                 watchlist_content += "</div>"
 
     # ── Market news ───────────────────────────────────────────────────────────
+    news_failed = False  # set when no fresh news existed — shown even in the short digest
     news_source = summary.get("news_source", "")
     newsletters = summary.get("newsletters") or []
     sherwood_items = summary.get("sherwood_news", [])
@@ -4814,6 +4904,7 @@ def format_digest_html(summary: dict, analysis: str) -> str:
                     f'font-size:13px;color:#0f172a;">{title}{pub_str}</div>'
                 )
     else:
+        news_failed = True
         problems = list(summary.get("news_problems") or [])
         nl_problems = summary.get("newsletter_problems") or []
         if nl_problems:
@@ -5000,26 +5091,78 @@ def format_digest_html(summary: dict, analysis: str) -> str:
         trend_content += "</div>"
 
     # ── Assemble ─────────────────────────────────────────────────────────────
-    body_content = (
-        tldr_block
-        + (_section("Trend Tracker", trend_content)
-           if (watch_items or len(breadth_history) > 1) else "")
-        + (_section("Market Regime", regime_content) if regime_content else "")
-        + (_section("Pending Orders", pending_content) if pending_orders else "")
-        + (_section("Portfolio Risk", risk_content) if risk_content else "")
-        + _section("Current Positions", _table(pos_header, pos_rows))
-        + _section("Technical Indicators", _table(ind_header, ind_rows))
-        + _section("Top Momentum Movers", _table(mom_header, mom_rows))
-        + _section("Watchlist Updates", watchlist_content)
-        + _section(
-            "Claude Analysis",
-            f'<div style="font-size:14px;line-height:1.7;color:#1e293b;">{analysis_html}</div>',
+    full = digest_full()
+    analysis_section = _section(
+        "Claude Analysis",
+        f'<div style="font-size:14px;line-height:1.7;color:#1e293b;">{analysis_html}</div>',
+    )
+    if full:
+        body_content = (
+            tldr_block
+            + (_section("Trend Tracker", trend_content)
+               if (watch_items or len(breadth_history) > 1) else "")
+            + (_section("Market Regime", regime_content) if regime_content else "")
+            + (_section("Pending Orders", pending_content) if pending_orders else "")
+            + (_section("Portfolio Risk", risk_content) if risk_content else "")
+            + _section("Current Positions", _table(pos_header, pos_rows))
+            + _section("Technical Indicators", _table(ind_header, ind_rows))
+            + _section("Top Momentum Movers", _table(mom_header, mom_rows))
+            + _section("Watchlist Updates", watchlist_content)
+            + analysis_section
+            + _section(
+                f"Market News{f' — {news_source}' if news_source else ''}",
+                sherwood_content,
+            )
+            + _section("Ticker News", ticker_news_content)
         )
-        + _section(
-            f"Market News{f' — {news_source}' if news_source else ''}",
-            sherwood_content,
+    else:
+        # TL;DR first, then what to act on, then the table to check it against. A dead news
+        # feed is the one input failure worth surfacing here: the analysis ran blind to macro.
+        body_content = (
+            tldr_block
+            + analysis_section
+            + (_section("Pending Orders", pending_content) if pending_orders else "")
+            + _section("Current Positions", _table(pos_header, pos_rows))
+            + (_section("Market News", sherwood_content) if news_failed else "")
         )
-        + _section("Ticker News", ticker_news_content)
+
+    # The abbreviations only matter next to the indicator tables, which the short digest omits.
+    glossary_html = (
+        """
+  <!-- Glossary -->
+  <tr>
+    <td style="background:#f8fafc;padding:20px 32px;border-top:1px solid #e2e8f0;">
+      <p style="margin:0 0 8px;font-size:10px;font-weight:700;color:#94a3b8;
+                text-transform:uppercase;letter-spacing:0.08em;">Abbreviations</p>
+      <p style="margin:0;font-size:11px;color:#94a3b8;line-height:1.8;">
+        <strong style="color:#64748b;">RSI</strong> &mdash;
+          Relative Strength Index (0&ndash;100). Momentum oscillator:
+          <span style="color:#16a34a;">55&ndash;75 = momentum zone</span>,
+          <span style="color:#d97706;">&gt;75 = overbought</span>,
+          <span style="color:#dc2626;">&lt;30 = oversold</span>.
+        &nbsp;&nbsp;
+        <strong style="color:#64748b;">MA50 / MA200</strong> &mdash;
+          50-day and 200-day simple moving averages of closing price.
+        &nbsp;&nbsp;
+        <strong style="color:#64748b;">vs MA50 / vs MA200</strong> &mdash;
+          How far the current price is above or below the moving average, as a percentage.
+        &nbsp;&nbsp;
+        <strong style="color:#64748b;">Vol Ratio</strong> &mdash;
+          Today&rsquo;s volume divided by the 30-day average volume.
+          1.0&times; = normal activity; &gt;2&times; = unusually high.
+        &nbsp;&nbsp;
+        <strong style="color:#64748b;">Today</strong> &mdash;
+          Price change from previous close, as a percentage.
+        &nbsp;&nbsp;
+        <strong style="color:#64748b;">Score</strong> &mdash;
+          Momentum score (0&ndash;100) combining RSI zone (40 pts),
+          volume spike (30 pts), daily move (20 pts),
+          and price position vs MA50 (10 pts).
+      </p>
+    </td>
+  </tr>
+"""
+        if full else ""
     )
 
     return f"""<!DOCTYPE html>
@@ -5072,39 +5215,7 @@ def format_digest_html(summary: dict, analysis: str) -> str:
     </td>
   </tr>
 
-  <!-- Glossary -->
-  <tr>
-    <td style="background:#f8fafc;padding:20px 32px;border-top:1px solid #e2e8f0;">
-      <p style="margin:0 0 8px;font-size:10px;font-weight:700;color:#94a3b8;
-                text-transform:uppercase;letter-spacing:0.08em;">Abbreviations</p>
-      <p style="margin:0;font-size:11px;color:#94a3b8;line-height:1.8;">
-        <strong style="color:#64748b;">RSI</strong> &mdash;
-          Relative Strength Index (0&ndash;100). Momentum oscillator:
-          <span style="color:#16a34a;">55&ndash;75 = momentum zone</span>,
-          <span style="color:#d97706;">&gt;75 = overbought</span>,
-          <span style="color:#dc2626;">&lt;30 = oversold</span>.
-        &nbsp;&nbsp;
-        <strong style="color:#64748b;">MA50 / MA200</strong> &mdash;
-          50-day and 200-day simple moving averages of closing price.
-        &nbsp;&nbsp;
-        <strong style="color:#64748b;">vs MA50 / vs MA200</strong> &mdash;
-          How far the current price is above or below the moving average, as a percentage.
-        &nbsp;&nbsp;
-        <strong style="color:#64748b;">Vol Ratio</strong> &mdash;
-          Today&rsquo;s volume divided by the 30-day average volume.
-          1.0&times; = normal activity; &gt;2&times; = unusually high.
-        &nbsp;&nbsp;
-        <strong style="color:#64748b;">Today</strong> &mdash;
-          Price change from previous close, as a percentage.
-        &nbsp;&nbsp;
-        <strong style="color:#64748b;">Score</strong> &mdash;
-          Momentum score (0&ndash;100) combining RSI zone (40 pts),
-          volume spike (30 pts), daily move (20 pts),
-          and price position vs MA50 (10 pts).
-      </p>
-    </td>
-  </tr>
-
+{glossary_html}
   <!-- Footer -->
   <tr>
     <td style="background:#f8fafc;padding:12px 32px;border-top:1px solid #e2e8f0;

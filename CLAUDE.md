@@ -87,7 +87,7 @@ Python 3.11+ required (uses `float | None` union type syntax).
 | `WATCHLIST_MIN_SCORE` | `15` | Minimum momentum score to surface a Robinhood watchlist ticker |
 | `CLAUDE_MODEL` | `claude-sonnet-5-5` | Model for the analysis, newsletter extraction and macro read. Adaptive thinking is ON by omission of the `thinking` param (5-5 returns a 400 for `{"type": "disabled"}`) — see Model & Thinking (2026-11-24) |
 | `CLAUDE_ANALYSIS_EFFORT` | `high` | `output_config.effort` for the analysis call; extraction and the macro read use `low` (`EXTRACTION_EFFORT`, `MACRO_EFFORT`) |
-| `CLAUDE_MAX_TOKENS` | `16000` | Max response length for analysis, **including thinking tokens** (the TL;DR is written last, so truncation loses it) |
+| `CLAUDE_MAX_TOKENS` | `16000` | Max response length for analysis, **including thinking tokens** (the TL;DR is written last, so truncation loses it — `_fallback_tldr()` recovers it; `stop_reason` is logged). Capped at 16000 for the SDK's non-streaming timeout guard |
 | `RSI_PERIOD` | `14` | RSI calculation window |
 | `MOMENTUM_TOP_N` | `10` | Max momentum candidates returned |
 | `USER_WATCHLISTS` | `{"My First List", "Gaming", "Tech"}` | Your watchlists (highest priority) |
@@ -690,16 +690,14 @@ How it reaches the analysis:
   within `CATALYST_TAG_DAYS` (4), a `[REPORTS EARNINGS …]` tag — next to the price/RSI data it is
   deciding on rather than in a section it has no reason to reread. This is what actually made the
   META trim cite the equity raise; the section alone did not.
-- Hard constraints in `CLAUDE_SYSTEM_PROMPT`: `ANALYST VIEWS` (an **ANALYST VIEWS** block covering every view — the original ≤5-line cap was removed 2026-11-12, see "Returns First" item 5 —
-  between `SINCE LAST SESSION` and `OPPORTUNITY COST CHECK`, each AGREE/DISAGREE/PARTLY against this
-  prompt's data and ending `changes: <action>` / `changes: nothing`; hedging preserved; events on
+- Hard constraints in `CLAUDE_SYSTEM_PROMPT`: `ANALYST VIEWS` (**the model weighs every view — no cap — but since 2026-11-25 does NOT write an ANALYST VIEWS block**; a view surfaces only in the one-sentence reasoning of the action it changes, see "Digest Length" below; hedging preserved; events on
   held symbols weighed in that position's reasoning) and `CATALYSTS` (any buy/add/trim of a symbol
   reporting within days must name the event). The TL;DR rule gained: do not state the market mood more
   confidently than the issue's own `stance`, and name only companies/themes present in the news or
   positions (it had coined "AMD-adjacent suppliers").
-- An `=== BEFORE YOU WRITE ===` reminder ends the prompt. Without it the model skipped the ANALYST
-  VIEWS block outright on a same-day rerun. A missing block also logs a warning. If it keeps being
-  skipped, the next step is a post-parse retry, not more prompt text.
+- An `=== BEFORE YOU WRITE ===` reminder ends the prompt (it was added when the model skipped a then-mandatory
+  ANALYST VIEWS block on a same-day rerun; it is now always present and also carries the brevity reminder). The
+  "missing ANALYST VIEWS block" log warning was removed with the block.
 - `apply_watch_verdicts()`'s block-boundary regex now stops at `ANALYST VIEWS` too.
 - Rendered in both digests (`What Sherwood is saying`); extraction results are saved to `news.json`
   under `newsletter_views`. They are not yet persisted to `last_analysis.json`, and view outcomes are
@@ -772,19 +770,32 @@ The system prompt frames the analyst as pursuing "ethically responsible" investi
 
 A second Claude call (Haiku model, 500 tokens) runs after the momentum scan and news fetch. It receives current watchlist, portfolio positions, momentum results, watchlist candidates, and news headlines. Returns `{"add": [...], "remove": [...]}` with reasons per ticker. The script enforces min/max bounds regardless of what Claude returns. If the call or JSON parse fails, `tickers.json` is left unchanged.
 
+## Digest Length — Output Is Not Input (2026-11-25)
+
+**Symptom (Chris):** "the emails are getting particularly long and I don't need most of it. That was literally the point of the TL;DR, which was omitted from today's briefing. All of the information the AGENT gets is not information the agent PRODUCES."
+
+**Two causes, both measured on the 2026-11-25 06:00 run:**
+1. **The TL;DR was lost to truncation.** The saved analysis ended mid-sentence in HOLDS. The response hit `CLAUDE_MAX_TOKENS` (16000, shared with adaptive thinking) before it reached the `---` + TL;DR it writes last — which also lost `ONE KEY THING TO WATCH`. Until now `stop_reason` was never logged, so this was invisible. (Cannot simply raise the cap: 16000 is what keeps the non-streaming request under the SDK timeout guard.)
+2. **The output restated the input.** A 12-entry ANALYST VIEWS block (the 2026-11-12 "cover EVERY view, no line limit" rule), the regime figures re-derived in OPPORTUNITY COST CHECK, and a HOLDS line for every position that duplicates the positions table. The email on top added Trend Tracker, Market Regime, Portfolio Risk, Technical Indicators, Top Momentum Movers, Watchlist Updates, the full newsletter text and Ticker News — all inputs the agent had already reasoned from.
+
+**Changes:**
+- Prompt: an `OUTPUT IS NOT INPUT` rule (no recap of input data, cite a number only when it is the reason for an action, whole analysis well under ~400 words on a no-trade day); the ANALYST VIEWS block is gone from the output (views are still all weighed — the 2026-11-12 "not capped" intent is about *consideration*, not *output* — and surface only where they decide an action); OPPORTUNITY COST CHECK is "about five lines"; `HOLDS` is exceptions only (non-obvious keeps, max ~5 lines + "All other positions: hold."); SINCE LAST SESSION items are two sentences; TL;DR is capped at ~90 words, must state the bottom line (the trades, or "no trades" + the one reason), and is told it is always written. A short unconditional reminder in `=== BEFORE YOU WRITE ===` repeats the brevity rule.
+- **Short digest by default** (`digest_full()`, env `DIGEST_FULL=1` restores the long email): TL;DR → analysis → Pending Orders (only when present) → Current Positions → Market News *only* as the red "no fresh news" warning. Both HTML and plain text. The data is not lost: `last_analysis.json` still carries the full snapshot, `news.json` the news, and the log the rest.
+- **TL;DR safety net.** `get_claude_analysis()` logs `stop_reason` + token usage on every run (`Analysis response: …`), logs an ERROR when it is `max_tokens`, and if the parsed TL;DR is empty `_fallback_tldr()` makes one low-effort call over the analysis text to write it (fails soft to ""). The watch item is still lost on a truncated response — only the TL;DR is recovered.
+- Validated by two live dry runs (writes stubbed): output tokens 4.7K/4.9K (the failed real run hit 16K), `stop_reason=end_turn`, TL;DR present, analysis ~580–620 words including TL;DR (the failed run's was ~1,500 and cut off), lean HTML 23 KB vs 118 KB full, plain text 71 vs 204 lines. The fallback was exercised with a stubbed truncated response (recovers a TL;DR; no second call when one exists; fails soft). **Not verified:** run-to-run variance in length (n=2), and whether the model keeps HOLDS to ~5 lines on a day with several real exceptions.
+- Watch for: `Analysis response: stop_reason=max_tokens` in `monitor.log` (adaptive thinking is unbounded by the prompt; if it recurs, lower `CLAUDE_ANALYSIS_EFFORT` or stream and raise the cap).
+
 ## Email Sections
 
-0. Trend Tracker (breadth history + open watch items with then→now deltas — only when there is something to track)
-0b. Portfolio Risk (benchmarks, correlated clusters, gain-protection alerts — same lines the analysis was shown)
-1. Pending Orders (table — only rendered when unfilled orders exist)
-2. Current Positions (table, colour-coded returns)
-3. Technical Indicators (table, colour-coded RSI/MA/vol)
-4. Top Momentum Movers (table)
-5. Watchlist Updates (add/remove with reasons + linked source articles)
-6. Claude Analysis (markdown-rendered)
-7. Market News — **What Sherwood is saying** (each issue's overall read, direction-tagged views with `HELD` flags, and the week's catalyst table), then each Sherwood issue as sent (green source banner, full text) with the merged tickers named, or dated wire headlines, or a red warning block if neither was available
-8. Ticker News — Yahoo Finance per holding (linked, dated headlines)
-9. Abbreviations glossary (footer)
+**Default (short) digest:**
+
+0. TL;DR
+1. Claude Analysis (SINCE LAST SESSION → OPPORTUNITY COST CHECK → TRIMS/EXITS → BUYS → HOLDS exceptions → ONE KEY THING TO WATCH)
+2. Pending Orders (table — only rendered when unfilled orders exist)
+3. Current Positions (table, colour-coded returns)
+4. Market News — only as the red "no market news newer than N days" warning, when no feed had fresh news
+
+**With `DIGEST_FULL=1`** (the pre-2026-11-25 email), in this order: TL;DR, Trend Tracker (breadth history + open watch items with then→now deltas), Market Regime + weekly macro read, Pending Orders, Portfolio Risk, Current Positions, Technical Indicators, Top Momentum Movers, Watchlist Updates (add/remove with reasons + linked articles), Claude Analysis, Market News (**What Sherwood is saying** — each issue's overall read, direction-tagged views with `HELD` flags, the week's catalyst table — then each issue as sent, or dated wire headlines, or the red warning), Ticker News (Yahoo Finance per holding), Abbreviations glossary.
 
 ## Cron Schedule (weekdays 6am)
 
